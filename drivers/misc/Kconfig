@@ -667,6 +667,29 @@ config XAGA_MARKER_WRITER
 
 	  Only the xaga defconfig fragment enables this; leave it off for
 	  other devices.
+
+config COROT_FB_SCAN
+	bool "corot one-shot framebuffer region scan (locate LK scanout)"
+	depends on ARM64 && ARCH_MEDIATEK
+	help
+	  Late-initcall scan of the reserved framebuffer region to locate the
+	  live LK scanout address. Prints a per-MB nonzero map into kmsg.
+
+config COROT_MARKER_WRITER
+	bool "corot boot-stage marker writer (XAGR ring)"
+	depends on ARM64
+	help
+	  Mirror printk into the corot log_store reserved DRAM region
+	  at 0x7ffbf000 (from the live MT6985 device tree). Armed at
+	  the head of arm64 setup_arch. Leave off for other devices.
+
+config COROT_SKIP_SMCCC_TRNG_SOC_ID
+	bool "Skip SMCCC TRNG/SOC_ID probes on corot ATF"
+	depends on ARM64
+	help
+	  Stock corot ATF/LK is a 5.15-era MediaTek chain. Unknown
+	  SMCCC TRNG/SOC_ID fastcalls can hang before console.
+
 endmenu
 
 source "drivers/misc/mediatek/Kconfig"

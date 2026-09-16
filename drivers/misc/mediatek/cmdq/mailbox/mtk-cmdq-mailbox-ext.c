@@ -82,6 +82,8 @@ cmdq_mminfra_gce_cg mminfra_gce_cg;
 #define CMDQ_THR_SPR			0x60
 
 #define GCE_BUS_GCTL			0x40
+
+bool append_by_event;
 #define GCE_GCTL_VALUE			0x48
 #define GCE_OUTPIN_EVENT		0x4c
 #define GCE_GPR_R0_START		0x80
@@ -218,6 +220,8 @@ struct cmdq {
 	void			*init_cmds_base;
 	dma_addr_t		init_cmds;
 	bool			sw_ddr_en;
+	bool			control_by_sw;
+	bool			cpu_init;
 	bool			outpin_en;
 	bool			prebuilt_enable;
 	bool			unprepare_in_idle;
@@ -228,6 +232,8 @@ struct gce_plat {
 	u32 thread_nr;
 	u8 shift;
 	u32 mminfra;
+	bool control_by_sw;
+	bool cpu_init;
 };
 
 #if IS_ENABLED(CMDQ_MMPROFILE_SUPPORT)
@@ -284,10 +290,10 @@ static void cmdq_init_cpu(struct cmdq *cmdq)
 
 static void cmdq_init(struct cmdq *cmdq)
 {
-	if (cmdq->init_cmds_base)
-		cmdq_init_cmds(cmdq);
-	else
+	if (cmdq->cpu_init || !cmdq->init_cmds_base)
 		cmdq_init_cpu(cmdq);
+	else
+		cmdq_init_cmds(cmdq);
 }
 
 static inline void cmdq_mmp_init(void)
@@ -381,6 +387,8 @@ static s32 cmdq_clk_enable(struct cmdq *cmdq)
 			writel(cmdq->prefetch,
 				cmdq->base + CMDQ_PREFETCH_GSIZE);
 		writel(CMDQ_TPR_EN, cmdq->base + CMDQ_TPR_MASK);
+		if (cmdq->control_by_sw)
+			writel(BIT(2) | BIT(1) | BIT(0), cmdq->base + GCE_GCTL_VALUE);
 		if (cmdq->sw_ddr_en) {
 			writel((0x7 << 16) + 0x7, cmdq->base + GCE_GCTL_VALUE);
 			writel(0, cmdq->base + GCE_DEBUG_START_ADDR);
@@ -2400,6 +2408,8 @@ static int cmdq_probe(struct platform_device *pdev)
 
 	gce_shift_bit = plat_data->shift;
 	gce_mminfra = plat_data->mminfra;
+	cmdq->control_by_sw = plat_data->control_by_sw;
+	cmdq->cpu_init = plat_data->cpu_init;
 	if (!of_property_read_bool(dev->of_node, "skip-poll-sleep"))
 		skip_poll_sleep = true;
 
@@ -2532,7 +2542,12 @@ static const struct dev_pm_ops cmdq_pm_ops = {
 static const struct gce_plat gce_plat_v2 = {.thread_nr = 16};
 static const struct gce_plat gce_plat_v4 = {.thread_nr = 24, .shift = 3};
 static const struct gce_plat gce_plat_v5 = {
-	.thread_nr = 32, .shift = 3, .mminfra = BIT(30)};
+	.thread_nr = 32, .shift = 3, .mminfra = BIT(30),
+	.control_by_sw = true, .cpu_init = false};
+
+static const struct gce_plat gce_plat_mt6985 = {
+	.thread_nr = 32, .shift = 3, .mminfra = BIT(30),
+	.control_by_sw = true, .cpu_init = true};
 
 static const struct of_device_id cmdq_of_ids[] = {
 	{.compatible = "mediatek,mt8173-gce", .data = (void *)&gce_plat_v2},
@@ -2553,6 +2568,7 @@ static const struct of_device_id cmdq_of_ids[] = {
 	{.compatible = "mediatek,mt6893-gce", .data = (void *)&gce_plat_v4},
 	{.compatible = "mediatek,mt6895-gce", .data = (void *)&gce_plat_v5},
 	{.compatible = "mediatek,mt6983-gce", .data = (void *)&gce_plat_v5},
+	{.compatible = "mediatek,mt6985-gce", .data = (void *)&gce_plat_mt6985},
 	{.compatible = "mediatek,mt6855-gce", .data = (void *)&gce_plat_v5},
 	{}
 };

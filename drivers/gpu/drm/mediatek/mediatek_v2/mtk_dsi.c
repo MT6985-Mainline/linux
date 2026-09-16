@@ -398,6 +398,10 @@ struct mtk_dsi_driver_data {
 	bool need_wait_fifo;
 	bool dsi_buffer;
 	bool dsi_new_trail;
+	u32 buffer_unit;
+	u32 sram_unit;
+	u32 urgent_lo_fifo_us;
+	u32 urgent_hi_fifo_us;
 	u32 max_vfp;
 	unsigned int (*mmclk_by_datarate)(struct mtk_dsi *dsi,
 		struct mtk_drm_crtc *mtk_crtc, unsigned int en);
@@ -415,6 +419,7 @@ struct mtk_dsi_mgr {
 };
 
 struct mtk_dsi {
+	bool m12_prepare_ok;
 	struct mtk_ddp_comp ddp_comp;
 	struct device *dev;
 	struct mipi_dsi_host host;
@@ -891,12 +896,12 @@ static void mtk_dsi_dual_enable(struct mtk_dsi *dsi, bool enable)
 
 static void mtk_dsi_enable(struct mtk_dsi *dsi)
 {
-	pr_err("XAGA-DSI[enable+] CON=0x%08x\n", readl(dsi->regs + DSI_CON_CTRL));
+	pr_err("COROT-DSI[enable+] CON=0x%08x\n", readl(dsi->regs + DSI_CON_CTRL));
 	mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_EN, DSI_EN);
 	if (dsi->driver_data->need_wait_fifo)
 		mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_CM_WAIT_FIFO_FULL_EN,
 			DSI_CM_WAIT_FIFO_FULL_EN);
-	pr_err("XAGA-DSI[enable-] CON=0x%08x\n", readl(dsi->regs + DSI_CON_CTRL));
+	pr_err("COROT-DSI[enable-] CON=0x%08x\n", readl(dsi->regs + DSI_CON_CTRL));
 }
 
 static void mtk_dsi_disable(struct mtk_dsi *dsi)
@@ -1049,7 +1054,12 @@ static int mtk_dsi_set_LFR(struct mtk_dsi *dsi, struct mtk_ddp_comp *comp,
 	unsigned int lfr_skip_num = 0;
 
 	struct drm_crtc *crtc = dsi->encoder.crtc;
-	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct mtk_drm_crtc *mtk_crtc;
+
+	if (!crtc)
+		return 0;
+	mtk_crtc = to_mtk_crtc(crtc);
+	{
 	unsigned int refresh_rate =
 		drm_mode_vrefresh(&mtk_crtc->base.state->adjusted_mode);
 
@@ -1096,6 +1106,7 @@ static int mtk_dsi_set_LFR(struct mtk_dsi *dsi, struct mtk_ddp_comp *comp,
 			comp->regs_pa + DSI_LFR_CON, val, mask);
 
 	return 0;
+	}
 }
 
 static int mtk_dsi_LFR_update(struct mtk_dsi *dsi, struct mtk_ddp_comp *comp,
@@ -1152,10 +1163,15 @@ static int mtk_dsi_set_data_rate(struct mtk_dsi *dsi)
 	/* Store DSI data rate in MHz */
 	dsi->data_rate = data_rate;
 
-	pr_err("XAGA-DSI[datarate] set hs_clk to %lu Hz (%d MHz)\n",
+	/* The bring-up hs_clk is a fixed-clock stub, not a child of the MIPI
+	 * TX PLL, so clk_set_rate above never reaches the PLL. Feed the rate
+	 * directly; pll_prepare consumes data_rate_adpt when programming. */
+	mtk_mipi_tx_pll_rate_set_adpt(dsi->phy, data_rate * 1000000);
+
+	pr_err("COROT-DSI[datarate] set hs_clk to %lu Hz (%d MHz)\n",
 	       mipi_tx_rate, data_rate);
 	ret = clk_set_rate(dsi->hs_clk, mipi_tx_rate);
-	pr_err("XAGA-DSI[datarate] clk_set_rate ret=%d\n", ret);
+	pr_err("COROT-DSI[datarate] clk_set_rate ret=%d\n", ret);
 	return ret;
 }
 
@@ -1173,13 +1189,13 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 #endif
 	DDPDBG("%s+\n", __func__);
 	{
-		void __iomem *tx = ioremap(0x11f70000, 0x1000);
+		void __iomem *tx = ioremap(0x11e50000, 0x1000);
 
-		pr_err("XAGA-DSI[poweron+] CON=0x%08x START=0x%08x INTSTA=0x%08x INTEN=0x%08x MODE=0x%08x\n",
+		pr_err("COROT-DSI[poweron+] CON=0x%08x START=0x%08x INTSTA=0x%08x INTEN=0x%08x MODE=0x%08x\n",
 		       readl(dsi->regs + DSI_CON_CTRL), readl(dsi->regs + DSI_START),
 		       readl(dsi->regs + DSI_INTSTA), readl(dsi->regs + DSI_INTEN),
 		       readl(dsi->regs + DSI_MODE_CTRL));
-		pr_err("XAGA-MIPITX[poweron+] PLL_CON0=0x%08x PLL_CON1=0x%08x PLL_CON4=0x%08x LANE_CON=0x%08x VOLTAGE_SEL=0x%08x\n",
+		pr_err("COROT-MIPITX[poweron+] PLL_CON0=0x%08x PLL_CON1=0x%08x PLL_CON4=0x%08x LANE_CON=0x%08x VOLTAGE_SEL=0x%08x\n",
 		       readl(tx + 0x2c), readl(tx + 0x30), readl(tx + 0x3c),
 		       readl(tx + 0x04), readl(tx + 0x08));
 		iounmap(tx);
@@ -1234,12 +1250,12 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 
 		phy_power_on(dsi->phy);
 
-		pr_err("XAGA-DSI[poweron] phy_power_on done, data_rate=%d MHz\n",
+		pr_err("COROT-DSI[poweron] phy_power_on done, data_rate=%d MHz\n",
 		       dsi->data_rate);
 		{
-			void __iomem *tx = ioremap(0x11f70000, 0x1000);
+			void __iomem *tx = ioremap(0x11e50000, 0x1000);
 
-			pr_err("XAGA-MIPITX[after-phy] PLL_CON0=0x%08x PLL_CON1=0x%08x PLL_CON4=0x%08x LANE_CON=0x%08x VOLTAGE_SEL=0x%08x\n",
+			pr_err("COROT-MIPITX[after-phy] PLL_CON0=0x%08x PLL_CON1=0x%08x PLL_CON4=0x%08x LANE_CON=0x%08x VOLTAGE_SEL=0x%08x\n",
 			       readl(tx + 0x2c), readl(tx + 0x30),
 			       readl(tx + 0x3c), readl(tx + 0x04),
 			       readl(tx + 0x08));
@@ -1298,7 +1314,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 		mtk_dsi_mask(dsi, DSI_SHADOW_DEBUG,
 			DSI_BYPASS_SHADOW, DSI_BYPASS_SHADOW);
 
-	pr_err("XAGA-DSI[poweron-] CON=0x%08x START=0x%08x INTSTA=0x%08x INTEN=0x%08x\n",
+	pr_err("COROT-DSI[poweron-] CON=0x%08x START=0x%08x INTSTA=0x%08x INTEN=0x%08x\n",
 	       readl(dsi->regs + DSI_CON_CTRL), readl(dsi->regs + DSI_START),
 	       readl(dsi->regs + DSI_INTSTA), readl(dsi->regs + DSI_INTEN));
 
@@ -1610,11 +1626,22 @@ static void mtk_dsi_tx_buf_rw(struct mtk_dsi *dsi)
 	u32 width, height, tmp = 0, rw_times;
 	u32 preultra_hi, preultra_lo, ultra_hi, ultra_lo, urgent_hi, urgent_lo;
 	u32 fill_rate, sodi_hi, sodi_lo;
+	u32 sram_unit, buffer_unit;
+	u32 urgent_lo_fifo_us, urgent_hi_fifo_us;
 	struct mtk_panel_ext *ext = mtk_dsi_get_panel_ext(&dsi->ddp_comp);
 	struct mtk_panel_dsc_params *dsc_params = &ext->params->dsc_params;
 	struct mtk_drm_crtc *mtk_crtc = dsi->ddp_comp.mtk_crtc;
 	u32 dsi_buf_bpp = mtk_get_dsi_buf_bpp(dsi);
 	u32 every_line = 1;
+
+	buffer_unit = dsi->driver_data->buffer_unit ?
+		dsi->driver_data->buffer_unit : 18;
+	sram_unit = dsi->driver_data->sram_unit ?
+		dsi->driver_data->sram_unit : 18;
+	urgent_lo_fifo_us = dsi->driver_data->urgent_lo_fifo_us ?
+		dsi->driver_data->urgent_lo_fifo_us : 11;
+	urgent_hi_fifo_us = dsi->driver_data->urgent_hi_fifo_us ?
+		dsi->driver_data->urgent_hi_fifo_us : 12;
 
 	if (!dsi->is_slave) {
 		width = mtk_dsi_get_virtual_width(dsi, dsi->encoder.crtc);
@@ -1671,9 +1698,9 @@ static void mtk_dsi_tx_buf_rw(struct mtk_dsi *dsi)
 
 	if (mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
 		if (dsi->ext->params->is_cphy) {
-			tmp = 25 * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
+			tmp = 25 * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
 		} else {
-			tmp = 25 * dsi->data_rate * dsi->lanes / 8 / 18;
+			tmp = 25 * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
 		}
 	}
 
@@ -1695,27 +1722,27 @@ static void mtk_dsi_tx_buf_rw(struct mtk_dsi *dsi)
 	/* enable ultra signal between SOF to VACT */
 	mtk_dsi_mask(dsi, DSI_RESERVED, DSI_VDE_BLOCK_ULTRA, 0);
 
-	fill_rate = mmsys_clk * 3 / 18;
-	tmp = readl(dsi->regs + DSI_BUF_CON1) >> 16;
+	fill_rate = mmsys_clk * dsi_buf_bpp / buffer_unit;
+	tmp = (readl(dsi->regs + DSI_BUF_CON1) >> 16) * sram_unit / buffer_unit;
 
 	if (dsi->ext->params->is_cphy) {
-		sodi_hi = tmp - (12 * (fill_rate - dsi->data_rate * 2 * dsi->lanes / 7 / 18) / 10);
-		sodi_lo = (23 + 5) * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
-		preultra_hi = 26 * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
-		preultra_lo = 25 * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
-		ultra_hi = 25 * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
-		ultra_lo = 23 * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
-		urgent_hi = 12 * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
-		urgent_lo = 11 * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
+		sodi_hi = tmp - (12 * (fill_rate - dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit) / 10);
+		sodi_lo = (23 + 5) * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
+		preultra_hi = 26 * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
+		preultra_lo = 25 * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
+		ultra_hi = 25 * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
+		ultra_lo = 23 * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
+		urgent_hi = urgent_hi_fifo_us * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
+		urgent_lo = urgent_lo_fifo_us * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
 	} else {
-		sodi_hi = tmp - (12 * (fill_rate - dsi->data_rate * dsi->lanes / 8 / 18) / 10);
-		sodi_lo = (23 + 5) * dsi->data_rate * dsi->lanes / 8 / 18;
-		preultra_hi = 26 * dsi->data_rate * dsi->lanes / 8 / 18;
-		preultra_lo = 25 * dsi->data_rate * dsi->lanes / 8 / 18;
-		ultra_hi = 25 * dsi->data_rate * dsi->lanes / 8 / 18;
-		ultra_lo = 23 * dsi->data_rate * dsi->lanes / 8 / 18;
-		urgent_hi = 12 * dsi->data_rate * dsi->lanes / 8 / 18;
-		urgent_lo = 11 * dsi->data_rate * dsi->lanes / 8 / 18;
+		sodi_hi = tmp - (12 * (fill_rate - dsi->data_rate * dsi->lanes / 8 / buffer_unit) / 10);
+		sodi_lo = (23 + 5) * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
+		preultra_hi = 26 * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
+		preultra_lo = 25 * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
+		ultra_hi = 25 * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
+		ultra_lo = 23 * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
+		urgent_hi = urgent_hi_fifo_us * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
+		urgent_lo = urgent_lo_fifo_us * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
 	}
 
 	writel((sodi_hi & 0xfffff), dsi->regs + DSI_BUF_SODI_HIGH);
@@ -1891,12 +1918,19 @@ static void mtk_dsi_self_pattern(struct mtk_dsi *dsi)
 
 static void mtk_dsi_start(struct mtk_dsi *dsi)
 {
-	pr_err("XAGA-STAGE dsi_start: START 0->1 (was CON=0x%08x MODE=0x%08x)\n",
+	pr_err("COROT-STAGE dsi_start: START 0->1 (was CON=0x%08x MODE=0x%08x)\n",
 	       readl(dsi->regs + DSI_CON_CTRL),
 	       readl(dsi->regs + DSI_MODE_CTRL));
+	/* MT6985 bring-up: DSI_EN sometimes reads back cleared between
+	 * preconfig and the first CPU transfer; without it the engine never
+	 * transmits and BUSY stays set until timeout. */
+	if (!(readl(dsi->regs + DSI_CON_CTRL) & DSI_EN)) {
+		pr_err("COROT-STAGE dsi_start: DSI_EN was lost, re-enabling\n");
+		mtk_dsi_enable(dsi);
+	}
 	writel(0, dsi->regs + DSI_START);
 	writel(1, dsi->regs + DSI_START);
-	pr_err("XAGA-STAGE dsi_start done: START=0x%08x INTSTA=0x%08x\n",
+	pr_err("COROT-STAGE dsi_start done: START=0x%08x INTSTA=0x%08x\n",
 	       readl(dsi->regs + DSI_START), readl(dsi->regs + DSI_INTSTA));
 }
 
@@ -1924,7 +1958,7 @@ static void mtk_dsi_set_interrupt_enable(struct mtk_dsi *dsi)
 	else
 		inten |= TE_RDY_INT_FLAG;
 
-	pr_err("XAGA-DSI[irq_enable] INTSTA(was)=0x%08x -> INTEN=0x%08x\n",
+	pr_err("COROT-DSI[irq_enable] INTSTA(was)=0x%08x -> INTEN=0x%08x\n",
 	       readl(dsi->regs + DSI_INTSTA), inten);
 	writel(0, dsi->regs + DSI_INTSTA);
 	writel(inten, dsi->regs + DSI_INTEN);
@@ -2012,6 +2046,7 @@ static void mtk_dsi_cmdq_poll(struct mtk_ddp_comp *comp,
 static s32 mtk_dsi_poll_for_idle(struct mtk_dsi *dsi, struct cmdq_pkt *handle)
 {
 	unsigned int loop_cnt = 0;
+	unsigned int loop_max = 100 * 1000;
 	s32 tmp;
 
 #ifndef DRM_CMDQ_DISABLE
@@ -2023,7 +2058,12 @@ static s32 mtk_dsi_poll_for_idle(struct mtk_dsi *dsi, struct cmdq_pkt *handle)
 	}
 #endif
 
-	while (loop_cnt < 100 * 1000) {
+	/* MT6985 bring-up: the first packets after engine start complete
+	 * well past the 100ms default window; give them up to 1s. */
+	if (of_machine_is_compatible("mediatek,mt6985"))
+		loop_max = 1000 * 1000;
+
+	while (loop_cnt < loop_max) {
 		tmp = readl(dsi->regs + DSI_INTSTA);
 		if (!(tmp & DSI_BUSY))
 			return 1;
@@ -2031,6 +2071,16 @@ static s32 mtk_dsi_poll_for_idle(struct mtk_dsi *dsi, struct cmdq_pkt *handle)
 		udelay(1);
 	}
 	DDPPR_ERR("%s timeout\n", __func__);
+	if (of_machine_is_compatible("mediatek,mt6985"))
+		pr_err("COROT-DSI[hung] INTSTA=0x%08x START=0x%08x TXRX=0x%08x MODE=0x%08x CON=0x%08x SIZE=0x%08x CMDQ0=0x%08x CMDQ1=0x%08x\n",
+		       readl(dsi->regs + DSI_INTSTA),
+		       readl(dsi->regs + DSI_START),
+		       readl(dsi->regs + DSI_TXRX_CTRL),
+		       readl(dsi->regs + DSI_MODE_CTRL),
+		       readl(dsi->regs + DSI_CON_CTRL),
+		       readl(dsi->regs + DSI_CMDQ_SIZE),
+		       readl(dsi->regs + dsi->driver_data->reg_cmdq0_ofs),
+		       readl(dsi->regs + dsi->driver_data->reg_cmdq0_ofs + 4));
 	return 0;
 }
 
@@ -2326,6 +2376,7 @@ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
 	|| IS_ENABLED(CONFIG_DRM_PANEL_L12A_36_02_0B_DSC_CMD) \
 	|| IS_ENABLED(CONFIG_DRM_PANEL_L2M_38_0A_0A_DSC_CMD)\
 	|| IS_ENABLED(CONFIG_DRM_PANEL_M9_42_02_0A_DSC_CMD)\
+	|| IS_ENABLED(CONFIG_DRM_PANEL_M12_MIN) \
 	|| IS_ENABLED(CONFIG_DRM_PANEL_M12A_42_02_0B_DSC_CMD) \
 	|| IS_ENABLED(CONFIG_DRM_PANEL_M12A_36_02_0A_DSC_CMD)
 	/* power-off  for vddi */
@@ -2582,7 +2633,7 @@ static int mtk_preconfig_dsi_enable(struct mtk_dsi *dsi)
 {
 	int ret;
 
-	pr_err("XAGA-DSI[preconfig+] CON=0x%08x START=0x%08x INTSTA=0x%08x\n",
+	pr_err("COROT-DSI[preconfig+] CON=0x%08x START=0x%08x INTSTA=0x%08x\n",
 	       readl(dsi->regs + DSI_CON_CTRL), readl(dsi->regs + DSI_START),
 	       readl(dsi->regs + DSI_INTSTA));
 	ret = mtk_dsi_poweron(dsi);
@@ -2623,8 +2674,8 @@ static int mtk_preconfig_dsi_enable(struct mtk_dsi *dsi)
 	mtk_dsi_clk_hs_mode(dsi, 0);
 #endif
 
-	pr_err("XAGA-STAGE preconfig_dsi_enable done (timing configured)\n");
-	xaga_dump_dsi();
+	pr_err("COROT-STAGE preconfig_dsi_enable done (timing configured)\n");
+	corot_dump_dsi();
 
 	return 0;
 }
@@ -2726,7 +2777,7 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 
 	DDPINFO("%s +\n", __func__);
 
-	pr_err("XAGA-DSI[output_enable] output_en=%d doze=%d panel=%p\n",
+	pr_err("COROT-DSI[output_enable] output_en=%d doze=%d panel=%p\n",
 	       dsi->output_en, new_doze_state, dsi->panel);
 
 	if (dsi->output_en) {
@@ -2767,7 +2818,7 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 	if (dsi->panel) {
 		DDP_PROFILE("[PROFILE] %s panel init start\n", __func__);
 		/*
-		 * xaga: KDE switches modes through the standard CRTC mode, not the
+		 * corot: KDE switches modes through the standard CRTC mode, not the
 		 * MTK CRTC_PROP_DISP_MODE_IDX property, so the panel ext params
 		 * (dynamic_fps) would stay stale.  Derive the mode index from the
 		 * connector and sync them before prepare, so the panel driver can
@@ -2780,7 +2831,7 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 
 			list_for_each_entry(m, &dsi->conn.modes, head) {
 				if (drm_mode_equal(m, &crtc->state->mode)) {
-					DDPINFO("%s xaga sync ext params idx=%d fps=%d\n",
+					DDPINFO("%s corot sync ext params idx=%d fps=%d\n",
 						__func__, idx, drm_mode_vrefresh(m));
 					dsi->ext->funcs->ext_param_set(dsi->panel,
 							&dsi->conn, idx);
@@ -2789,8 +2840,14 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 				idx++;
 			}
 		}
-		if (!dsi->doze_enabled || force_lcm_update)
+		if (!dsi->doze_enabled || force_lcm_update) {
 			drm_panel_prepare(dsi->panel);
+			/* drm_panel_prepare() is void in 7.2; infer failure from the
+			 * prepared flag and skip enable so a dead panel cannot crash. */
+			dsi->m12_prepare_ok = dsi->panel->prepared;
+			if (!dsi->m12_prepare_ok)
+				pr_err("COROT-DSI[prepare] panel prepare FAILED; skip enable\n");
+		}
 
 #if IS_ENABLED(CONFIG_DRM_PANEL_L11_38_0A_0A_DSC_CMD) \
 	|| IS_ENABLED(CONFIG_DRM_PANEL_L11A_38_0A_0A_DSC_CMD) \
@@ -2799,6 +2856,7 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 	|| IS_ENABLED(CONFIG_DRM_PANEL_L12A_36_02_0B_DSC_CMD) \
 	|| IS_ENABLED(CONFIG_DRM_PANEL_L12A_42_02_0A_DSC_CMD) \
 	|| IS_ENABLED(CONFIG_DRM_PANEL_M9_42_02_0A_DSC_CMD) \
+	|| IS_ENABLED(CONFIG_DRM_PANEL_M12_MIN) \
         || IS_ENABLED(CONFIG_DRM_PANEL_M12A_42_02_0B_DSC_CMD) \
         || IS_ENABLED(CONFIG_DRM_PANEL_M12A_36_02_0A_DSC_CMD)
 		mtk_dsi_exit_ulps(dsi);
@@ -2888,16 +2946,16 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 	mtk_dsi_self_pattern(dsi);
 #endif
 
-	pr_err("XAGA-STAGE output_dsi_enable: panel_prepare + set_mode + hs done\n");
-	xaga_dump_dsi();
+	pr_err("COROT-STAGE output_dsi_enable: panel_prepare + set_mode + hs done\n");
+	corot_dump_dsi();
 
 	if (!mtk_dsi_is_cmd_mode(&dsi->ddp_comp))
 		mtk_dsi_start(dsi);
 
-	if (dsi->panel) {
+	if (dsi->panel && dsi->m12_prepare_ok) {
 		drm_panel_enable(dsi->panel);
-		pr_err("XAGA-DSC[after_panel_enable] %s\n", __func__);
-		xaga_dump_disp("after_panel_enable");
+		pr_err("COROT-DSC[after_panel_enable] %s\n", __func__);
+		corot_dump_disp("after_panel_enable");
 #ifdef CONFIG_MI_DISP_ESD_CHECK
 		if (!new_doze_state)
 			mi_disp_err_flag_esd_check_switch(&dsi->ddp_comp.mtk_crtc->base, true);
@@ -3565,7 +3623,7 @@ static int mtk_dsi_start_vdo_mode(struct mtk_ddp_comp *comp, void *handle)
 	if (dsi->slave_dsi)
 		_mtk_dsi_set_mode(&dsi->slave_dsi->ddp_comp, handle, vid_mode);
 
-	pr_err("XAGA-DSI[start_vdo] vid_mode=%d\n", vid_mode);
+	pr_err("COROT-DSI[start_vdo] vid_mode=%d\n", vid_mode);
 
 	return 0;
 }
@@ -4091,29 +4149,29 @@ static void mtk_dsi_ddp_prepare(struct mtk_ddp_comp *comp)
 	 * trigger-loop WFE on DSI0_EOF does not see a stale FRAME_DONE.
 	 */
 	writel(0, dsi->regs + DSI_INTSTA);
-	pr_err("XAGA-DSI[ddp_prepare] after direct INTSTA clear=0x%08x\n",
+	pr_err("COROT-DSI[ddp_prepare] after direct INTSTA clear=0x%08x\n",
 	       readl(dsi->regs + DSI_INTSTA));
 
 	{
 		void __iomem *r = dsi->regs;
 		struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
 
-		pr_err("XAGA-DSI[ddp_prepare] is_dual_pipe=%d crtc=%p slave_dsi=%p\n",
+		pr_err("COROT-DSI[ddp_prepare] is_dual_pipe=%d crtc=%p slave_dsi=%p\n",
 		       mtk_crtc ? mtk_crtc->is_dual_pipe : -1, mtk_crtc,
 		       dsi->slave_dsi);
-		pr_err("XAGA-DSI[ddp_prepare] START=0x%08x CON=0x%08x MODE=0x%08x TXRX=0x%08x\n",
+		pr_err("COROT-DSI[ddp_prepare] START=0x%08x CON=0x%08x MODE=0x%08x TXRX=0x%08x\n",
 		       readl(r + 0x00), readl(r + DSI_CON_CTRL),
 		       readl(r + DSI_MODE_CTRL), readl(r + DSI_TXRX_CTRL));
-		pr_err("XAGA-DSI[ddp_prepare] PSCTRL=0x%08x SIZE_CON=0x%08x VM_CMD=0x%08x\n",
+		pr_err("COROT-DSI[ddp_prepare] PSCTRL=0x%08x SIZE_CON=0x%08x VM_CMD=0x%08x\n",
 		       readl(r + DSI_PSCTRL), readl(r + DSI_SIZE_CON),
 		       readl(r + dsi->driver_data->reg_vm_cmd_con_ofs));
-		pr_err("XAGA-DSI[ddp_prepare] LCCON=0x%08x LD0CON=0x%08x BUF_CON1=0x%08x\n",
+		pr_err("COROT-DSI[ddp_prepare] LCCON=0x%08x LD0CON=0x%08x BUF_CON1=0x%08x\n",
 		       readl(r + DSI_PHY_LCCON), readl(r + DSI_PHY_LD0CON),
 		       readl(r + DSI_BUF_CON1));
-		pr_err("XAGA-DSI[ddp_prepare] VSA=0x%08x VBP=0x%08x VFP=0x%08x VACT=0x%08x\n",
+		pr_err("COROT-DSI[ddp_prepare] VSA=0x%08x VBP=0x%08x VFP=0x%08x VACT=0x%08x\n",
 		       readl(r + DSI_VSA_NL), readl(r + DSI_VBP_NL),
 		       readl(r + DSI_VFP_NL), readl(r + DSI_VACT_NL));
-		pr_err("XAGA-DSI[ddp_prepare] HSA=0x%08x HBP=0x%08x HFP=0x%08x HSTX_CKL=0x%08x\n",
+		pr_err("COROT-DSI[ddp_prepare] HSA=0x%08x HBP=0x%08x HFP=0x%08x HSTX_CKL=0x%08x\n",
 		       readl(r + DSI_HSA_WC), readl(r + DSI_HBP_WC),
 		       readl(r + DSI_HFP_WC), readl(r + DSI_HSTX_CKL_WC));
 		{
@@ -4127,34 +4185,34 @@ static void mtk_dsi_ddp_prepare(struct mtk_ddp_comp *comp)
 
 			for (i = 0; i < 3; i++)
 				or[i] = ioremap(obase[i], 0x1000);
-			pr_err("XAGA-RDMA[LK] GLOBAL_CON=0x%08x SIZE0=0x%08x SIZE1=0x%08x FIFO=0x%08x\n",
+			pr_err("COROT-RDMA[LK] GLOBAL_CON=0x%08x SIZE0=0x%08x SIZE1=0x%08x FIFO=0x%08x\n",
 			       readl(rr + 0x10), readl(rr + 0x14), readl(rr + 0x18),
 			       readl(rr + 0x40));
-			pr_err("XAGA-RDMA1[LK] GLOBAL_CON=0x%08x SIZE0=0x%08x SIZE1=0x%08x FIFO=0x%08x\n",
+			pr_err("COROT-RDMA1[LK] GLOBAL_CON=0x%08x SIZE0=0x%08x SIZE1=0x%08x FIFO=0x%08x\n",
 			       readl(rr1 + 0x10), readl(rr1 + 0x14), readl(rr1 + 0x18),
 			       readl(rr1 + 0x40));
 			for (i = 0; i < 3; i++) {
-				pr_err("XAGA-OVL[%s] EN=0x%08x INTSTA=0x%08x ROI=0x%08x SRC_CON=0x%08x DATAPATH=0x%08x\n",
+				pr_err("COROT-OVL[%s] EN=0x%08x INTSTA=0x%08x ROI=0x%08x SRC_CON=0x%08x DATAPATH=0x%08x\n",
 				       oname[i], readl(or[i] + 0x0c), readl(or[i] + 0x08),
 				       readl(or[i] + 0x20), readl(or[i] + 0x2c),
 				       readl(or[i] + 0x24));
-				pr_err("XAGA-OVL[%s] CON0=0x%08x SRC_SIZE0=0x%08x PITCH0=0x%08x ADDR0=0x%08x ADDR_MSB0=0x%08x RDMA_CTRL0=0x%08x\n",
+				pr_err("COROT-OVL[%s] CON0=0x%08x SRC_SIZE0=0x%08x PITCH0=0x%08x ADDR0=0x%08x ADDR_MSB0=0x%08x RDMA_CTRL0=0x%08x\n",
 				       oname[i], readl(or[i] + 0x30), readl(or[i] + 0x38),
 				       readl(or[i] + 0x44), readl(or[i] + 0xf40),
 				       readl(or[i] + 0xf44), readl(or[i] + 0xc0));
 			}
-			pr_err("XAGA-XBAR OVL0_MOUT_EN=0x%08x OVL0_2L_MOUT_EN=0x%08x OVL1_2L_MOUT_EN=0x%08x\n",
+			pr_err("COROT-XBAR OVL0_MOUT_EN=0x%08x OVL0_2L_MOUT_EN=0x%08x OVL1_2L_MOUT_EN=0x%08x\n",
 			       readl(mx + 0xf08), readl(mx + 0xf04), readl(mx + 0xf0c));
-			pr_err("XAGA-XBAR MMSYS_OVL_CON=0x%08x OVL0_BLENDOUT_SOUT=0x%08x OVL1_2L_BLENDOUT_SOUT=0x%08x\n",
+			pr_err("COROT-XBAR MMSYS_OVL_CON=0x%08x OVL0_BLENDOUT_SOUT=0x%08x OVL1_2L_BLENDOUT_SOUT=0x%08x\n",
 			       readl(mx + 0xf4c), readl(mx + 0xf6c), readl(mx + 0xfa0));
-			pr_err("XAGA-XBAR OVL0_2L_OVL1_OVL1_2L_BGOUT=0x%08x TOVL0_OUT1_SEL_IN=0x%08x TOVL0_OUT1_MOUT=0x%08x\n",
+			pr_err("COROT-XBAR OVL0_2L_OVL1_OVL1_2L_BGOUT=0x%08x TOVL0_OUT1_SEL_IN=0x%08x TOVL0_OUT1_MOUT=0x%08x\n",
 			       readl(mx + 0xf68), readl(mx + 0xf70), readl(mx + 0xf74));
-			pr_err("XAGA-XBAR RDMA0_SEL_IN=0x%08x RDMA0_SOUT_SEL=0x%08x RDMA0_RSZ0_SEL_IN=0x%08x RSZ0_MOUT=0x%08x\n",
+			pr_err("COROT-XBAR RDMA0_SEL_IN=0x%08x RDMA0_SOUT_SEL=0x%08x RDMA0_RSZ0_SEL_IN=0x%08x RSZ0_MOUT=0x%08x\n",
 			       readl(mx + 0xf34), readl(mx + 0xf38), readl(mx + 0xf3c),
 			       readl(mx + 0xf7c));
-			pr_err("XAGA-XBAR DITHER0_MOUT=0x%08x DSI0_SEL_IN=0x%08x DSC_WRAP_SOUT_SEL=0x%08x\n",
+			pr_err("COROT-XBAR DITHER0_MOUT=0x%08x DSI0_SEL_IN=0x%08x DSC_WRAP_SOUT_SEL=0x%08x\n",
 			       readl(mx + 0xf50), readl(mx + 0xf54), readl(mx + 0xf80));
-			pr_err("XAGA-XBAR RSZ0_SEL_IN=0x%08x RDMA1_SEL_IN=0x%08x RDMA1_SOUT_SEL=0x%08x PQ0_SOUT=0x%08x\n",
+			pr_err("COROT-XBAR RSZ0_SEL_IN=0x%08x RDMA1_SEL_IN=0x%08x RDMA1_SOUT_SEL=0x%08x PQ0_SOUT=0x%08x\n",
 			       readl(mx + 0xf78), readl(mx + 0xfc4), readl(mx + 0xfcc),
 			       readl(mx + 0xff8));
 			for (i = 0; i < 3; i++)
@@ -4752,6 +4810,12 @@ static void mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
 		config = BTA;
 	else
 		config = (msg->tx_len > 2) ? LONG_PACKET : SHORT_PACKET;
+
+	/* MT6985 (dsi_buffer gen): the command engine only transmits when the
+	 * HSTX bit is set in the packet header; without it the packet never
+	 * leaves and DSI_BUSY stays asserted (vendor gce2 path always sets it). */
+	if (!MTK_DSI_HOST_IS_READ(type))
+		config |= HSTX;
 
 	if (msg->tx_len > 2) {
 		cmdq_size = 1 + (msg->tx_len + 3) / 4;
@@ -6227,7 +6291,7 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
 	else
 		irq_flag = CMD_DONE_INT_FLAG;
 
-	pr_err("XAGA-DSI[transfer] type=0x%02x tx_len=%d mode_ctrl=0x%08x irq=0x%02x\n",
+	pr_err("COROT-DSI[transfer] type=0x%02x tx_len=%d mode_ctrl=0x%08x irq=0x%02x\n",
 	       msg->type, msg->tx_len,
 	       readl(dsi->regs + DSI_MODE_CTRL), irq_flag);
 
@@ -7102,6 +7166,7 @@ skip_change_mipi:
 		mtk_dsi_poll_for_idle(dsi, cmdq_handle2);
 #ifdef CONFIG_MI_DISP
 #if IS_ENABLED(CONFIG_DRM_PANEL_L11_38_0A_0A_DSC_CMD) || IS_ENABLED(CONFIG_DRM_PANEL_L11A_38_0A_0A_DSC_CMD) || IS_ENABLED(CONFIG_DRM_PANEL_L2M_38_0A_0A_DSC_CMD) || IS_ENABLED(CONFIG_DRM_PANEL_M11R_38_0A_0A_DSC_CMD) || IS_ENABLED(CONFIG_DRM_PANEL_M9_42_02_0A_DSC_CMD)
+|| IS_ENABLED(CONFIG_DRM_PANEL_M12_MIN)
 	if (!((fps_src == 60 || fps_src == 90) && (fps_dst == 120))) {
 		cmdq_pkt_clear_event(cmdq_handle2,
 			mtk_crtc->gce_obj.event[EVENT_TE]);
@@ -8012,6 +8077,11 @@ static int mtk_dsi_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 		unsigned long long *base_bw =
 			(unsigned long long *)params;
 
+		if (!crtc || !crtc->base.dev ||
+		    ((struct mtk_drm_private *)crtc->base.dev->dev_private)->data->mmsys_id == MMSYS_MT6985) {
+			*base_bw = 0;
+			break;
+		}
 		*base_bw = mtk_dsi_get_frame_hrt_bw_base_by_datarate(crtc, dsi);
 	}
 		break;
@@ -8541,6 +8611,32 @@ static const struct mtk_dsi_driver_data mt6983_dsi_driver_data = {
 	.need_bypass_shadow = false,
 	.need_wait_fifo = false,
 	.dsi_buffer = true,
+	.buffer_unit = 18,
+	.sram_unit = 18,
+	.dsi_new_trail = false,
+	.max_vfp = 0xffe,
+	.mmclk_by_datarate = mtk_dsi_set_mmclk_by_datarate_V2,
+};
+
+static const struct mtk_dsi_driver_data mt6985_dsi_driver_data = {
+	.reg_cmdq0_ofs = 0xd00,
+	.reg_cmdq1_ofs = 0xd04,
+	.reg_vm_cmd_con_ofs = 0x200,
+	.reg_vm_cmd_data0_ofs = 0x208,
+	.reg_vm_cmd_data10_ofs = 0x218,
+	.reg_vm_cmd_data20_ofs = 0x228,
+	.reg_vm_cmd_data30_ofs = 0x238,
+	.poll_for_idle = mtk_dsi_poll_for_idle,
+	.irq_handler = mtk_dsi_irq_status,
+	.esd_eint_compat = "mediatek, DSI_TE-eint",
+	.support_shadow = false,
+	.need_bypass_shadow = false,
+	.need_wait_fifo = false,
+	.dsi_buffer = true,
+	.buffer_unit = 32,
+	.sram_unit = 18,
+	.urgent_lo_fifo_us = 14,
+	.urgent_hi_fifo_us = 15,
 	.dsi_new_trail = false,
 	.max_vfp = 0xffe,
 	.mmclk_by_datarate = mtk_dsi_set_mmclk_by_datarate_V2,
@@ -8688,6 +8784,7 @@ static const struct of_device_id mtk_dsi_of_match[] = {
 	{.compatible = "mediatek,mt8173-dsi", .data = &mt8173_dsi_driver_data},
 	{.compatible = "mediatek,mt6885-dsi", .data = &mt6885_dsi_driver_data},
 	{.compatible = "mediatek,mt6983-dsi", .data = &mt6983_dsi_driver_data},
+	{.compatible = "mediatek,mt6985-dsi", .data = &mt6985_dsi_driver_data},
 	{.compatible = "mediatek,mt6895-dsi", .data = &mt6895_dsi_driver_data},
 	{.compatible = "mediatek,mt6873-dsi", .data = &mt6873_dsi_driver_data},
 	{.compatible = "mediatek,mt6853-dsi", .data = &mt6853_dsi_driver_data},
@@ -8753,7 +8850,7 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 			}
 			if (dsi->panel)
 				dsi->ext = find_panel_ext(dsi->panel);
-			pr_err("XAGA-DBG[dsi_probe] panel=%px ext=%px\n",
+			pr_err("COROT-DBG[dsi_probe] panel=%px ext=%px\n",
 				dsi->panel, dsi->ext);
 			if (dsi->slave_dsi) {
 				dsi->slave_dsi->ext = dsi->ext;
@@ -8789,7 +8886,7 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 
 	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	dsi->regs = devm_ioremap_resource(dev, regs);
-	pr_err("XAGA-DSI[probe] INTSTA=0x%08x INTEN=0x%08x START=0x%08x\n",
+	pr_err("COROT-DSI[probe] INTSTA=0x%08x INTEN=0x%08x START=0x%08x\n",
 	       readl(dsi->regs + DSI_INTSTA), readl(dsi->regs + DSI_INTEN),
 	       readl(dsi->regs + DSI_START));
 	if (IS_ERR(dsi->regs)) {
@@ -8831,7 +8928,9 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 		goto error;
 	}
 
-	writel(0, dsi->regs + DSI_INTSTA);
+	/* INTSTA is write-1-clear; writing 0 never clears the stale LK bits
+	 * and the level IRQ storms until the core disables it. */
+	writel(0xffffffff, dsi->regs + DSI_INTSTA);
 	writel(0, dsi->regs + DSI_INTEN);
 	irq_set_status_flags(irq_num, IRQ_TYPE_LEVEL_HIGH);
 	ret = devm_request_irq(
@@ -8860,7 +8959,8 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	/* Assume DSI0 enable already in LK */
 	if (dsi->ddp_comp.id == DDP_COMPONENT_DSI0) {
 #ifndef CONFIG_MTK_DISP_NO_LK
-		if (disp_helper_get_stage() == DISP_HELPER_STAGE_NORMAL) {
+		if (disp_helper_get_stage() == DISP_HELPER_STAGE_NORMAL &&
+		    !of_machine_is_compatible("mediatek,mt6985")) {
 			phy_power_on(dsi->phy);
 			ret = clk_prepare_enable(dsi->engine_clk);
 			if (ret < 0)
@@ -8872,8 +8972,18 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 				DDPPR_ERR("%s Failed to enable digital clock: %d\n",
 					__func__, ret);
 		}
-		dsi->output_en = true;
-		dsi->clk_refcnt = 1;
+			/* MT6985 (corot): LK leaves the panel on, but the DRM
+			 * lifecycle must still run panel prepare/enable once;
+			 * force the full path instead of assuming LK state. */
+			if (of_machine_is_compatible("mediatek,mt6985")) {
+				dsi->output_en = false;
+				/* Full poweron must run (PLL/PHY) or HS clock stays
+				 * dead and every CPU DSI transfer times out. */
+				dsi->clk_refcnt = 0;
+			} else {
+				dsi->output_en = true;
+				dsi->clk_refcnt = 1;
+			}
 #endif
 	}
 

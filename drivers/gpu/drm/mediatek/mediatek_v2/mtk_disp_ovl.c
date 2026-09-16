@@ -337,6 +337,14 @@ int mtk_dprec_mmp_dump_ovl_layer(struct mtk_plane_state *plane_state);
 
 
 /* AID offset in mmsys config */
+/* MT6985 exposes one AID bit per layer in the OVL system block. */
+#define MT6985_OVL0_2L_AID_SEL	(0xB00UL)
+#define MT6985_OVL1_2L_AID_SEL	(0xB20UL)
+#define MT6985_OVL2_2L_AID_SEL	(0xB40UL)
+#define MT6985_OVL3_2L_AID_SEL	(0xB60UL)
+#define MT6985_OVL_LAYER_OFFSET	0x4
+#define MT6985_OVLSYS_REG_MASK	0x1FFFFFUL
+
 #define MT6983_OVL0_AID_SEL	(0xB00UL)
 #define MT6983_OVL1_2L_AID_SEL	(0xB08UL)
 #define MT6983_OVL0_2L_NWCG_AID_SEL (0xB0CUL)
@@ -441,8 +449,10 @@ struct mtk_disp_ovl_data {
 	unsigned int greq_num_dl;
 	bool is_support_34bits;
 	unsigned int (*aid_sel_mapping)(struct mtk_ddp_comp *comp);
+	bool aid_per_layer_setting;
 	resource_size_t (*mmsys_mapping)(struct mtk_ddp_comp *comp);
 	unsigned int source_bpc;
+	bool support_pq_selfloop;
 };
 
 #define MAX_LAYER_NUM 4
@@ -518,6 +528,26 @@ resource_size_t mtk_ovl_mmsys_mapping_MT6983(struct mtk_ddp_comp *comp)
 	}
 }
 
+static resource_size_t mtk_ovl_mmsys_mapping_MT6985(struct mtk_ddp_comp *comp)
+{
+	/* 7.2 does not carry the t-oss ovlsys resources in mtk_drm_private.
+	 * The MT6985 OVL registers live in the 0x2000..0x5000 window of
+	 * each 0x200000-aligned OVL system block, so derive its base from the
+	 * existing component resource without adding a DTS/private-struct
+	 * dependency in this phase.
+	 */
+	switch (comp->id) {
+	case DDP_COMPONENT_OVL0_2L:
+	case DDP_COMPONENT_OVL1_2L:
+	case DDP_COMPONENT_OVL2_2L:
+	case DDP_COMPONENT_OVL3_2L:
+		return comp->regs_pa & ~MT6985_OVLSYS_REG_MASK;
+	default:
+		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
+		return 0;
+	}
+}
+
 resource_size_t mtk_ovl_mmsys_mapping_MT6895(struct mtk_ddp_comp *comp)
 {
 	struct mtk_drm_private *priv = comp->mtk_crtc->base.dev->dev_private;
@@ -546,6 +576,23 @@ resource_size_t mtk_ovl_mmsys_mapping_MT6879(struct mtk_ddp_comp *comp)
 	case DDP_COMPONENT_OVL0_2L:
 	case DDP_COMPONENT_OVL0_2L_NWCG:
 		return priv->config_regs_pa;
+	default:
+		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
+		return 0;
+	}
+}
+
+static unsigned int mtk_ovl_aid_sel_MT6985(struct mtk_ddp_comp *comp)
+{
+	switch (comp->id) {
+	case DDP_COMPONENT_OVL0_2L:
+		return MT6985_OVL0_2L_AID_SEL;
+	case DDP_COMPONENT_OVL1_2L:
+		return MT6985_OVL1_2L_AID_SEL;
+	case DDP_COMPONENT_OVL2_2L:
+		return MT6985_OVL2_2L_AID_SEL;
+	case DDP_COMPONENT_OVL3_2L:
+		return MT6985_OVL3_2L_AID_SEL;
 	default:
 		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
 		return 0;
@@ -613,6 +660,30 @@ int mtk_ovl_aid_bit(struct mtk_ddp_comp *comp, bool is_ext, int id)
 		return mtk_ovl_layer_num(comp) + id;
 	else
 		return id;
+}
+
+static void mtk_ovl_aid_config(struct mtk_disp_ovl *ovl,
+		struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
+		resource_size_t mmsys_reg, unsigned int aid_sel_offset,
+		int sec_bit, bool enable)
+{
+	unsigned int offset = aid_sel_offset;
+	unsigned int value;
+	unsigned int mask;
+
+	if (!mmsys_reg || !aid_sel_offset)
+		return;
+
+	if (ovl->data->aid_per_layer_setting) {
+		offset += MT6985_OVL_LAYER_OFFSET * sec_bit;
+		value = enable ? BIT(0) : 0;
+		mask = BIT(0);
+	} else {
+		value = enable ? BIT(sec_bit) : 0;
+		mask = BIT(sec_bit);
+	}
+
+	cmdq_pkt_write(handle, comp->cmdq_base, mmsys_reg + offset, value, mask);
 }
 
 static void dump_ovl_layer_trace(struct mtk_drm_crtc *mtk_crtc,
@@ -870,7 +941,7 @@ static void mtk_ovl_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 		comp->regs_pa + DISP_REG_OVL_GDRDY_PRD,
 		0xFFFFFFFF, 0xFFFFFFFF);
 
-	pr_err("XAGA-STAGE ovl_start: %s dual_pipe=%d EN=0x%08x SRC_CON=0x%08x DATAPATH=0x%08x ROI=0x%08x\n",
+	pr_err("COROT-STAGE ovl_start: %s dual_pipe=%d EN=0x%08x SRC_CON=0x%08x DATAPATH=0x%08x ROI=0x%08x\n",
 	       mtk_dump_comp_str(comp),
 	       (comp->mtk_crtc && comp->mtk_crtc->is_dual_pipe) ? 1 : 0,
 	       readl(comp->regs + DISP_REG_OVL_EN),
@@ -1542,14 +1613,9 @@ static void _ovl_common_config(struct mtk_ddp_comp *comp, unsigned int idx,
 
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, true, id);
-			if (state->pending.is_sec && pending->addr)
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					BIT(sec_bit), BIT(sec_bit));
-			else
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					0, BIT(sec_bit));
+			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
+					aid_sel_offset, sec_bit,
+					state->pending.is_sec && pending->addr);
 		}
 
 		write_ext_layer_addr_cmdq(comp, handle, id, addr);
@@ -1570,14 +1636,9 @@ static void _ovl_common_config(struct mtk_ddp_comp *comp, unsigned int idx,
 
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, false, lye_idx);
-			if (state->pending.is_sec && pending->addr)
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					BIT(sec_bit), BIT(sec_bit));
-			else
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					0, BIT(sec_bit));
+			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
+					aid_sel_offset, sec_bit,
+					state->pending.is_sec && pending->addr);
 		}
 
 		if (pending->mml_mode == MML_MODE_RACING) {
@@ -2015,14 +2076,9 @@ static bool compr_l_config_PVRIC_V3_1(struct mtk_ddp_comp *comp,
 
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, true, id);
-			if (state->pending.is_sec && pending->addr)
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					BIT(sec_bit), BIT(sec_bit));
-			else
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					0, BIT(sec_bit));
+			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
+					aid_sel_offset, sec_bit,
+					state->pending.is_sec && pending->addr);
 		}
 
 		write_ext_layer_addr_cmdq(comp, handle, id, lx_addr);
@@ -2047,14 +2103,9 @@ static bool compr_l_config_PVRIC_V3_1(struct mtk_ddp_comp *comp,
 	} else {
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, false, lye_idx);
-			if (state->pending.is_sec && pending->addr)
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					BIT(sec_bit), BIT(sec_bit));
-			else
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					0, BIT(sec_bit));
+			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
+					aid_sel_offset, sec_bit,
+					state->pending.is_sec && pending->addr);
 		}
 
 		write_phy_layer_addr_cmdq(comp, handle, lye_idx, lx_addr);
@@ -2298,14 +2349,8 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, true, id);
-			if (state->pending.is_sec)
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					BIT(sec_bit), BIT(sec_bit));
-			else
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					0, BIT(sec_bit));
+			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
+					aid_sel_offset, sec_bit, state->pending.is_sec);
 		}
 
 		write_ext_layer_addr_cmdq(comp, handle, id, lx_addr);
@@ -2328,14 +2373,8 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 	} else {
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, false, lye_idx);
-			if (state->pending.is_sec)
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					BIT(sec_bit), BIT(sec_bit));
-			else
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					mmsys_reg + aid_sel_offset,
-					0, BIT(sec_bit));
+			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
+					aid_sel_offset, sec_bit, state->pending.is_sec);
 		}
 
 		write_phy_layer_addr_cmdq(comp, handle, lye_idx, lx_addr);
@@ -3855,6 +3894,37 @@ static const struct mtk_disp_ovl_data mt6983_ovl_driver_data = {
 	.source_bpc = 10,
 };
 
+static const struct compress_info compr_info_mt6985  = {
+	.name = "AFBC_V1_2_MTK_1",
+	.l_config = &compr_l_config_AFBC_V1_2,
+};
+
+static const struct mtk_disp_ovl_data mt6985_ovl_driver_data = {
+	.addr = DISP_REG_OVL_ADDR_BASE,
+	.el_addr_offset = 0x10,
+	.el_hdr_addr = 0xfb4,
+	.el_hdr_addr_offset = 0x10,
+	.fmt_rgb565_is_0 = true,
+	.fmt_uyvy = 4U << 12,
+	.fmt_yuyv = 5U << 12,
+	.compr_info = &compr_info_mt6985,
+	.support_shadow = false,
+	.need_bypass_shadow = false,
+	.preultra_th_dc = 0x3c0,
+	.fifo_size = 1024,
+	.issue_req_th_dl = 511,
+	.issue_req_th_dc = 31,
+	.issue_req_th_urg_dl = 255,
+	.issue_req_th_urg_dc = 31,
+	.greq_num_dl = 0xFFFF,
+	.is_support_34bits = true,
+	.aid_sel_mapping = &mtk_ovl_aid_sel_MT6985,
+	.aid_per_layer_setting = true,
+	.mmsys_mapping = &mtk_ovl_mmsys_mapping_MT6985,
+	.source_bpc = 10,
+	.support_pq_selfloop = true,
+};
+
 static const struct compress_info compr_info_mt6895  = {
 	.name = "AFBC_V1_2_MTK_1",
 	.l_config = &compr_l_config_AFBC_V1_2,
@@ -4045,6 +4115,8 @@ static const struct of_device_id mtk_disp_ovl_driver_dt_match[] = {
 	 .data = &mt6885_ovl_driver_data},
 	{.compatible = "mediatek,mt6983-disp-ovl",
 	 .data = &mt6983_ovl_driver_data},
+	{.compatible = "mediatek,mt6985-disp-ovl",
+	 .data = &mt6985_ovl_driver_data},
 	{.compatible = "mediatek,mt6895-disp-ovl",
 	 .data = &mt6895_ovl_driver_data},
 	{.compatible = "mediatek,mt6873-disp-ovl",

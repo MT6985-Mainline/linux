@@ -46,6 +46,7 @@
 #include <linux/ctype.h>
 #include <linux/uio.h>
 #include <linux/xaga_marker.h>
+#include <linux/corot_marker.h>
 #include <linux/sched/clock.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/task_stack.h>
@@ -2436,6 +2437,7 @@ asmlinkage int vprintk_emit(int facility, int level,
 	 * restored to expdb by LK on the next boot). No-op unless armed at
 	 * setup_arch head. */
 	xaga_marker_early_printk(fmt, args);
+	corot_marker_early_printk(fmt, args);
 
 	/* Suppress unimportant messages after panic happens */
 	if (unlikely(suppress_printk))

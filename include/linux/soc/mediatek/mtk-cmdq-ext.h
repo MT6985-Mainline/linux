@@ -183,6 +183,10 @@ struct cmdq_base {
 	u8 cpr_cnt;
 };
 
+/* per-thread PAUSE tokens used by append-by-event task submission */
+#define CMDQ_TOKEN_PAUSE_TASK_0		801
+#define CMDQ_TOKEN_PAUSE_TASK_32	832
+
 struct cmdq_client {
 	struct mbox_client client;
 	struct mbox_chan *chan;

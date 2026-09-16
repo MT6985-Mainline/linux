@@ -507,11 +507,11 @@ static void mtk_rdma_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 	{
 		void __iomem *baddr = comp->regs;
 
-		pr_err("XAGA-RDMA GLOBAL_CON=0x%08x SIZE_CON0=0x%08x SIZE_CON1=0x%08x\n",
+		pr_err("COROT-RDMA GLOBAL_CON=0x%08x SIZE_CON0=0x%08x SIZE_CON1=0x%08x\n",
 			readl(baddr + DISP_REG_RDMA_GLOBAL_CON),
 			readl(baddr + DISP_REG_RDMA_SIZE_CON_0),
 			readl(baddr + DISP_REG_RDMA_SIZE_CON_1));
-		pr_err("XAGA-RDMA FIFO_CON=0x%08x INT_EN=0x%08x INT_STA=0x%08x\n",
+		pr_err("COROT-RDMA FIFO_CON=0x%08x INT_EN=0x%08x INT_STA=0x%08x\n",
 			readl(baddr + DISP_REG_RDMA_FIFO_CON),
 			readl(baddr + DISP_REG_RDMA_INT_ENABLE),
 			readl(baddr + DISP_REG_RDMA_INT_STATUS));
@@ -866,7 +866,7 @@ static void mtk_rdma_config(struct mtk_ddp_comp *comp,
 		w = cfg->w / 2;
 	else
 		w = cfg->w;
-	pr_err("XAGA-STAGE rdma_config: %s dual_pipe=%d cfg.w=%d -> w=%d h=%d\n",
+	pr_err("COROT-STAGE rdma_config: %s dual_pipe=%d cfg.w=%d -> w=%d h=%d\n",
 	       mtk_dump_comp_str(comp),
 	       comp->mtk_crtc->is_dual_pipe ? 1 : 0, cfg->w, w, cfg->h);
 	cmdq_pkt_write(handle, comp->cmdq_base,
@@ -1723,6 +1723,15 @@ static const struct of_device_id mtk_disp_rdma_driver_dt_match[] = {
 	 .data = &mt6885_rdma_driver_data},
 	{.compatible = "mediatek,mt6983-disp-rdma",
 	 .data = &mt6983_rdma_driver_data},
+	/*
+	 * No independent MT6985 RDMA data exists in either the 5.15 reference
+	 * or the 6.18 Corot tree. The verified MT6895/MT6983 scalar RDMA
+	 * tuning fields are identical; reuse the existing MT6895 record rather
+	 * than inventing MT6985 fields. The Corot DRM master uses the MT6895
+	 * SODI path.
+	 */
+	{.compatible = "mediatek,mt6985-disp-rdma",
+	 .data = &mt6895_rdma_driver_data},
 	{.compatible = "mediatek,mt6895-disp-rdma",
 	 .data = &mt6895_rdma_driver_data},
 	{.compatible = "mediatek,mt6873-disp-rdma",

@@ -75,5 +75,7 @@ obj-y				+= keba/
 obj-y				+= amd-sbi/
 obj-$(CONFIG_MISC_RP1)		+= rp1/
 obj-$(CONFIG_XAGA_MARKER_WRITER)	+= xaga-marker-writer.o
+obj-$(CONFIG_COROT_MARKER_WRITER)	+= corot-marker-writer.o
+obj-$(CONFIG_COROT_FB_SCAN)		+= corot-fbscan.o
 obj-$(CONFIG_MTK_CMDQ_MBOX_EXT)	+= mediatek/
 obj-$(CONFIG_MTK_COMBO)		+= mediatek/

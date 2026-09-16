@@ -1369,6 +1369,15 @@ config DRM_PANEL_LEDS_KTZ8863A
 	help
 	  Say Y here if you want to enable support for DRM_PANEL_LEDS_KTZ8863A Lleds.
 
+config DRM_PANEL_M12_MIN
+	tristate "Minimal probe driver for Xiaomi M12 OLED (corot P1)"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  P1 bring-up: power, reset and DCS ID read for the corot
+	  m12_42_02_0a_dsc_cmd OLED. Logs the panel ID into kmsg.
+
 config DRM_PANEL_L16_36_02_0B_DSC_VDO
 	tristate "DRM_PANEL_L16_36_02_0B_DSC_VDO panel"
 	depends on OF

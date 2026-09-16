@@ -124,6 +124,8 @@ struct client_priv {
 	struct workqueue_struct *flushq;
 };
 
+extern bool append_by_event;
+
 struct cmdq_instruction {
 	u16 arg_c:16;
 	u16 arg_b:16;
@@ -244,6 +246,9 @@ struct cmdq_client *cmdq_mbox_create(struct device *dev, int index)
 	client->client.tx_block = false;
 	client->client.knows_txdone = true;
 	client->chan = mbox_request_channel(&client->client, index);
+	pr_err("COROT-GCE: mbox_create dev=%s idx=%d ret=%ld\n",
+		dev ? dev_name(dev) : "(null)", index,
+		IS_ERR(client->chan) ? PTR_ERR(client->chan) : 0);
 	if (IS_ERR(client->chan)) {
 		cmdq_err("channel request fail:%ld idx:%d",
 			PTR_ERR(client->chan), index);
@@ -2021,9 +2026,15 @@ int cmdq_pkt_wait_no_clear(struct cmdq_pkt *pkt, u16 event)
 	 * bit 31: 1 - update, 0 - no update
 	 */
 	arg_b = CMDQ_WFE_WAIT | CMDQ_WFE_WAIT_VALUE;
-	return cmdq_pkt_append_command(pkt, CMDQ_GET_ARG_C(arg_b),
-		CMDQ_GET_ARG_B(arg_b), event,
-		0, 0, 0, 0, CMDQ_CODE_WFE);
+	{
+		int ret = cmdq_pkt_append_command(pkt, CMDQ_GET_ARG_C(arg_b),
+			CMDQ_GET_ARG_B(arg_b), event,
+			0, 0, 0, 0, CMDQ_CODE_WFE);
+
+		if (event == CMDQ_TOKEN_PAUSE_TASK_32)
+			pkt->pause_offset = pkt->cmd_buf_size;
+		return ret;
+	}
 }
 EXPORT_SYMBOL(cmdq_pkt_wait_no_clear);
 
@@ -2111,6 +2122,16 @@ s32 cmdq_pkt_finalize(struct cmdq_pkt *pkt)
 #endif
 #endif	/* end of CONFIG_MTK_CMDQ_MBOX_EXT */
 
+	if (append_by_event && !pkt->sec_data) {
+		err = cmdq_pkt_wait_no_clear(pkt, CMDQ_TOKEN_PAUSE_TASK_32);
+		if (err < 0)
+			return err;
+
+		/* JUMP to EOC */
+		err = cmdq_pkt_jump(pkt, CMDQ_JUMP_PASS);
+		if (err < 0)
+			return err;
+	}
 	/* insert EOC and generate IRQ for each command iteration */
 	err = cmdq_pkt_eoc(pkt, true);
 	if (err < 0)
@@ -2512,6 +2533,32 @@ s32 cmdq_pkt_flush_async(struct cmdq_pkt *pkt,
 	err = cmdq_pkt_finalize(pkt);
 	if (err < 0)
 		return err;
+
+#ifdef CONFIG_MTK_CMDQ_MBOX_EXT
+	if (pkt->pause_offset == CMDQ_INST_SIZE)
+		pr_err("COROT-GCEIRQ: EMPTY pkt flush chan=%d\n",
+			cmdq_mbox_chan_id(client->chan));
+	if (cmdq_mbox_chan_id(client->chan) == 13) {
+		pr_err("COROT-GCE: === thread13 flush, caller stack ===\n");
+		dump_stack();
+	}
+#endif
+	if (append_by_event && pkt->pause_offset) {
+		struct cmdq_instruction *cmdq_inst, inst;
+
+		cmdq_inst = (void *)cmdq_pkt_get_va_by_offset(pkt,
+			pkt->pause_offset - CMDQ_INST_SIZE);
+		if (cmdq_inst) {
+			inst = *cmdq_inst;
+			cmdq_inst->arg_a = CMDQ_TOKEN_PAUSE_TASK_0
+				+ cmdq_mbox_chan_id(client->chan);
+			if (cmdq_inst->op != CMDQ_CODE_WFE)
+				cmdq_err("wrong pause inst:%#018llx -> %#018llx",
+					inst, *((u64 *)cmdq_inst));
+		} else
+			cmdq_err("pause inst NULL, offset:%zu",
+				pkt->pause_offset);
+	}
 
 #if IS_ENABLED(CONFIG_MTK_CMDQ_MBOX_EXT)
 	item->cb = cb;

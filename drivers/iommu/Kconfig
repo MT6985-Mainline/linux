@@ -337,6 +337,13 @@ config MTK_IOMMU
 
 	  If unsure, say N here.
 
+config MTK_IOMMU_MT6985
+	bool "MediaTek MT6985 IOMMU support"
+	depends on ARM64
+	depends on MTK_IOMMU
+	help
+	  MT6985 disp/mdp IOMMU data for the corot mainline bring-up.
+
 config MTK_IOMMU_MT6895
 	tristate "MediaTek MT6895 IOMMU (downstream-compatible)"
 	depends on ARCH_MEDIATEK || COMPILE_TEST

@@ -45,6 +45,8 @@ struct mtk_disp_ddp_data {
 	unsigned int mutex_mod_reg;
 	unsigned int mutex_sof_reg;
 	const unsigned int *dispsys_map;
+	const unsigned int *mutex_ovlsys_mod;
+	const unsigned int *mutex_ovlsys_sof;
 };
 
 struct mtk_ddp {

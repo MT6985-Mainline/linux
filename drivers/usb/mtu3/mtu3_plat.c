@@ -19,6 +19,29 @@
 #include "mtu3_dr.h"
 #include "mtu3_debug.h"
 
+/* Some MT6985 boards have no controller VBUS detect pin; VBUS is
+ * managed by the PMIC, so force the device-side VBUS-valid state. */
+void ssusb_set_force_vbus(struct ssusb_mtk *ssusb, bool vbus_on)
+{
+	u32 u2ctl;
+	u32 misc;
+
+	if (!ssusb->force_vbus)
+		return;
+
+	u2ctl = mtu3_readl(ssusb->ippc_base, SSUSB_U2_CTRL(0));
+	misc = mtu3_readl(ssusb->mac_base, U3D_MISC_CTRL);
+	if (vbus_on) {
+		u2ctl &= ~SSUSB_U2_PORT_OTG_SEL;
+		misc |= VBUS_FRC_EN | VBUS_ON;
+	} else {
+		u2ctl |= SSUSB_U2_PORT_OTG_SEL;
+		misc &= ~(VBUS_FRC_EN | VBUS_ON);
+	}
+	mtu3_writel(ssusb->ippc_base, SSUSB_U2_CTRL(0), u2ctl);
+	mtu3_writel(ssusb->mac_base, U3D_MISC_CTRL, misc);
+}
+
 /* u2-port0 should be powered on and enabled; */
 int ssusb_check_clocks(struct ssusb_mtk *ssusb, u32 ex_clks)
 {
@@ -154,6 +177,19 @@ static int ssusb_rscs_init(struct ssusb_mtk *ssusb)
 		goto phy_err;
 	}
 
+	if (ssusb->dr_mode == USB_DR_MODE_PERIPHERAL) {
+		int i;
+
+		for (i = 0; i < ssusb->num_phys; i++) {
+			ret = phy_set_mode(ssusb->phys[i], PHY_MODE_USB_DEVICE);
+			if (ret) {
+				dev_err(ssusb->dev, "failed to set PHY %d to device mode: %d\n",
+					i, ret);
+				goto phy_err;
+			}
+		}
+	}
+
 	return 0;
 
 phy_err:
@@ -272,6 +308,7 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 		ssusb->dr_mode = USB_DR_MODE_OTG;
 
 	of_property_read_u32(node, "mediatek,u3p-dis-msk", &ssusb->u3p_dis_msk);
+	ssusb->force_vbus = of_property_read_bool(node, "mediatek,force-vbus");
 
 	if (ssusb->dr_mode == USB_DR_MODE_PERIPHERAL)
 		goto out;

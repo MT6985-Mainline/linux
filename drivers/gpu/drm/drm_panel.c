@@ -81,6 +81,11 @@ static void drm_panel_init(struct drm_panel *panel, struct device *dev,
  */
 void drm_panel_add(struct drm_panel *panel)
 {
+	/* Upstream initializes the follower list and lock here; this
+	 * backport lost them, so drm_panel_prepare crashed walking an
+	 * uninitialized (zeroed) list head. */
+	mutex_init(&panel->follower_lock);
+	INIT_LIST_HEAD(&panel->followers);
 	mutex_lock(&panel_lock);
 	list_add_tail(&panel->list, &panel_list);
 	mutex_unlock(&panel_lock);

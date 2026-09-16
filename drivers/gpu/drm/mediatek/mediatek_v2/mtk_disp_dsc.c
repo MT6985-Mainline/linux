@@ -108,7 +108,10 @@ struct mtk_disp_dsc_data {
 	bool need_bypass_shadow;
 	bool need_obuf_sw;
 	bool dsi_buffer;
+	unsigned int shadow_ctrl_reg;
 };
+
+#define DISP_REG_SHADOW_CTRL(module)	((module)->data->shadow_ctrl_reg)
 
 
 /**
@@ -197,7 +200,7 @@ static void mtk_dsc_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 		mtk_ddp_write_mask(comp, DSC_EN, DISP_REG_DSC_CON,
 				DSC_EN, handle);
 
-	pr_err("XAGA-STAGE dsc_start: CON=0x%08x INTSTA=0x%08x\n",
+	pr_err("COROT-STAGE dsc_start: CON=0x%08x INTSTA=0x%08x\n",
 	       readl(baddr + DISP_REG_DSC_CON), readl(baddr + DISP_REG_DSC_INTSTA));
 }
 
@@ -206,28 +209,20 @@ static void mtk_dsc_stop(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 	void __iomem *baddr = comp->regs;
 
 	mtk_ddp_write_mask(comp, 0x0, DISP_REG_DSC_CON, DSC_EN, handle);
-	pr_err("XAGA-STAGE dsc_stop: CON=0x%08x\n",
+	pr_err("COROT-STAGE dsc_stop: CON=0x%08x\n",
 	       readl(baddr + DISP_REG_DSC_CON));
 }
 
 static void mtk_dsc_prepare(struct mtk_ddp_comp *comp)
 {
 	struct mtk_disp_dsc *dsc = comp_to_dsc(comp);
-	struct drm_crtc *crtc = &(comp->mtk_crtc->base);
-	struct mtk_drm_private *priv = crtc->dev->dev_private;
 
 	mtk_ddp_comp_clk_prepare(comp);
 
 	/* Bypass shadow register and read shadow register */
-	if (dsc->data->need_bypass_shadow) {
-		if (priv->data->mmsys_id == MMSYS_MT6983 ||
-			priv->data->mmsys_id == MMSYS_MT6895)
-			mtk_ddp_write_mask_cpu(comp, DSC_BYPASS_SHADOW,
-				MT6983_DISP_REG_SHADOW_CTRL, DSC_BYPASS_SHADOW);
-		else
-			mtk_ddp_write_mask_cpu(comp, DSC_BYPASS_SHADOW,
-				DISP_REG_DSC_SHADOW, DSC_BYPASS_SHADOW);
-	}
+	if (dsc->data->need_bypass_shadow)
+		mtk_ddp_write_mask_cpu(comp, DSC_BYPASS_SHADOW,
+			DISP_REG_SHADOW_CTRL(dsc), DSC_BYPASS_SHADOW);
 }
 
 static void mtk_dsc_unprepare(struct mtk_ddp_comp *comp)
@@ -324,21 +319,21 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 	dsc_params = &comp->mtk_crtc->panel_ext->params->dsc_params;
 	spr_params = &comp->mtk_crtc->panel_ext->params->spr_params;
 
-	pr_err("XAGA-DSC-PARAMS ver=%d slice_mode=%d rgb_swap=%d dsc_cfg=%d rct=%d bpc=%d lbuf=%d bp=%d bpp=%d\n",
+	pr_err("COROT-DSC-PARAMS ver=%d slice_mode=%d rgb_swap=%d dsc_cfg=%d rct=%d bpc=%d lbuf=%d bp=%d bpp=%d\n",
 	       dsc_params->ver, dsc_params->slice_mode, dsc_params->rgb_swap,
 	       dsc_params->dsc_cfg, dsc_params->rct_on, dsc_params->bit_per_channel,
 	       dsc_params->dsc_line_buf_depth, dsc_params->bp_enable,
 	       dsc_params->bit_per_pixel);
-	pr_err("XAGA-DSC-PARAMS pic=%dx%d slice=%dx%d chunk=%d xmit=%d dec=%d\n",
+	pr_err("COROT-DSC-PARAMS pic=%dx%d slice=%dx%d chunk=%d xmit=%d dec=%d\n",
 	       dsc_params->pic_width, dsc_params->pic_height,
 	       dsc_params->slice_width, dsc_params->slice_height,
 	       dsc_params->chunk_size, dsc_params->xmit_delay, dsc_params->dec_delay);
-	pr_err("XAGA-DSC-PARAMS scale=%d incr=%d decr=%d lbpo=%d nfl=%d sbpo=%d init=%d fin=%d\n",
+	pr_err("COROT-DSC-PARAMS scale=%d incr=%d decr=%d lbpo=%d nfl=%d sbpo=%d init=%d fin=%d\n",
 	       dsc_params->scale_value, dsc_params->increment_interval,
 	       dsc_params->decrement_interval, dsc_params->line_bpg_offset,
 	       dsc_params->nfl_bpg_offset, dsc_params->slice_bpg_offset,
 	       dsc_params->initial_offset, dsc_params->final_offset);
-	pr_err("XAGA-DSC-PARAMS fmin=%d fmax=%d rc=%d edge=%d q0=%d q1=%d tgt_hi=%d tgt_lo=%d\n",
+	pr_err("COROT-DSC-PARAMS fmin=%d fmax=%d rc=%d edge=%d q0=%d q1=%d tgt_hi=%d tgt_lo=%d\n",
 	       dsc_params->flatness_minqp, dsc_params->flatness_maxqp,
 	       dsc_params->rc_model_size, dsc_params->rc_edge_factor,
 	       dsc_params->rc_quant_incr_limit0, dsc_params->rc_quant_incr_limit1,
@@ -549,16 +544,16 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 		{
 			void __iomem *baddr = comp->regs;
 
-			pr_err("XAGA-DSC CON=0x%08x MODE=0x%08x ENC_W=0x%08x\n",
+			pr_err("COROT-DSC CON=0x%08x MODE=0x%08x ENC_W=0x%08x\n",
 				readl(baddr + DISP_REG_DSC_CON),
 				readl(baddr + DISP_REG_DSC_MODE),
 				readl(baddr + DISP_REG_DSC_ENC_WIDTH));
-			pr_err("XAGA-DSC PIC_W=0x%08x PIC_H=0x%08x SLICE_W=0x%08x SLICE_H=0x%08x\n",
+			pr_err("COROT-DSC PIC_W=0x%08x PIC_H=0x%08x SLICE_W=0x%08x SLICE_H=0x%08x\n",
 				readl(baddr + DISP_REG_DSC_PIC_W),
 				readl(baddr + DISP_REG_DSC_PIC_H),
 				readl(baddr + DISP_REG_DSC_SLICE_W),
 				readl(baddr + DISP_REG_DSC_SLICE_H));
-			pr_err("XAGA-DSC CHUNK=0x%08x BUF=0x%08x PPS0=0x%08x PPS1=0x%08x\n",
+			pr_err("COROT-DSC CHUNK=0x%08x BUF=0x%08x PPS0=0x%08x PPS1=0x%08x\n",
 				readl(baddr + DISP_REG_DSC_CHUNK_SIZE),
 				readl(baddr + DISP_REG_DSC_BUF_SIZE),
 				readl(baddr + DISP_REG_DSC_PPS0),
@@ -924,6 +919,7 @@ static const struct mtk_disp_dsc_data mt6885_dsc_driver_data = {
 	.support_shadow     = false,
 	.need_bypass_shadow = false,
 	.dsi_buffer = false,
+	.shadow_ctrl_reg = 0x0200,
 };
 
 static const struct mtk_disp_dsc_data mt6983_dsc_driver_data = {
@@ -931,6 +927,15 @@ static const struct mtk_disp_dsc_data mt6983_dsc_driver_data = {
 	.need_bypass_shadow = false,
 	.need_obuf_sw = true,
 	.dsi_buffer = true,
+	.shadow_ctrl_reg = 0x0228,
+};
+
+static const struct mtk_disp_dsc_data mt6985_dsc_driver_data = {
+	.support_shadow     = false,
+	.need_bypass_shadow = false,
+	.need_obuf_sw = true,
+	.dsi_buffer = true,
+	.shadow_ctrl_reg = 0x0228,
 };
 
 static const struct mtk_disp_dsc_data mt6895_dsc_driver_data = {
@@ -938,30 +943,35 @@ static const struct mtk_disp_dsc_data mt6895_dsc_driver_data = {
 	.need_bypass_shadow = false,
 	.need_obuf_sw = false,
 	.dsi_buffer = true,
+	.shadow_ctrl_reg = 0x0228,
 };
 
 static const struct mtk_disp_dsc_data mt6873_dsc_driver_data = {
 	.support_shadow     = false,
 	.need_bypass_shadow = true,
 	.dsi_buffer = false,
+	.shadow_ctrl_reg = 0x0200,
 };
 
 static const struct mtk_disp_dsc_data mt6853_dsc_driver_data = {
 	.support_shadow     = false,
 	.need_bypass_shadow = true,
 	.dsi_buffer = false,
+	.shadow_ctrl_reg = 0x0200,
 };
 
 static const struct mtk_disp_dsc_data mt6879_dsc_driver_data = {
 	.support_shadow = false,
 	.need_bypass_shadow = false,
 	.dsi_buffer = true,
+	.shadow_ctrl_reg = 0x0200,
 };
 
 static const struct mtk_disp_dsc_data mt6855_dsc_driver_data = {
 	.support_shadow = false,
 	.need_bypass_shadow = false,
 	.dsi_buffer = false,
+	.shadow_ctrl_reg = 0x0200,
 };
 
 static const struct of_device_id mtk_disp_dsc_driver_dt_match[] = {
@@ -969,6 +979,8 @@ static const struct of_device_id mtk_disp_dsc_driver_dt_match[] = {
 	  .data = &mt6885_dsc_driver_data},
 	{ .compatible = "mediatek,mt6983-disp-dsc",
 	  .data = &mt6983_dsc_driver_data},
+	{ .compatible = "mediatek,mt6985-disp-dsc",
+	  .data = &mt6985_dsc_driver_data},
 	{ .compatible = "mediatek,mt6895-disp-dsc",
 	  .data = &mt6895_dsc_driver_data},
 	{ .compatible = "mediatek,mt6873-disp-dsc",

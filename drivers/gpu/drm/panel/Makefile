@@ -160,3 +160,4 @@ ccflags-$(CONFIG_DRM_PANEL_L16_36_02_0B_DSC_VDO) += \
 	-I$(srctree)/drivers/misc/mediatek/include/ \
 	-I$(srctree)/drivers/misc/mediatek/include/mt-plat/ \
 	-I$(srctree)/drivers/gpu/drm/
+obj-$(CONFIG_DRM_PANEL_M12_MIN) += panel-m12-min.o

@@ -5,6 +5,7 @@ obj-$(CONFIG_MTK_DVFSRC) += mtk-dvfsrc.o
 obj-$(CONFIG_MTK_INFRACFG) += mtk-infracfg.o
 obj-$(CONFIG_MTK_PMIC_WRAP) += mtk-pmic-wrap.o
 obj-$(CONFIG_MTK_REGULATOR_COUPLER) += mtk-regulator-coupler.o
+obj-$(CONFIG_MTK_SCPSYS_MT6985) += mtk-scpsys.o mtk-scpsys-mt6985.o
 obj-$(CONFIG_MTK_SCPSYS_MT6895) += mtk-scpsys.o mtk-scpsys-mt6895.o \
 				   mtk-scpsys-bringup.o \
 				   mtk-pm-domain-disable-unused.o

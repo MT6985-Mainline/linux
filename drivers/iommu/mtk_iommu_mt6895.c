@@ -3678,7 +3678,52 @@ static const struct mtk_iommu_plat_data mt8192_data = {
 			   {0, 14, 16}, {0, 13, 18, 17}},
 };
 
+static const struct mtk_iommu_iova_region mt6985_multi_dom_mm[] = {
+	{ .iova_base = SZ_4K, .size = (SZ_4G * 4 - SZ_4K), .type = NORMAL},
+	{ .iova_base = 0x20000000ULL, .size = 0x12c00000, .type = NORMAL},
+	{ .iova_base = 0x106000000ULL, .size = SZ_32M, .type = NORMAL},
+	{ .iova_base = 0x108000000ULL, .size = SZ_64M, .type = PROTECTED},
+	{ .iova_base = 0x10C000000ULL, .size = SZ_64M, .type = PROTECTED},
+	{ .iova_base = 0x110000000ULL, .size = 0x60000000, .type = PROTECTED},
+};
+
+static const struct mtk_iommu_plat_data mt6985_data_disp = {
+	.m4u_plat	= M4U_MT6985,
+	.flags          = HAS_SUB_COMM | OUT_ORDER_WR_EN | GET_DOM_ID_LEGACY |
+			  NOT_STD_AXI_MODE | TLB_SYNC_EN | IOMMU_SEC_BK_EN |
+			  SKIP_CFG_PORT | IOVA_34_EN | PGTABLE_PA_35_EN |
+			  HAS_BCLK | HAS_SMI_SUB_COMM | SAME_SUBSYS | IOMMU_MAU_EN,
+	.hw_list        = &mm_iommu_list,
+	.inv_sel_reg    = REG_MMU_INV_SEL_GEN2,
+	.iommu_id	= DISP_IOMMU,
+	.iommu_type     = MM_IOMMU,
+	.tab_id		= MM_TABLE,
+	.normal_dom	= 0,
+	.iova_region    = mt6985_multi_dom_mm,
+	.iova_region_nr = ARRAY_SIZE(mt6985_multi_dom_mm),
+	.mau_count	= 4,
+};
+
+static const struct mtk_iommu_plat_data mt6985_data_mdp = {
+	.m4u_plat	= M4U_MT6985,
+	.flags          = HAS_SUB_COMM | OUT_ORDER_WR_EN | GET_DOM_ID_LEGACY |
+			  NOT_STD_AXI_MODE | TLB_SYNC_EN | IOMMU_SEC_BK_EN |
+			  SKIP_CFG_PORT | IOVA_34_EN | PGTABLE_PA_35_EN |
+			  HAS_BCLK | HAS_SMI_SUB_COMM | SAME_SUBSYS | IOMMU_MAU_EN,
+	.hw_list        = &mm_iommu_list,
+	.inv_sel_reg    = REG_MMU_INV_SEL_GEN2,
+	.iommu_id	= MDP_IOMMU,
+	.iommu_type     = MM_IOMMU,
+	.tab_id		= MM_TABLE,
+	.normal_dom	= 0,
+	.iova_region    = mt6985_multi_dom_mm,
+	.iova_region_nr = ARRAY_SIZE(mt6985_multi_dom_mm),
+	.mau_count	= 4,
+};
+
 static const struct of_device_id mtk_iommu_of_ids[] = {
+{ .compatible = "mediatek,mt6985-disp-iommu", .data = &mt6985_data_disp},
+{ .compatible = "mediatek,mt6985-mdp-iommu", .data = &mt6985_data_mdp},
 { .compatible = "mediatek,mt6895-disp-iommu", .data = &mt6895_data_disp},
 { .compatible = "mediatek,mt6895-mdp-iommu", .data = &mt6895_data_mdp},
 {}

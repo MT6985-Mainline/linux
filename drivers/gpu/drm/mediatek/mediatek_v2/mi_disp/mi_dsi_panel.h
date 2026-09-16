@@ -203,6 +203,7 @@ struct mi_dsi_panel_cfg {
 
 struct mtk_dsi {
 	/* Copy from mtk_dsi.c */
+	bool m12_prepare_ok;
 	struct mtk_ddp_comp ddp_comp;
 	struct device *dev;
 	struct mipi_dsi_host host;

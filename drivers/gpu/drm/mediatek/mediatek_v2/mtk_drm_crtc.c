@@ -3485,6 +3485,14 @@ bool mtk_crtc_with_trigger_loop(struct drm_crtc *crtc)
 {
 #ifndef DRM_CMDQ_DISABLE
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct mtk_drm_private *priv;
+
+	/* MT6985 bring-up: the trig loop waits for stream-EOF tokens that only
+	 * a running display produces and wedges the CFG thread (err -22 loop),
+	 * stalling every later cmdq flush. Keep it off until the pipe is up. */
+	priv = mtk_crtc->base.dev->dev_private;
+	if (priv && priv->data && priv->data->mmsys_id == MMSYS_MT6985)
+		return false;
 
 	if (mtk_crtc->gce_obj.client[CLIENT_TRIG_LOOP])
 		return true;
@@ -3588,7 +3596,15 @@ int get_path_wait_event(struct mtk_drm_crtc *mtk_crtc,
 			enum CRTC_DDP_PATH ddp_path)
 {
 	struct mtk_ddp_comp *comp = NULL;
+	struct mtk_drm_private *priv;
 	int i;
+
+	/* MT6985 bring-up: STREAM_EOF/CMD_EOF tokens are only produced by the
+	 * trigger loop, which is not running yet. Waiting on them wedges the
+	 * CFG thread (err -22 loop) instead of completing the commit. */
+	priv = mtk_crtc->base.dev->dev_private;
+	if (priv && priv->data && priv->data->mmsys_id == MMSYS_MT6985)
+		return 0;
 
 	if (ddp_path < 0 || ddp_path >= DDP_PATH_NR) {
 		DDPPR_ERR("%s, invalid ddp_path value\n", __func__);
@@ -3632,7 +3648,7 @@ void mtk_crtc_wait_frame_done(struct mtk_drm_crtc *mtk_crtc,
 	int gce_event;
 
 	gce_event = get_path_wait_event(mtk_crtc, ddp_path);
-	if (gce_event < 0)
+	if (gce_event <= 0)
 		return;
 	if (gce_event == mtk_crtc->gce_obj.event[EVENT_STREAM_EOF] ||
 	    gce_event == mtk_crtc->gce_obj.event[EVENT_CMD_EOF] ||
@@ -4068,7 +4084,7 @@ int mtk_crtc_fill_fb_para(struct mtk_drm_crtc *mtk_crtc)
 	if (_parse_tag_videolfb(&vramsize, &fb_base, &fps) < 0) {
 		DDPPR_ERR("Can't access buffer info from dts\n");
 	} else {
-		pr_err("XAGA-FBIOMMU: parse OK fb_base=%pa vram=0x%x fps=%d\n",
+		pr_err("COROT-FBIOMMU: parse OK fb_base=%pa vram=0x%x fps=%d\n",
 			&fb_base, vramsize, fps);
 		fb_info->fb_pa = fb_base;
 		fb_info->width = ALIGN_TO_32(mtk_crtc->base.mode.hdisplay);
@@ -5224,6 +5240,14 @@ static void mtk_crtc_addon_connector_connect(struct drm_crtc *crtc,
 		struct mtk_ddp_config cfg;
 
 		dsc_comp = priv->ddp_comp[DDP_COMPONENT_DSC0];
+		/* Paths without a bound DSC component (MT6985 bring-up: LK
+		 * already inserted DSC into the hardware path) must not
+		 * dereference NULL here. */
+		if (!dsc_comp) {
+			DDPINFO("%s: no DSC comp bound, skip addon connector\n",
+				__func__);
+			return;
+		}
 
 		cfg.w = crtc->state->adjusted_mode.hdisplay;
 		cfg.h = crtc->state->adjusted_mode.vdisplay;
@@ -5749,10 +5773,10 @@ void mtk_crtc_config_default_path(struct mtk_drm_crtc *mtk_crtc)
 	cfg.bpc = mtk_crtc->bpc;
 	cfg.p_golden_setting_context = __get_golden_setting_context(mtk_crtc);
 
-	pr_err("XAGA-STAGE config_default_path: mode %dx%d vrefresh=%d bpc=%d is_dual_pipe=%d\n",
+	pr_err("COROT-STAGE config_default_path: mode %dx%d vrefresh=%d bpc=%d is_dual_pipe=%d\n",
 	       cfg.w, cfg.h, cfg.vrefresh, cfg.bpc,
 	       mtk_crtc->is_dual_pipe ? 1 : 0);
-	xaga_dump_disp("before_path_config");
+	corot_dump_disp("before_path_config");
 
 #ifndef DRM_CMDQ_DISABLE
 	if (priv->data->mmsys_id == MMSYS_MT6983 ||
@@ -5816,8 +5840,8 @@ void mtk_crtc_config_default_path(struct mtk_drm_crtc *mtk_crtc)
 	cmdq_pkt_flush(cmdq_handle);
 	cmdq_pkt_destroy(cmdq_handle);
 
-	pr_err("XAGA-STAGE config_default_path DONE (cmdq flushed)\n");
-	xaga_dump_disp("after_path_config");
+	pr_err("COROT-STAGE config_default_path DONE (cmdq flushed)\n");
+	corot_dump_disp("after_path_config");
 }
 
 static void mtk_crtc_all_layer_off(struct mtk_drm_crtc *mtk_crtc,
@@ -6034,6 +6058,7 @@ void mtk_drm_crtc_enable(struct drm_crtc *crtc)
 {
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	struct mtk_crtc_state *mtk_state = to_mtk_crtc_state(crtc->state);
+	struct mtk_drm_private *priv = crtc->dev->dev_private;
 	unsigned int crtc_id = drm_crtc_index(crtc);
 #ifndef DRM_CMDQ_DISABLE
 	struct cmdq_client *client;
@@ -6063,11 +6088,11 @@ void mtk_drm_crtc_enable(struct drm_crtc *crtc)
 	/*for dual pipe*/
 	mtk_crtc_prepare_dual_pipe(mtk_crtc);
 
-	pr_err("XAGA-STAGE crtc_enable: is_dual_pipe=%d ddp_mode=%d path_comp_nr=%d crtc_id=%d\n",
+	pr_err("COROT-STAGE crtc_enable: is_dual_pipe=%d ddp_mode=%d path_comp_nr=%d crtc_id=%d\n",
 	       mtk_crtc->is_dual_pipe ? 1 : 0, mtk_crtc->ddp_mode,
 	       mtk_crtc->ddp_ctx[mtk_crtc->ddp_mode].ddp_comp_nr[DDP_MAJOR],
 	       crtc_id);
-	xaga_dump_disp("crtc_enable_start");
+	corot_dump_disp("crtc_enable_start");
 
 	/* attach the crtc to each componet */
 	mtk_crtc_attach_ddp_comp(crtc, mtk_crtc->ddp_mode, true);
@@ -6089,6 +6114,10 @@ void mtk_drm_crtc_enable(struct drm_crtc *crtc)
 #ifndef DRM_CMDQ_DISABLE
 	/* 3. power on cmdq client */
 	client = mtk_crtc->gce_obj.client[CLIENT_CFG];
+	if (!client || !client->chan) {
+		DDPPR_ERR("crtc%d: GCE CLIENT_CFG is unavailable\n", crtc_id);
+		goto end;
+	}
 	cmdq_mbox_enable(client->chan);
 	CRTC_MMP_MARK(crtc_id, enable, 1, 1);
 
@@ -6130,6 +6159,10 @@ void mtk_drm_crtc_enable(struct drm_crtc *crtc)
 
 	/* 6. config ddp engine */
 	mtk_crtc_config_default_path(mtk_crtc);
+	/* The panel lifecycle needs encoder->crtc/state, which is valid only
+	 * after the default path is connected. */
+	if (priv->data->mmsys_id == MMSYS_MT6985 && output_comp)
+		mtk_ddp_comp_io_cmd(output_comp, NULL, CONNECTOR_PANEL_ENABLE, NULL);
 	CRTC_MMP_MARK(crtc_id, enable, 1, 3);
 
 	/* 7. disconnect addon module and config */
@@ -6165,8 +6198,8 @@ void mtk_drm_crtc_enable(struct drm_crtc *crtc)
 	if (mtk_crtc->mml_cfg)
 		mtk_crtc_alloc_sram(mtk_crtc);
 
-	pr_err("XAGA-STAGE crtc_enable DONE (all 15 steps)\n");
-	xaga_dump_disp("crtc_enable_done");
+	pr_err("COROT-STAGE crtc_enable DONE (all 15 steps)\n");
+	corot_dump_disp("crtc_enable_done");
 end:
 	CRTC_MMP_EVENT_END(crtc_id, enable,
 			mtk_crtc->enabled, 0);
@@ -6541,12 +6574,18 @@ void mtk_crtc_first_enable_ddp_config(struct mtk_drm_crtc *mtk_crtc)
 			writel(0x1, mtk_crtc->side_config_regs +
 					DISP_REG_CONFIG_BYPASS_MUX_SHADOW);
 		}
-	}
-	cmdq_mbox_enable(mtk_crtc->gce_obj.client[CLIENT_CFG]->chan);
-#endif
+		}
+		if (!mtk_crtc->gce_obj.client[CLIENT_CFG] ||
+		    !mtk_crtc->gce_obj.client[CLIENT_CFG]->chan) {
+			DDPPR_ERR("crtc%d: first enable has no GCE CLIENT_CFG\n",
+				drm_crtc_index(crtc));
+			return;
+		}
+		cmdq_mbox_enable(mtk_crtc->gce_obj.client[CLIENT_CFG]->chan);
+	#endif
 
 	mtk_crtc_pkt_create(&cmdq_handle, &mtk_crtc->base,
-		mtk_crtc->gce_obj.client[CLIENT_CFG]);
+			mtk_crtc->gce_obj.client[CLIENT_CFG]);
 	cmdq_pkt_clear_event(cmdq_handle,
 			     mtk_crtc->gce_obj.event[EVENT_CMD_EOF]);
 	cmdq_pkt_clear_event(cmdq_handle,
@@ -6589,8 +6628,8 @@ void mtk_crtc_first_enable_ddp_config(struct mtk_drm_crtc *mtk_crtc)
 	cmdq_pkt_flush(cmdq_handle);
 	cmdq_pkt_destroy(cmdq_handle);
 
-	pr_err("XAGA-STAGE first_enable_ddp_config DONE (first_cfg flushed)\n");
-	xaga_dump_disp("after_first_config");
+	pr_err("COROT-STAGE first_enable_ddp_config DONE (first_cfg flushed)\n");
+	corot_dump_disp("after_first_config");
 
 	if (mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base))
 		mtk_crtc_set_dirty(mtk_crtc);
@@ -6624,8 +6663,10 @@ void mtk_drm_crtc_first_enable(struct drm_crtc *crtc)
 	/*for dual pipe*/
 	mtk_crtc_prepare_dual_pipe(mtk_crtc);
 
-	/* 2. start trigger loop first to keep gce alive */
-	if (mtk_crtc_with_trigger_loop(crtc)) {
+	/* 2. Start the trigger loop after panel preparation on MT6985.
+	 * Starting it during LK handoff waits forever for panel TE/EOF. */
+	if (priv->data->mmsys_id != MMSYS_MT6985 &&
+	    mtk_crtc_with_trigger_loop(crtc)) {
 		if (mtk_crtc_with_sodi_loop(crtc) &&
 			(!mtk_crtc_is_frame_trigger_mode(crtc)))
 			mtk_crtc_start_sodi_loop(crtc);
@@ -6635,7 +6676,7 @@ void mtk_drm_crtc_first_enable(struct drm_crtc *crtc)
 	/* 3. Regsister configuration */
 	mtk_crtc_first_enable_ddp_config(mtk_crtc);
 
-	pr_err("XAGA-STAGE crtc_first_enable: after first_enable_ddp_config\n");
+	pr_err("COROT-STAGE crtc_first_enable: after first_enable_ddp_config\n");
 
 	if (disp_helper_get_stage() == DISP_HELPER_STAGE_NORMAL) {
 		/* 4. power on mtcmos */
@@ -9353,6 +9394,13 @@ static void mtk_crtc_init_gce_obj(struct drm_device *drm_dev,
 
 	/* Load CRTC GCE event */
 	for (i = 0; i < EVENT_TYPE_MAX; i++) {
+		if (i == EVENT_SYNC_TOKEN_SODI &&
+		    mtk_crtc->base.dev->dev_private &&
+		    ((struct mtk_drm_private *)mtk_crtc->base.dev->dev_private)->data &&
+		    ((struct mtk_drm_private *)mtk_crtc->base.dev->dev_private)->data->mmsys_id == MMSYS_MT6985) {
+			mtk_crtc->gce_obj.event[i] = -1;
+			continue;
+		}
 		mtk_crtc_get_event_name(mtk_crtc, buf, sizeof(buf), i);
 		mtk_crtc->gce_obj.event[i] = cmdq_dev_get_event(dev, buf);
 	}
@@ -9378,10 +9426,16 @@ static void mtk_crtc_init_gce_obj(struct drm_device *drm_dev,
 				}
 			}
 		}
-	}
-	cmdq_buf->va_base = cmdq_mbox_buf_alloc(
-		mtk_crtc->gce_obj.client[CLIENT_CFG],
-		&(cmdq_buf->pa_base));
+		}
+		if (!mtk_crtc->gce_obj.client[CLIENT_CFG] ||
+		    !mtk_crtc->gce_obj.client[CLIENT_CFG]->chan) {
+			DDPPR_ERR("crtc%d: cannot allocate GCE buffer without CLIENT_CFG\n",
+				drm_crtc_index(&mtk_crtc->base));
+			return;
+		}
+		cmdq_buf->va_base = cmdq_mbox_buf_alloc(
+			mtk_crtc->gce_obj.client[CLIENT_CFG],
+			&(cmdq_buf->pa_base));
 
 	if (!cmdq_buf->va_base) {
 		DDPPR_ERR("va base is NULL\n");

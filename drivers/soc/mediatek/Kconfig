@@ -79,6 +79,16 @@ config MTK_REGULATOR_COUPLER
 	default ARCH_MEDIATEK
 	depends on REGULATOR
 
+config MTK_SCPSYS_MT6985
+	bool "MediaTek MT6985 SCPSYS power domain support"
+	depends on ARCH_MEDIATEK
+	depends on PM
+	select PM_GENERIC_DOMAINS
+	select REGMAP
+	select MTK_INFRACFG
+	help
+	  MediaTek MT6985 SPM/SCPSYS power domains for display and UFS.
+
 config MTK_SCPSYS_MT6895
 	bool "MediaTek MT6895 SCPSYS power domain support"
 	depends on ARCH_MEDIATEK

@@ -17,6 +17,17 @@
 #include "panthor_devfreq.h"
 #include "panthor_device.h"
 
+/*
+ * GPUEB stubs: MT6985 GPUEB microcontroller driver is not available in
+ * this mainline tree. These stubs make panthor fall back to the standard
+ * CCF (Common Clock Framework) devfreq path instead.
+ */
+#ifndef CONFIG_MTK_GPUEB
+bool mt6895_gpueb_available(void) { return false; }
+int mt6895_gpueb_commit(unsigned int target, unsigned int oppidx) { return -EOPNOTSUPP; }
+#endif
+
+
 
 /*
  * XAGA (MT6895): upper bound for the shader-complex ("stacks") clock.

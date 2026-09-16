@@ -26,6 +26,9 @@ void __init arm_smccc_version_init(u32 version, enum arm_smccc_conduit conduit)
 	smccc_version = version;
 	smccc_conduit = conduit;
 
+#ifdef CONFIG_COROT_SKIP_SMCCC_TRNG_SOC_ID
+	smccc_trng_available = false;
+#else
 	smccc_trng_available = smccc_probe_trng();
 
 	if ((smccc_version >= ARM_SMCCC_VERSION_1_2) &&
@@ -39,6 +42,7 @@ void __init arm_smccc_version_init(u32 version, enum arm_smccc_conduit conduit)
 			smccc_soc_id_revision = (s32)res.a0;
 		}
 	}
+#endif
 }
 
 enum arm_smccc_conduit arm_smccc_1_1_get_conduit(void)

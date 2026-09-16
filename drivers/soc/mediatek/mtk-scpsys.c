@@ -369,6 +369,9 @@ static int scpsys_sram_table_disable(struct scp_domain *scpd)
 static int set_bus_protection(struct regmap *map, struct bus_prot *bp)
 {
 	u32 val;
+
+	if (!map)
+		return -EPROBE_DEFER;
 	u32 set_ofs = bp->set_ofs;
 	u32 en_ofs = bp->en_ofs;
 	u32 sta_ofs = bp->sta_ofs;
@@ -394,6 +397,9 @@ static int set_bus_protection(struct regmap *map, struct bus_prot *bp)
 static int clear_bus_protection(struct regmap *map, struct bus_prot *bp)
 {
 	u32 val;
+
+	if (!map)
+		return -EPROBE_DEFER;
 	u32 clr_ofs = bp->clr_ofs;
 	u32 en_ofs = bp->en_ofs;
 	u32 sta_ofs = bp->sta_ofs;
@@ -1085,13 +1091,22 @@ static int init_basic_clks(struct platform_device *pdev, struct clk **clk,
 	int i;
 
 	for (i = 0; i < MAX_CLKS && name[i]; i++) {
-		clk[i] = devm_clk_get(&pdev->dev, name[i]);
+		clk[i] = devm_clk_get_optional(&pdev->dev, name[i]);
 
 		if (IS_ERR(clk[i])) {
-			dev_notice(&pdev->dev,
-				"get basic clk %s fail %ld\n",
-				name[i], PTR_ERR(clk[i]));
-			return PTR_ERR(clk[i]);
+			int err = PTR_ERR(clk[i]);
+
+			/* MT6985 bring-up keeps LK-owned domains on. */
+			if (err == -EPROBE_DEFER &&
+			    of_device_is_compatible(pdev->dev.of_node,
+					    "mediatek,mt6985-scpsys")) {
+				clk[i] = NULL;
+				continue;
+			}
+
+			dev_notice(&pdev->dev, "get basic clk %s fail %d\n",
+				   name[i], err);
+			return err;
 		}
 	}
 
@@ -1336,7 +1351,14 @@ int mtk_register_power_domains(struct platform_device *pdev,
 		 * software.  The unused domains will be switched off during
 		 * late_init time.
 		 */
-		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_BYPASS_INIT_ON))
+		/* MT6985 bring-up: LK already owns the MTCMOS state, while the
+		 * complete infracfg/SMI/EMI bus-provider graph is not present.
+		 * Do not power-cycle every domain during registration; that would
+		 * touch missing bus regmaps and can crash in deferred-probe work. */
+		if (of_device_is_compatible(pdev->dev.of_node,
+				    "mediatek,mt6985-scpsys"))
+			on = true;
+		else if (MTK_SCPD_CAPS(scpd, MTK_SCPD_BYPASS_INIT_ON))
 			on = false;
 		else
 			on = !WARN_ON(genpd->power_on(genpd) < 0);
