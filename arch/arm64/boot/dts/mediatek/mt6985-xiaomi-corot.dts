@@ -753,8 +753,13 @@
 		dma-ranges = <0x0 0x0 0x0 0x0 0x4 0x0>;
 		clocks = <&mmsys0_clk CLK_MM_CONFIG>;
 		clock-names = "mmsys0";
-		pinctrl-names = "default";
-		pinctrl-0 = <&dsi0_te_pins>;
+		/*
+		 * COROT r70: no pinctrl-0 here on purpose.  The TE pinmux is
+		 * already set up by the bootloader, and re-applying it from
+		 * pinctrl_bind_pins() before mtk_drm_probe() runs is what hangs
+		 * the interconnect (the probe returns -EPROBE_DEFER in ~8 us and
+		 * our first breadcrumb never prints).
+		 */
 		/* GCE clients: same thread map as 5.15 mt6985 dispsys node */
 		mboxes = <&gce 0 0 CMDQ_THR_PRIO_4>,
 			 <&gce 1 0 CMDQ_THR_PRIO_4>,

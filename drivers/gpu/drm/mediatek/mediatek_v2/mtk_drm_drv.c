@@ -6226,6 +6226,38 @@ static const struct of_device_id mtk_drm_of_ids[] = {
 	 .data = &mt6855_mmsys_driver_data},
 	{} };
 
+/*
+ * COROT r66: keep kicking the deferred-probe queue.
+ *
+ * The DRM master binds only when something triggers the deferred-probe queue
+ * (its probe then runs and finishes around 10.5 s).  With the USB register
+ * dump removed, nothing in this tree does that any more, so the master is never
+ * probed and the panel never comes up.  Kick it every 2 s for the first minute,
+ * with a marker so the log shows it happening.
+ */
+extern void driver_deferred_probe_trigger(void);
+
+static void corot_defprobe_work(struct work_struct *w)
+{
+	static unsigned int n;
+
+	driver_deferred_probe_trigger();
+	n++;
+	if (n <= 3 || n == 30)
+		pr_err("COROT-DEFPROBE r66: kick %u\n", n);
+	if (n < 30)
+		schedule_delayed_work(to_delayed_work(w), msecs_to_jiffies(2000));
+}
+
+static DECLARE_DELAYED_WORK(corot_defprobe_dw, corot_defprobe_work);
+
+static int __init corot_defprobe_init(void)
+{
+	schedule_delayed_work(&corot_defprobe_dw, msecs_to_jiffies(2000));
+	return 0;
+}
+late_initcall(corot_defprobe_init);
+
 static struct platform_driver mtk_drm_platform_driver = {
 	.probe = mtk_drm_probe,
 	.remove = mtk_drm_remove,

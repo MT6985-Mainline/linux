@@ -511,9 +511,15 @@ static int mtu3_probe(struct platform_device *pdev)
 	pm_runtime_put_autosuspend(dev);
 	pm_runtime_forbid(dev);
 
+	/*
+	 * COROT r64: the USB register dump is deliberately NOT scheduled any
+	 * more.  It fires every 4 s starting 5 s after probe, and reading a
+	 * runtime-suspended MTU3 block stalls the interconnect - that is the
+	 * hard hang (and watchdog reset) seen 9.4 s into most boots.  The dump
+	 * belonged to the USB bring-up work, not to the display, so it goes.
+	 */
 	corot_usb = ssusb;
-	INIT_DELAYED_WORK(&corot_usb_dw, corot_usb_dump_work);
-	schedule_delayed_work(&corot_usb_dw, msecs_to_jiffies(5000));
+	(void)corot_usb_dump_work;
 
 	return 0;
 

@@ -88,6 +88,87 @@ static const struct m12_cmd m12_init_cmds[] = {
 	M12C(0xd2,0x80,0x01,0x10,0x00,0x98,0x00,0x52), M12C(0x67,0x32,0x24,0x38,0x38),
 };
 
+/*
+ * COROT r51: refresh-rate selection.
+ *
+ * The M12A does not follow the DSI timing - it runs at the rate its own FCON
+ * register says.  The vendor driver's tables (mode_*hz_setting_gir_off) show
+ * the sequence; the key writes are
+ *     0x2F (FCON)    0x08 = 60 Hz, 0x04 = 90 Hz, 0x02 = 120 Hz, 0x03 = 144 Hz
+ *     0xB3 (EM duty) 0x14 at 60 Hz, 0x38 at the others
+ * Each table below re-selects Page0 first, because the sequence ends on Page8.
+ */
+static const struct m12_cmd m12_fps_60[] = {
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00), M12C(0x6f,0x44),
+	M12C(0xb3,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14),
+	M12C(0x2f,0x08),
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0xe9,0x00,0x00,0x00,0x00), M12C(0x5f,0x01),
+};
+
+static const struct m12_cmd m12_fps_90[] = {
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00), M12C(0x6f,0x44),
+	M12C(0xb3,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38),
+	M12C(0x2f,0x04),
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0xe9,0x00,0x00,0x00,0x00), M12C(0x5f,0x01),
+};
+
+static const struct m12_cmd m12_fps_120[] = {
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00), M12C(0x6f,0x44),
+	M12C(0xb3,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38),
+	M12C(0x2f,0x02),
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0xe9,0x00,0x00,0x00,0x00), M12C(0x5f,0x01),
+};
+
+static const struct m12_cmd m12_fps_144[] = {
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00), M12C(0x6f,0x44),
+	M12C(0xb3,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38),
+	M12C(0x2f,0x03),
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0xe9,0x00,0x00,0x00,0x00), M12C(0x5f,0x01),
+};
+
+static struct mipi_dsi_device *g_m12_dsi;
+
+int corot_m12_apply_fps(unsigned int fps)
+{
+	const struct m12_cmd *tbl = NULL;
+	unsigned int nr = 0, i;
+
+	switch (fps) {
+	case 60:
+		tbl = m12_fps_60;
+		nr = sizeof(m12_fps_60) / sizeof(m12_fps_60[0]);
+		break;
+	case 90:
+		tbl = m12_fps_90;
+		nr = sizeof(m12_fps_90) / sizeof(m12_fps_90[0]);
+		break;
+	case 120:
+		tbl = m12_fps_120;
+		nr = sizeof(m12_fps_120) / sizeof(m12_fps_120[0]);
+		break;
+	case 144:
+		tbl = m12_fps_144;
+		nr = sizeof(m12_fps_144) / sizeof(m12_fps_144[0]);
+		break;
+	default:
+		return -22;
+	}
+	pr_err("COROT-FPS: request %u Hz, dsi=%p tbl=%p n=%u\n",
+	       fps, g_m12_dsi, tbl, nr);
+	if (!g_m12_dsi) {
+		pr_err("COROT-FPS: FAILED - panel dsi device not known yet\n");
+		return -19;
+	}
+
+	for (i = 0; i < nr; i++)
+		m12_write_cmd(g_m12_dsi, &tbl[i]);
+	for (i = 0; i < 5; i++)	/* the log-catcher drops single lines */
+		pr_err("COROT-FPS: panel FCON set to %u Hz (repeat %u/5)\n",
+		       fps, i + 1);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(corot_m12_apply_fps);
+
 static int m12_min_unprepare(struct drm_panel *panel)
 {
 	/* Bring-up: leaving the panel powered keeps the LK handoff state
@@ -108,6 +189,10 @@ static int m12_min_prepare(struct drm_panel *panel)
 	rd = mipi_dsi_dcs_read(dsi, 0x04, id, sizeof(id));
 	dev_info(&dsi->dev, "m12: keep LK state; DCS 0x04 = %02x %02x %02x (ret=%d)\n",
 		 id[0], id[1], id[2], rd);
+
+	/* COROT r51: our mode says 60 Hz, so make the panel actually run at
+	 * 60 Hz instead of inheriting whatever rate LK left. */
+	corot_m12_apply_fps(60);
 	return 0;
 }
 static int m12_min_enable(struct drm_panel *panel)
@@ -254,6 +339,7 @@ static int m12_min_probe(struct mipi_dsi_device *dsi)
 		return -ENOMEM;
 
 	ctx->dsi = dsi;
+	g_m12_dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
 
 	dsi->lanes = 4;

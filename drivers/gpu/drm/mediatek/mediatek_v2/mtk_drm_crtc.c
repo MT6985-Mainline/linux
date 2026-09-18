@@ -5622,25 +5622,220 @@ static void corot_phase_tick(void)
 	phase++;
 }
 
+/*
+ * ============================ COROT r48 ============================
+ * Phase sweep + per-frame timing measurement.  Layer stays off and only the
+ * OVL background colour is emitted, so a phase that fixes the truncation
+ * fills the WHOLE screen with its colour.
+ */
+static const u32 corot_p48_bg[6] = {
+	0x00ff0000,	/* 0 red     - baseline */
+	0x0000ff00,	/* 1 green   - OVL ROI height 1000 */
+	0x000000ff,	/* 2 blue    - OVL ROI height 2000 */
+	0x00ffff00,	/* 3 yellow  - rwt x2 */
+	0x0000ffff,	/* 4 cyan    - rwt max */
+	0x00ffffff,	/* 5 white   - baseline again */
+};
+
+/* provided by drivers/gpu/drm/panel/panel-m12-min.c */
+extern int corot_m12_apply_fps(unsigned int fps);
+
+/* the panel refresh rate each phase asks for */
+static const unsigned int corot_p51_fps[6] = {
+	120,	/* 0 red     - broken control (inherited rate) */
+	 60,	/* 1 green   - the fix: match our 60 Hz mode */
+	144,	/* 2 blue */
+	 90,	/* 3 yellow */
+	 60,	/* 4 cyan    - the fix again */
+	120,	/* 5 white */
+};
+
+/* DCS writes may sleep, so the frame timer only queues the request */
+static unsigned int corot_fps_want = 60;
+static void corot_fps_work(struct work_struct *w)
+{
+	corot_m12_apply_fps(corot_fps_want);
+}
+static DECLARE_WORK(corot_fps_wq, corot_fps_work);
+#define COROT_P48_N	6
+#define COROT_P48_MS	12000
+
+static unsigned int corot_p48;
+
+/* what the tick has always done: INTEN=0, clear INTSTA, START 0->1 */
+static void corot_dsi_trigger_min(void)
+{
+	if (!corot_dsi_map)
+		return;
+	writel(0, corot_dsi_map + 0x08);
+	writel(0xffffffff, corot_dsi_map + 0x0c);
+	writel(0, corot_dsi_map + 0x00);
+	writel(1, corot_dsi_map + 0x00);
+}
+
+/* --- per-frame timing accumulators --- */
+static unsigned long tm_n, tm_dsi_sum, tm_dsi_max, tm_dsi_to;
+static unsigned long tm_ovl_sum, tm_ovl_max, tm_ovl_to;
+static unsigned int tm_ymin_last, tm_ymax_last;
+
+/*
+ * Poll the DSI busy flag and the OVL FSM until both are idle (or 40 ms).
+ * Records how long each took and the OVL scan position range seen.
+ */
+static void corot_frame_timing(void)
+{
+	void __iomem *d = corot_dsi_map;
+	unsigned int us = 0, dsi_idle = 0, ovl_idle = 0, to = 0;
+	unsigned int ymin = 0x1fff, ymax = 0;
+	int i, seen = 0;
+
+	if (!d || !corot_ovl_map)
+		return;
+
+	/* the engine needs a moment to pick the trigger up */
+	for (i = 0; i < 100; i++) {
+		if (readl(d + 0x0c) & 0x80000000) {
+			seen = 1;
+			break;
+		}
+		udelay(20);
+	}
+	if (!seen)
+		to = 2;		/* never went busy within 2 ms */
+
+	for (i = 0; i < 2000; i++) {		/* up to 40 ms */
+		u32 sta = readl(d + 0x0c);
+		u32 ad = readl(corot_ovl_map + 0x244);
+		u32 fl = readl(corot_ovl_map + 0x240);
+		unsigned int y = (ad >> 16) & 0x1fff;
+
+		if (y < ymin)
+			ymin = y;
+		if (y > ymax)
+			ymax = y;
+		if (!(sta & 0x80000000) && !dsi_idle)
+			dsi_idle = us;
+		if (((fl & 0x3ff) != 0x20) && !ovl_idle)
+			ovl_idle = us;
+		if (dsi_idle && ovl_idle)
+			break;
+		udelay(20);
+		us += 20;
+	}
+	if (!dsi_idle) {
+		dsi_idle = us;
+		tm_dsi_to++;
+	}
+	if (!ovl_idle) {
+		ovl_idle = us;
+		tm_ovl_to++;
+	}
+
+	tm_n++;
+	tm_dsi_sum += dsi_idle;
+	if (dsi_idle > tm_dsi_max)
+		tm_dsi_max = dsi_idle;
+	tm_ovl_sum += ovl_idle;
+	if (ovl_idle > tm_ovl_max)
+		tm_ovl_max = ovl_idle;
+	tm_ymin_last = ymin == 0x1fff ? 0 : ymin;
+	tm_ymax_last = ymax;
+	(void)to;
+}
+
+/* program SOF in every mutex slot that has modules, in all four blocks */
+static void corot_p48_set_sof(u32 val)
+{
+	int i, n;
+
+	for (i = 0; i < 4; i++) {
+		void __iomem *b = corot_mtx_map[i];
+
+		if (!b)
+			continue;
+		for (n = 0; n < 4; n++) {
+			if (!readl(b + 0x30 + 0x20 * n))
+				continue;
+			writel(val, b + 0x2c + 0x20 * n);
+		}
+	}
+}
+
+static void corot_p48_phase(unsigned int n)
+{
+	corot_p48 = n;
+
+	corot_p48_set_sof(0x41);
+
+	if (corot_dsi_map) {
+		u32 c = readl(corot_dsi_map + 0x10);
+
+		/* baseline: neither pacing bit, original rwt */
+		writel(c & ~((1u << 24) | (1u << 27)), corot_dsi_map + 0x10);
+		writel(0x00059c0b, corot_dsi_map + 0x410);
+	}
+
+	if (corot_ovl_map)
+		writel(0x0a9804c4, corot_ovl_map + 0x20);
+
+	/* r55: fps is not under test - do not switch it mid-stream */
+
+	/*
+	 * COROT r55: which of the DSI's frame-bounding registers is set?
+	 *   0x30 LFR_CON, 0x34 LFR_STA, 0x3c VFP_EARLY_STOP (+ MIN_NL),
+	 *   0x300 TARGET_NL
+	 */
+	if (corot_dsi_map)
+		pr_err("COROT-DSIBOUND phase=%u lfr_con=0x%08x lfr_sta=0x%08x early_stop=0x%08x target_nl=0x%08x vact=0x%08x size=0x%08x\n",
+		       n, readl(corot_dsi_map + 0x30), readl(corot_dsi_map + 0x34),
+		       readl(corot_dsi_map + 0x3c), readl(corot_dsi_map + 0x300),
+		       readl(corot_dsi_map + 0x2c), readl(corot_dsi_map + 0x38));
+
+	if (corot_dsi_map) {
+		if (n == 1 || n == 4)
+			writel(0, corot_dsi_map + 0x3c);
+		if (n == 2 || n == 4)
+			writel(0, corot_dsi_map + 0x300);
+		if (n == 3 || n == 4)
+			writel(0, corot_dsi_map + 0x30);
+	}
+
+	if (corot_ovl_map) {
+		writel(corot_p48_bg[n], corot_ovl_map + 0x28);
+		writel(readl(corot_ovl_map + 0x2c) & ~1u,
+		       corot_ovl_map + 0x2c);
+	}
+	pr_err("COROT-P51 phase=%u bg=0x%08x want_fps=%u roi=0x%08x rwt=0x%08x con10=0x%08x\n",
+	       n, corot_p48_bg[n], corot_p51_fps[n],
+	       corot_ovl_map ? readl(corot_ovl_map + 0x20) : 0,
+	       corot_dsi_map ? readl(corot_dsi_map + 0x410) : 0,
+	       corot_dsi_map ? readl(corot_dsi_map + 0x10) : 0);
+}
+
+static void corot_p48_tick(void)
+{
+	static unsigned long t0;
+	static unsigned int n;
+
+	if (t0 && time_before(jiffies, t0 + msecs_to_jiffies(COROT_P48_MS)))
+		return;
+	t0 = jiffies;
+	corot_p48_phase(n);
+	n = (n + 1) % COROT_P48_N;
+}
+
 static void corot_ftrig_tick(struct timer_list *t)
 {
 	static unsigned long pushed, held, held_max, n_busy, n_ur, n_inp, n_frm;
-	static unsigned long n_force, n_steps, next_report, next_push;
-	static unsigned long n_dsc_err, n_dsc_zf, n_dsc_aeof;
-	static unsigned int y_last;
-	static unsigned long last_push_j;
-	static unsigned long n_act, n_done, n_und;
-	static int t2_done;
-	static unsigned int y_max, y_at_push;
-	static unsigned int period_idx;
-	unsigned int period = corot_periods[period_idx];
+	static unsigned long n_force, next_report, next_push;
+	static unsigned long n_dsc_aeof;
+	static unsigned int y_at_push;
+	static int dumped;
+	unsigned int period = corot_periods[0];
 	unsigned int delay = period;
 	u32 sta = 0;
 	int i, n;
 
-	/*
-	 * COROT r42: honour the sweep period first ...
-	 */
 	if (time_before(jiffies, next_push)) {
 		delay = jiffies_to_msecs(next_push - jiffies);
 		if ((int)delay < 1)
@@ -5648,28 +5843,6 @@ static void corot_ftrig_tick(struct timer_list *t)
 		goto report;
 	}
 
-	/*
-	 * COROT r45: never start a frame while the OVL is still scanning.  The
-	 * DSI goes idle long before the OVL finishes, so gating on the DSI alone
-	 * restarts the OVL mid-frame and the panel only ever receives the first
-	 * ~1400 lines.
-	 */
-	if (corot_ovl_map && (jiffies - last_push_j) < msecs_to_jiffies(COROT_OVL_MAX_MS)) {
-		u32 fl = readl(corot_ovl_map + 0x240);
-
-		if ((fl & 0x3ff) == 0x20) {	/* eng_act: still scanning */
-			n_act++;
-			delay = 1;
-			goto report;
-		}
-	}
-
-	/*
-	 * ... then wait for the engine to go idle.  Writing DSI_START=0 while
-	 * a frame is still being pushed aborts it, so never do that.  The rest
-	 * is diagnostic: how often the DSI is busy, how often it underruns and
-	 * how many frames really complete.
-	 */
 	if (corot_dsi_map) {
 		sta = readl(corot_dsi_map + 0x0c);
 		if (sta & COROT_DSI_UNDERRUN)
@@ -5686,101 +5859,88 @@ static void corot_ftrig_tick(struct timer_list *t)
 					  jiffies + msecs_to_jiffies(COROT_RETRY_MS));
 				goto report;
 			}
-			n_force++;	/* engine never went idle: push anyway */
+			n_force++;
 		}
 	}
 
-	/* COROT r45: remember where the OVL had got to when we push */
-	if (corot_ovl_map) {
-		u32 ad = readl(corot_ovl_map + 0x244);
-		u32 fl = readl(corot_ovl_map + 0x240);
-
-		y_at_push = (ad >> 16) & 0x1fff;
-		if ((fl >> 25) & 1)
-			n_und++;
-		if ((fl >> 26) & 1)
-			n_done++;
-	}
+	if (corot_ovl_map)
+		y_at_push = (readl(corot_ovl_map + 0x244) >> 16) & 0x1fff;
 	if (held > held_max)
 		held_max = held;
 	held = 0;
 	pushed++;
-	last_push_j = jiffies;
 	next_push = jiffies + msecs_to_jiffies(period);
 
-	if (pushed == 3) {
-		corot_ovl_trace2();
+	if (!dumped && pushed == 5) {
+		dumped = 1;
 		corot_size_dump();
 	}
 
+	corot_p48_tick();
 
-	for (i = 0; i < 4; i++) {
-		void __iomem *b = corot_mtx_map[i];
-
-		if (!b)
-			continue;
-		for (n = 0; n < 4; n++) {
-			if (!readl(b + 0x30 + 0x20 * n))
-				continue;
-			writel(0, b + 0x20 + 0x20 * n);
-			writel(1, b + 0x20 + 0x20 * n);
-		}
-	}
-
+	/* mutex EN pulse (always - it is not under test in r49) */
 	{
-		/* COROT r44: keep the framebuffer layer on permanently */
-		static int once;
+		for (i = 0; i < 4; i++) {
+			void __iomem *b = corot_mtx_map[i];
 
-		if (!once) {
-			once = 1;
-			corot_phase_apply(1);
+			if (!b)
+				continue;
+			for (n = 0; n < 4; n++) {
+				if (!readl(b + 0x30 + 0x20 * n))
+					continue;
+				writel(0, b + 0x20 + 0x20 * n);
+				writel(1, b + 0x20 + 0x20 * n);
+			}
 		}
 	}
 
-	/*
-	 * COROT r43: sample the DSC error flags every frame instead of leaving
-	 * the stale boot-time 0x00000009 in place.
-	 */
 	if (corot_dsc_map) {
 		u32 ds = readl(corot_dsc_map + 0x08);
 
-		if (ds & (1u << 1))
-			n_dsc_err++;
-		if (ds & (1u << 2))
-			n_dsc_zf++;
 		if (ds & (1u << 3))
 			n_dsc_aeof++;
 		writel(0xffffffff, corot_dsc_map + 0x08);
 	}
 
+	/* r51 keeps ROI and rwt at their baseline values */
+	if (corot_ovl_map)
+		writel(0x0a9804c4, corot_ovl_map + 0x20);
+	if (corot_dsi_map)
+		writel(0x00059c0b, corot_dsi_map + 0x410);
+
+	/* COROT r55: keep the bound registers cleared for the active phase */
 	if (corot_dsi_map) {
-		writel(0, corot_dsi_map + 0x08);	/* INTEN = 0, no storm */
-		writel(0xffffffff, corot_dsi_map + 0x0c);
-		writel(0, corot_dsi_map + 0x00);	/* START edge */
-		writel(1, corot_dsi_map + 0x00);
+		if (corot_p48 == 1 || corot_p48 == 4)
+			writel(0, corot_dsi_map + 0x3c);
+		if (corot_p48 == 2 || corot_p48 == 4)
+			writel(0, corot_dsi_map + 0x300);
+		if (corot_p48 == 3 || corot_p48 == 4)
+			writel(0, corot_dsi_map + 0x30);
 	}
+
+	/* r51 wants ROI and rwt at their baseline values */
+	corot_dsi_trigger_min();	/* INTEN=0, INTSTA clear, START 0->1 */
+
+	/*
+	 * COROT r48: measure this frame while it is in flight.  Costs up to
+	 * 40 ms once per frame, which is why it runs before the report and why
+	 * the period below is short anyway.
+	 */
+	corot_frame_timing();
 
 report:
 	if (time_after_eq(jiffies, next_report)) {
-		next_report = jiffies + msecs_to_jiffies(COROT_HOLD_MS * 1000);
-		n_steps++;
-	{
-		u32 ad = corot_ovl_map ? readl(corot_ovl_map + 0x244) : 0;
-		u32 fl = corot_ovl_map ? readl(corot_ovl_map + 0x240) : 0;
-		u32 y = (ad >> 16) & 0x1fff;
-
-		if (y > y_max)
-			y_max = y;
-		y_last = y;
-		pr_err("COROT-FTRIG pushed=%lu ur=%lu inp=%lu frm=%lu busy=%lu force=%lu dscAEOF=%lu | ovlY_now=%u ovlY_atpush=%u ovlY_max=%u fsm=0x%03x act=%lu und=%lu done=%lu | ovl_int=0x%08x dsi=0x%08x dsc=0x%08x\n",
+		next_report = jiffies + msecs_to_jiffies(5000);
+		pr_err("COROT-FT phase=%u bg=0x%08x pushed=%lu ur=%lu inp=%lu frm=%lu busy=%lu force=%lu aeof=%lu | dsi_us n=%lu avg=%lu max=%lu to=%lu | ovl_us avg=%lu max=%lu to=%lu | ovlY at_push=%u in_frame=%u..%u | dsi=0x%08x dsc=0x%08x con10=0x%08x\n",
+		       corot_p48, corot_p48_bg[corot_p48],
 		       pushed, n_ur, n_inp, n_frm, n_busy, n_force, n_dsc_aeof,
-		       y_last, y_at_push, y_max, fl & 0x3ff,
-		       n_act, n_und, n_done,
-		       corot_ovl_map ? readl(corot_ovl_map + 0x08) : 0,
+		       tm_n,
+		       tm_n ? tm_dsi_sum / tm_n : 0, tm_dsi_max, tm_dsi_to,
+		       tm_n ? tm_ovl_sum / tm_n : 0, tm_ovl_max, tm_ovl_to,
+		       y_at_push, tm_ymin_last, tm_ymax_last,
 		       corot_dsi_map ? readl(corot_dsi_map + 0x0c) : 0,
-		       corot_dsc_map ? readl(corot_dsc_map + 0x08) : 0);
-	}
-		period_idx = (period_idx + 1) % COROT_PERIOD_N;
+		       corot_dsc_map ? readl(corot_dsc_map + 0x08) : 0,
+		       corot_dsi_map ? readl(corot_dsi_map + 0x10) : 0);
 	}
 
 	mod_timer(&corot_ftrig_timer, jiffies + msecs_to_jiffies(delay));
@@ -6164,6 +6324,18 @@ void trigger_without_cmdq(struct drm_crtc *crtc)
 		__func__, __LINE__);
 	/* COROT: keep the display IRQ storm from wedging the SoC */
 	corot_mask_display_irqs_early();
+
+	/*
+	 * COROT r56: the panel does not follow the DSI timing - it runs at the
+	 * rate its own FCON register says, and the bootloader's choice is not
+	 * ours.  Ask for 60 Hz, matching the DRM mode we advertise, ONCE here:
+	 * the panel is powered by now and no frame has been pushed yet.
+	 * Switching the rate later, with frames flowing, wedges the pipeline.
+	 */
+	pr_err("COROT-MARKER r72-fwdevlink-off: frame trigger reached\n");
+
+	corot_m12_apply_fps(60);
+
 	/* COROT: our driver revision never programs the MT6985 crossbar */
 	corot_mt6985_xbar("fix");
 
