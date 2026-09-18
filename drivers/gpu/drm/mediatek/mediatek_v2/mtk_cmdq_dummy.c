@@ -442,3 +442,124 @@ void cmdq_set_outpin_event(struct cmdq_client *cl, bool ena)
 
 }
 //EXPORT_SYMBOL(cmdq_set_outpin_event);
+
+
+/* ------------------------------------------------------------------ *
+ * corot: extra stubs
+ *
+ * This port uses more of the CMDQ API than the vendor's dummy provided.
+ * With DRM_CMDQ_DISABLE there is no GCE behind any of it, so every call
+ * either does nothing or reports success; the display path itself is
+ * programmed by CPU MMIO through cmdq_pkt_write() above.
+ * ------------------------------------------------------------------ */
+
+void cmdq_mbox_enable(void *chan) { }
+void cmdq_mbox_disable(void *chan) { }
+void cmdq_mbox_channel_stop(struct mbox_chan *chan) { }
+s32 cmdq_mbox_get_usage(void *chan) { return 0; }
+void cmdq_thread_set_spr(struct mbox_chan *chan, u8 id, u32 val) { }
+
+void cmdq_thread_dump(struct mbox_chan *chan, struct cmdq_pkt *cl_pkt,
+	u64 **inst_out, dma_addr_t *pc_out)
+{
+	if (inst_out)
+		*inst_out = NULL;
+	if (pc_out)
+		*pc_out = 0;
+}
+
+s32 cmdq_pkt_refinalize(struct cmdq_pkt *pkt) { return 0; }
+
+s32 cmdq_pkt_assign_command_reuse(struct cmdq_pkt *pkt, u16 reg_idx,
+	u32 value, struct cmdq_reuse *reuse)
+{
+	return 0;
+}
+
+u32 cmdq_pkt_write_value_addr_reuse(struct cmdq_pkt *pkt, dma_addr_t addr,
+	u32 value, u32 mask, u64 **curr_buf_va)
+{
+	return cmdq_pkt_write(pkt, NULL, addr, value, mask);
+}
+
+void cmdq_pkt_reuse_buf_va(struct cmdq_pkt *pkt, struct cmdq_reuse *reuse,
+	const u32 count) { }
+
+u32 cmdq_pkt_poll_addr(struct cmdq_pkt *pkt, u32 value, u32 addr, u32 mask,
+	u8 reg_gpr)
+{
+	return 0;
+}
+
+u32 cmdq_pkt_poll(struct cmdq_pkt *pkt, struct cmdq_base *clt_base,
+	u32 value, u32 addr, u32 mask, u8 reg_gpr)
+{
+	return 0;
+}
+
+u32 cmdq_pkt_read_addr(struct cmdq_pkt *pkt, dma_addr_t addr, u16 dst_reg_idx)
+{
+	return 0;
+}
+
+u32 cmdq_pkt_dump_buf(struct cmdq_pkt *pkt, dma_addr_t curr_pa) { return 0; }
+u32 *cmdq_pkt_get_perf_ret(struct cmdq_pkt *pkt) { return NULL; }
+
+s32 cmdq_util_error_save(const char *format, ...) { return 0; }
+void cmdq_util_prebuilt_init(const u16 mod) { }
+void cmdq_vcp_enable(bool en) { }
+
+/* declared as (enum CMDQ_VCP_ENG_ENUM, dma_addr_t *) in the SoC cmdq header;
+ * an enum is passed as its underlying int in the AArch64 ABI. */
+void *cmdq_get_vcp_buf(int engine, dma_addr_t *pa_out)
+{
+	if (pa_out)
+		*pa_out = 0;
+	return NULL;
+}
+
+
+/* ---------------------------------------------------------------- *
+ * corot: final batch
+ *
+ * Remaining CMDQ entry points referenced by the display/MML drivers.
+ * No GCE is present, so they either do nothing or report success.
+ * ---------------------------------------------------------------- */
+
+/* The display address macros reference these even without CMDQ. */
+int gce_shift_bit = 3;
+int gce_mminfra = 0x40000000;
+
+void cmdq_clear_event(void *chan, u16 event_id) { }
+
+u32 cmdq_mbox_set_thread_timeout(void *chan, u32 timeout) { return timeout; }
+u32 cmdq_pkt_copy(struct cmdq_pkt *dst, struct cmdq_pkt *src) { return 0; }
+s32 cmdq_pkt_eoc(struct cmdq_pkt *pkt, bool cnt_inc) { return 0; }
+
+/* the engine parameter is enum CMDQ_VCP_ENG_ENUM in the SoC header */
+s32 cmdq_pkt_readback(struct cmdq_pkt *pkt, int engine, u32 buf_offset,
+	u16 size, u16 reg_gpr, struct cmdq_reuse *reuse,
+	struct cmdq_poll_reuse *poll_reuse)
+{
+	return 0;
+}
+
+void cmdq_pkt_reuse_poll(struct cmdq_pkt *pkt,
+	struct cmdq_poll_reuse *poll_reuse) { }
+
+u32 cmdq_pkt_sleep(struct cmdq_pkt *pkt, u32 tick, u16 reg_gpr) { return 0; }
+u32 cmdq_pkt_vcp_reuse_val(int engine, u32 buf_offset, u16 size) { return 0; }
+
+s32 cmdq_pkt_write_reg_indriect(struct cmdq_pkt *pkt, u16 addr_reg_idx,
+	u16 src_reg_idx, u32 mask)
+{
+	return 0;
+}
+
+u32 cmdq_pkt_write_value_addr(struct cmdq_pkt *pkt, dma_addr_t addr,
+	u32 value, u32 mask)
+{
+	return cmdq_pkt_write(pkt, NULL, addr, value, mask);
+}
+
+void cmdq_util_prebuilt_dump(const u16 hwid, const u16 event) { }

@@ -10,6 +10,8 @@
 #include "cmdq-util.h"
 #else
 #include "mtk-cmdq-ext.h"
+/* provided by drivers/misc/mediatek/cmdq/mailbox/cmdq-util.c */
+void cmdq_util_prebuilt_init(const u16 mod);
 #endif
 
 #define HW_ENGINE_NUM (2)

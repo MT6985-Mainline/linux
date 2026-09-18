@@ -230,6 +230,14 @@ static struct mtk_panel_params m12_ext_params = {
 		.rc_quant_incr_limit1 = M12_DSC_RC_QUANT_INCR_LIMIT1,
 		.rc_tgt_offset_hi = M12_DSC_RC_TGT_OFFSET_HI,
 		.rc_tgt_offset_lo = M12_DSC_RC_TGT_OFFSET_LO,
+		/*
+		 * COROT: without this the DSC driver falls into its default PPS
+		 * table (PPS12 = 0x01040880) instead of the M12A CSOT one.
+		 * LK's known-good registers match 0x6d126102 exactly:
+		 *   PPS12 = 0x01040900
+		 *   PPS16..19 = 0xd9c7e1a7 0xd209d9e9 0xd22bd229 0x0000d271
+		 */
+		.dsc_config_panel_name = 0x6d126102,
 	},
 };
 

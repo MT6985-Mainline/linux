@@ -139,6 +139,11 @@ static void __iomem *xaga_smi_mdp_sub0_base;
 static void __iomem *xaga_smi_mdp_sub1_base;
 static void __iomem *xaga_larb0_base;
 static void __iomem *xaga_mdp_iommu_base;
+static void __iomem *corot_smi_mdp_sub2_base;
+static void __iomem *corot_disp_larb0_base;
+static void __iomem *corot_disp_iommu_base;
+static void __iomem *corot_mdp_iommu_bk1_base;
+static void __iomem *corot_emi_vio_base;
 
 /* CMDQ log flag */
 int mtk_cmdq_log;
@@ -222,6 +227,8 @@ struct cmdq {
 	bool			sw_ddr_en;
 	bool			control_by_sw;
 	bool			cpu_init;
+	u32			gctl_value;
+	bool			mminfra_inited;
 	bool			outpin_en;
 	bool			prebuilt_enable;
 	bool			unprepare_in_idle;
@@ -234,6 +241,7 @@ struct gce_plat {
 	u32 mminfra;
 	bool control_by_sw;
 	bool cpu_init;
+	u32 gctl_value;
 };
 
 #if IS_ENABLED(CMDQ_MMPROFILE_SUPPORT)
@@ -352,10 +360,195 @@ static void cmdq_lock_wake_lock(struct cmdq *cmdq, bool lock)
 
 static int cmdq_ultra_en(struct cmdq *cmdq)
 {
+	u32 val;
+
 	cmdq_log("%s hwid:%d", __func__, cmdq->hwid);
 
-	writel(CMDQ_ULTRA_EN, cmdq->base + GCE_BUS_GCTL);
+	/*
+	 * Read-modify-write like the vendor driver. LK hands the kernel a
+	 * GCE_BUS_GCTL of 0x12 (CMDQ_PREULTRA_EN plus an undocumented bit 4);
+	 * a plain write of CMDQ_ULTRA_EN clears those bits, which is what this
+	 * port used to do.
+	 */
+	val = readl(cmdq->base + GCE_BUS_GCTL);
+	writel(val | CMDQ_ULTRA_EN, cmdq->base + GCE_BUS_GCTL);
 	return 0;
+}
+
+/*
+ * MT6985 bring-up diagnostic: GCE-D cannot execute a single instruction when
+ * its DDR access enable (GCE_GCTL_VALUE bits 16-17) is clear, because the
+ * instruction fetch never completes.  The vendor/stock kernel programs
+ * 0x20002 there from mtk_mminfra_pd_callback ("enable gce apsrc").  Print the
+ * GCE globals plus the MMINFRA clock-gate status (CG_CON0 bit0 = GCE-D,
+ * bit1 = GCE-M, bit2 = SMI; CG_CON1 bit17 = GCE 26M; set bit = gate OFF) so a
+ * single boot log shows which side is missing.
+ */
+static atomic_t corot_env_enable_dump = ATOMIC_INIT(0);
+static atomic_t corot_env_error_dump = ATOMIC_INIT(0);
+
+static void corot_gce_env_dump(struct cmdq *cmdq, const char *tag, u32 thr)
+{
+	u32 cg0 = 0, cg1 = 0;
+
+	if (xaga_mminfra_base) {
+		cg0 = readl_relaxed(xaga_mminfra_base + 0x100);
+		cg1 = readl_relaxed(xaga_mminfra_base + 0x110);
+	}
+
+	pr_err("COROT-GCEENV[%s] gce=0x%lx thr=%u gctl=0x%08x bus_gctl=0x%08x tpr=0x%08x outpin=0x%08x slot=0x%08x mminfra_cg0=0x%08x mminfra_cg1=0x%08x ddr_en=%u\n",
+		tag, (unsigned long)cmdq->base_pa, thr,
+		readl(cmdq->base + GCE_GCTL_VALUE),
+		readl(cmdq->base + GCE_BUS_GCTL),
+		readl(cmdq->base + CMDQ_TPR_MASK),
+		readl(cmdq->base + GCE_OUTPIN_EVENT),
+		readl(cmdq->base + CMDQ_THR_SLOT_CYCLES),
+		cg0, cg1,
+		(readl(cmdq->base + GCE_GCTL_VALUE) >> 16) & 0x7);
+}
+
+/*
+ * Dump the GCE's memory path: prefetch size, the MDP M4U that owns the
+ * L39_GCE_DM port, the two MDP SMI commons and display LARB0. LARB0 is at
+ * 0x1440c000 on MT6985 (the address the DRM debug block uses, 0x14021000, is
+ * an xaga leftover and reads a non-LARB region).
+ */
+static atomic_t corot_bus_dump = ATOMIC_INIT(0);
+
+/* LARB non-secure configuration / outstanding status */
+#define COROT_LARB_NONSEC_CON	0x380
+#define COROT_LARB_OSTDL	0x200
+
+static u32 corot_rd(void __iomem *base, u32 off)
+{
+	return base ? readl(base + off) : 0;
+}
+
+static void corot_gce_bus_dump(struct cmdq *cmdq, const char *tag, u32 thr)
+{
+	struct cmdq_thread *thread = &cmdq->thread[thr];
+
+	pr_err("COROT-GCEBUS[%s] thr=%u prefetch_g=0x%08x thr_prefetch=0x%08x thr_cfg=0x%08x thr_instcyc=0x%08x\n",
+		tag, thr,
+		readl(cmdq->base + CMDQ_PREFETCH_GSIZE),
+		readl(thread->base + CMDQ_THR_PREFETCH),
+		readl(thread->base + CMDQ_THR_CFG),
+		readl(thread->base + CMDQ_THR_INST_CYCLES));
+	pr_err("COROT-GCEBUS[%s] mdp_iommu pt=0x%08x int_sta=0x%08x ctrl=0x%08x int_main=0x%08x fault_iova=0x%08x fault_pa=0x%08x fault_id0=0x%08x fault_id1=0x%08x\n",
+		tag,
+		corot_rd(xaga_mdp_iommu_base, 0x000),
+		corot_rd(xaga_mdp_iommu_base, 0x008),
+		corot_rd(xaga_mdp_iommu_base, 0x110),
+		corot_rd(xaga_mdp_iommu_base, 0x124),
+		corot_rd(xaga_mdp_iommu_base, 0x130),
+		corot_rd(xaga_mdp_iommu_base, 0x134),
+		corot_rd(xaga_mdp_iommu_base, 0x150),
+		corot_rd(xaga_mdp_iommu_base, 0x154));
+	pr_err("COROT-GCEBUS[%s] smi_mdp bus=0x%08x l1len=0x%08x l1arb0=0x%08x m4u=0x%08x | smi_mdp_sub0 l1len=0x%08x preultra=0x%08x | smi_mdp_sub2(1e819000) l1len=0x%08x preultra=0x%08x\n",
+		tag,
+		corot_rd(xaga_smi_mdp_base, 0x220),
+		corot_rd(xaga_smi_mdp_base, 0x100),
+		corot_rd(xaga_smi_mdp_base, 0x104),
+		corot_rd(xaga_smi_mdp_base, 0x234),
+		corot_rd(xaga_smi_mdp_sub0_base, 0x100),
+		corot_rd(xaga_smi_mdp_sub0_base, 0x244),
+		corot_rd(corot_smi_mdp_sub2_base, 0x100),
+		corot_rd(corot_smi_mdp_sub2_base, 0x244));
+	pr_err("COROT-GCEBUS[%s] gce core_irq_sta=0x%08x loaded_thr=0x%08x core_rest=0x%08x | disp_iommu(1e802000) pt=0x%08x ctrl=0x%08x int_main=0x%08x misc=0x%08x fault_st1=0x%08x int_id=0x%08x\n",
+		tag,
+		readl(cmdq->base + CMDQ_CURR_IRQ_STATUS),
+		readl(cmdq->base + CMDQ_CURR_LOADED_THR),
+		readl(cmdq->base + CMDQ_CORE_REST),
+		corot_rd(corot_disp_iommu_base, 0x000),
+		corot_rd(corot_disp_iommu_base, 0x110),
+		corot_rd(corot_disp_iommu_base, 0x124),
+		corot_rd(corot_disp_iommu_base, 0x048),
+		corot_rd(corot_disp_iommu_base, 0x134),
+		corot_rd(corot_disp_iommu_base, 0x150));
+	pr_err("COROT-GCEBUS[%s] mdp_iommu extra int_ctl0=0x%08x cpe_done=0x%08x fault_va=0x%08x fault_st1=0x%08x vld_pa_rng=0x%08x | smi_mdp extra l1arb1=0x%08x\n",
+		tag,
+		corot_rd(xaga_mdp_iommu_base, 0x120),
+		corot_rd(xaga_mdp_iommu_base, 0x12c),
+		corot_rd(xaga_mdp_iommu_base, 0x130),
+		corot_rd(xaga_mdp_iommu_base, 0x134),
+		corot_rd(xaga_mdp_iommu_base, 0x118),
+		corot_rd(xaga_smi_mdp_base, 0x108));
+	/*
+	 * MTK's own register map names two GCE fault registers that no driver
+	 * ever reads (mdp/cmdq_reg.h): CMDQ_CURR_INST_ABORT (base+0x020) and
+	 * CMDQ_SECURITY_ABORT (base+0x050).  A non-zero value at the moment
+	 * the thread raises IRQ status bit 4 says directly what the GCE
+	 * aborted on.
+	 */
+	pr_err("COROT-GCEABORT[%s] curr_inst_abort=0x%08x security_abort=0x%08x gce_dbg_ctl=0x%08x\n",
+		tag,
+		readl(cmdq->base + 0x020),
+		readl(cmdq->base + 0x050),
+		readl(cmdq->base + GCE_DBG_CTL));
+	pr_err("COROT-GCEBUS[%s] mdp_iommu2 int_ctrl0=0x%08x cpe_done=0x%08x fault_va_mmu0=0x%08x invld_pa_mmu0=0x%08x fault_va_mmu1=0x%08x invld_pa_mmu1=0x%08x | bk1 pt=0x%08x ctrl=0x%08x fault_st1=0x%08x id=0x%08x\n",
+		tag,
+		corot_rd(xaga_mdp_iommu_base, 0x120),
+		corot_rd(xaga_mdp_iommu_base, 0x12c),
+		corot_rd(xaga_mdp_iommu_base, 0x13c),
+		corot_rd(xaga_mdp_iommu_base, 0x140),
+		corot_rd(xaga_mdp_iommu_base, 0x144),
+		corot_rd(xaga_mdp_iommu_base, 0x148),
+		corot_rd(corot_mdp_iommu_bk1_base, 0x000),
+		corot_rd(corot_mdp_iommu_bk1_base, 0x110),
+		corot_rd(corot_mdp_iommu_bk1_base, 0x134),
+		corot_rd(corot_mdp_iommu_bk1_base, 0x150));
+	pr_err("COROT-GCEBUS[%s] smi_mdp_sub2(1e819000) 0x380=0x%08x 0x384=0x%08x 0x388=0x%08x 0x38c=0x%08x 0x100=0x%08x 0x444=0x%08x | smi_mdp 0x238=0x%08x 0x23c=0x%08x 0x300=0x%08x 0x444=0x%08x\n",
+		tag,
+		corot_rd(corot_smi_mdp_sub2_base, 0x380),
+		corot_rd(corot_smi_mdp_sub2_base, 0x384),
+		corot_rd(corot_smi_mdp_sub2_base, 0x388),
+		corot_rd(corot_smi_mdp_sub2_base, 0x38c),
+		corot_rd(corot_smi_mdp_sub2_base, 0x100),
+		corot_rd(corot_smi_mdp_sub2_base, 0x444),
+		corot_rd(xaga_smi_mdp_base, 0x238),
+		corot_rd(xaga_smi_mdp_base, 0x23c),
+		corot_rd(xaga_smi_mdp_base, 0x300),
+		corot_rd(xaga_smi_mdp_base, 0x444));
+	pr_err("COROT-GCEBUS[%s] emi_vio(0x10342d14..d24)=0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
+		tag,
+		corot_rd(corot_emi_vio_base, 0xd14),
+		corot_rd(corot_emi_vio_base, 0xd18),
+		corot_rd(corot_emi_vio_base, 0xd1c),
+		corot_rd(corot_emi_vio_base, 0xd20),
+		corot_rd(corot_emi_vio_base, 0xd24));
+	pr_err("COROT-GCEBUS[%s] larb0(1440c000) nonsec[0..7]=0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x ost[0..3]=0x%08x 0x%08x 0x%08x 0x%08x\n",
+		tag,
+		corot_rd(corot_disp_larb0_base, COROT_LARB_NONSEC_CON + 0x00),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_NONSEC_CON + 0x04),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_NONSEC_CON + 0x08),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_NONSEC_CON + 0x0c),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_NONSEC_CON + 0x10),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_NONSEC_CON + 0x14),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_NONSEC_CON + 0x18),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_NONSEC_CON + 0x1c),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_OSTDL + 0x00),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_OSTDL + 0x04),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_OSTDL + 0x08),
+		corot_rd(corot_disp_larb0_base, COROT_LARB_OSTDL + 0x0c));
+}
+
+static void corot_gce_thread_dump(struct cmdq *cmdq, const char *tag, u32 thr)
+{
+	struct cmdq_thread *thread = &cmdq->thread[thr];
+
+	pr_err("COROT-GCETHR[%s] thr=%u warm_rst=0x%08x susp=0x%08x wait_token=0x%08x cnt=0x%08x irq_en=0x%08x cur=0x%08x end=0x%08x spr=0x%08x 0x%08x 0x%08x 0x%08x\n",
+		tag, thr,
+		readl(thread->base + CMDQ_THR_WARM_RESET),
+		readl(thread->base + CMDQ_THR_SUSPEND_TASK),
+		readl(thread->base + CMDQ_THR_WAIT_TOKEN),
+		readl(thread->base + CMDQ_THR_CNT),
+		readl(thread->base + CMDQ_THR_IRQ_ENABLE),
+		readl(thread->base + CMDQ_THR_CURR_ADDR),
+		readl(thread->base + CMDQ_THR_END_ADDR),
+		readl(thread->base + CMDQ_THR_SPR + 0x00),
+		readl(thread->base + CMDQ_THR_SPR + 0x04),
+		readl(thread->base + CMDQ_THR_SPR + 0x08),
+		readl(thread->base + CMDQ_THR_SPR + 0x0c));
 }
 
 static s32 cmdq_clk_enable(struct cmdq *cmdq)
@@ -387,14 +580,45 @@ static s32 cmdq_clk_enable(struct cmdq *cmdq)
 			writel(cmdq->prefetch,
 				cmdq->base + CMDQ_PREFETCH_GSIZE);
 		writel(CMDQ_TPR_EN, cmdq->base + CMDQ_TPR_MASK);
-		if (cmdq->control_by_sw)
+		if (cmdq->gctl_value) {
+			/*
+			 * MT6985 GCE-D: GCE_GCTL_VALUE holds the GCE DDR/APSRC
+			 * access enable in bits 16-17.  Stock/vendor value is
+			 * 0x20002 (mtk_mminfra_pd_callback, "enable gce apsrc").
+			 * Clearing that field - which a plain 0x7 write does -
+			 * makes the GCE fail its first instruction fetch: the
+			 * thread raises IRQ status 0x10, is auto-suspended and
+			 * its PC stays at the packet start.
+			 */
+			writel(cmdq->gctl_value, cmdq->base + GCE_GCTL_VALUE);
+			if (atomic_inc_return(&corot_env_enable_dump) <= 2)
+				corot_gce_env_dump(cmdq, "enable", 0);
+		} else if (cmdq->control_by_sw) {
 			writel(BIT(2) | BIT(1) | BIT(0), cmdq->base + GCE_GCTL_VALUE);
+		}
 		if (cmdq->sw_ddr_en) {
 			writel((0x7 << 16) + 0x7, cmdq->base + GCE_GCTL_VALUE);
 			writel(0, cmdq->base + GCE_DEBUG_START_ADDR);
 		}
 		writel(cmdq->outpin_en ? 0x3 : 0x0,
 			cmdq->base + GCE_OUTPIN_EVENT);
+		/*
+		 * MT6985: the vendor brings MMINFRA up from mtk_mminfra_debug,
+		 * which issues the two MTK_SIP_CMDQ_CONTROL MMINFRA commands
+		 * ("mminfra init" and "mminfra rfifo init"). This port has no
+		 * mminfra-debug node, so nothing ever issues them. Without that
+		 * init the GCE cannot read its instruction stream from DRAM:
+		 * every thread aborts at instruction 0 with thread IRQ status
+		 * 0x10 while its PC stays at the packet start. Issue them once,
+		 * before the first task.
+		 */
+		if (!cmdq->mminfra_inited) {
+			cmdq->mminfra_inited = true;
+			cmdq_util_mminfra_cmd(0);
+			cmdq_util_mminfra_cmd(3);
+			corot_gce_env_dump(cmdq, "mminfra-smc", 0);
+		}
+
 		/* make sure pm not suspend */
 		cmdq_lock_wake_lock(cmdq, true);
 		if (gce_mminfra)
@@ -1172,6 +1396,13 @@ static void cmdq_thread_irq_handler(struct cmdq *cmdq,
 
 	if (irq_flag & CMDQ_THR_IRQ_ERROR) {
 		err = -EINVAL;
+		if (atomic_inc_return(&corot_env_error_dump) <= 6) {
+			corot_gce_env_dump(cmdq, "err", thread->idx);
+			if (atomic_inc_return(&corot_bus_dump) <= 3) {
+				corot_gce_bus_dump(cmdq, "err", thread->idx);
+				corot_gce_thread_dump(cmdq, "err", thread->idx);
+			}
+		}
 		pr_err("XAGA-GCE: thr%d EN=0x%x STATUS=0x%08x PC=0x%08x IRQ=0x%08x\n",
 			thread->idx,
 			readl(thread->base + CMDQ_THR_ENABLE_TASK),
@@ -2380,6 +2611,16 @@ static int cmdq_probe(struct platform_device *pdev)
 		xaga_larb0_base = ioremap(0x14021000, 0x1000);
 	if (!xaga_mdp_iommu_base)
 		xaga_mdp_iommu_base = ioremap(0x1e810000, 0x1000);
+	if (!corot_smi_mdp_sub2_base)
+		corot_smi_mdp_sub2_base = ioremap(0x1e819000, 0x1000);
+	if (!corot_disp_larb0_base)
+		corot_disp_larb0_base = ioremap(0x1440c000, 0x1000);
+	if (!corot_disp_iommu_base)
+		corot_disp_iommu_base = ioremap(0x1e802000, 0x1000);
+	if (!corot_mdp_iommu_bk1_base)
+		corot_mdp_iommu_bk1_base = ioremap(0x1e811000, 0x1000);
+	if (!corot_emi_vio_base)
+		corot_emi_vio_base = ioremap(0x10342000, 0x1000);
 
 	cmdq->irq = platform_get_irq(pdev, 0);
 	if (!cmdq->irq) {
@@ -2410,6 +2651,7 @@ static int cmdq_probe(struct platform_device *pdev)
 	gce_mminfra = plat_data->mminfra;
 	cmdq->control_by_sw = plat_data->control_by_sw;
 	cmdq->cpu_init = plat_data->cpu_init;
+	cmdq->gctl_value = plat_data->gctl_value;
 	if (!of_property_read_bool(dev->of_node, "skip-poll-sleep"))
 		skip_poll_sleep = true;
 
@@ -2524,7 +2766,8 @@ static int cmdq_probe(struct platform_device *pdev)
 #if IS_ENABLED(CONFIG_MTK_CMDQ_MBOX_EXT)
 	cmdq_util_controller->track_ctrl(cmdq, cmdq->base_pa, false);
 #endif
-	cmdq->prebuilt_clt = cmdq_mbox_create(&pdev->dev, 0);
+	if (cmdq->prebuilt_enable)
+		cmdq->prebuilt_clt = cmdq_mbox_create(&pdev->dev, 0);
 
 	if (!of_parse_phandle_with_args(
 		dev->of_node, "iommus", "#iommu-cells", 0, &args)) {
@@ -2547,7 +2790,8 @@ static const struct gce_plat gce_plat_v5 = {
 
 static const struct gce_plat gce_plat_mt6985 = {
 	.thread_nr = 32, .shift = 3, .mminfra = BIT(30),
-	.control_by_sw = true, .cpu_init = true};
+	.control_by_sw = true, .cpu_init = true,
+	.gctl_value = 0x20002};
 
 static const struct of_device_id cmdq_of_ids[] = {
 	{.compatible = "mediatek,mt8173-gce", .data = (void *)&gce_plat_v2},

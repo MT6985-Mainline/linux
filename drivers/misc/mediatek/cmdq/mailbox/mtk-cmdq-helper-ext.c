@@ -585,10 +585,51 @@ static void cmdq_mbox_pool_free(struct cmdq_client *cl, void *va, dma_addr_t pa)
 	cmdq_mbox_pool_free_impl(priv->buf_pool, va, pa, &priv->buf_cnt);
 }
 
+/*
+ * MT6985 bring-up: when corot_cmd_buf_pa is set on the kernel command line,
+ * every GCE command buffer is taken from that physical address instead of the
+ * DMA allocator.  LK keeps its own CMDQ pool at 0x33ff00000 (13 GiB), while
+ * the kernel allocator hands out low DRAM, so this isolates whether GCE-D's
+ * instruction fetch depends on which DRAM region the buffer lives in.
+ */
+static unsigned long corot_cmd_buf_pa;
+module_param(corot_cmd_buf_pa, ulong, 0644);
+MODULE_PARM_DESC(corot_cmd_buf_pa, "Take GCE command buffers from this PA");
+
+#define COROT_OVERRIDE_MAX 64
+static void *corot_ov_va[COROT_OVERRIDE_MAX];
+static DEFINE_MUTEX(corot_ov_lock);
+
 static void *cmdq_mbox_buf_alloc_dev(struct device *dev, dma_addr_t *pa_out)
 {
 	void *va = NULL;
 	dma_addr_t pa = 0;
+	int i;
+
+	if (corot_cmd_buf_pa) {
+		mutex_lock(&corot_ov_lock);
+		for (i = 0; i < COROT_OVERRIDE_MAX; i++) {
+			dma_addr_t cand;
+
+			if (corot_ov_va[i])
+				continue;
+			cand = (dma_addr_t)corot_cmd_buf_pa +
+				(dma_addr_t)i * CMDQ_BUF_ALLOC_SIZE;
+			va = ioremap(cand, CMDQ_BUF_ALLOC_SIZE);
+			if (va) {
+				corot_ov_va[i] = va;
+				pa = cand;
+				pr_err("COROT-CMDBUF: override slot %d pa:0x%llx va:0x%p\n",
+					i, (unsigned long long)pa, va);
+			}
+			break;
+		}
+		mutex_unlock(&corot_ov_lock);
+		if (va) {
+			*pa_out = pa;
+			return va;
+		}
+	}
 
 	if (dev)
 		va = dma_alloc_coherent(dev, CMDQ_BUF_ALLOC_SIZE, &pa, GFP_KERNEL);
@@ -629,6 +670,21 @@ EXPORT_SYMBOL(cmdq_mbox_buf_alloc);
 
 static void cmdq_mbox_buf_free_dev(struct device *dev, void *va, dma_addr_t pa)
 {
+	int i;
+
+	if (corot_cmd_buf_pa) {
+		mutex_lock(&corot_ov_lock);
+		for (i = 0; i < COROT_OVERRIDE_MAX; i++) {
+			if (corot_ov_va[i] == va) {
+				corot_ov_va[i] = NULL;
+				mutex_unlock(&corot_ov_lock);
+				iounmap(va);
+				return;
+			}
+		}
+		mutex_unlock(&corot_ov_lock);
+	}
+
 	dma_free_coherent(dev, CMDQ_BUF_ALLOC_SIZE, va, pa);
 }
 

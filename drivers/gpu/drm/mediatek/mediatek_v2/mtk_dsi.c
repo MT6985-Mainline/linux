@@ -896,7 +896,9 @@ static void mtk_dsi_dual_enable(struct mtk_dsi *dsi, bool enable)
 
 static void mtk_dsi_enable(struct mtk_dsi *dsi)
 {
-	pr_err("COROT-DSI[enable+] CON=0x%08x\n", readl(dsi->regs + DSI_CON_CTRL));
+	pr_err("COROT-DSI[enable+] regs_pa=0x%llx virt=%p CON=0x%08x\n",
+	       (unsigned long long)dsi->ddp_comp.regs_pa, dsi->regs,
+	       readl(dsi->regs + DSI_CON_CTRL));
 	mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_EN, DSI_EN);
 	if (dsi->driver_data->need_wait_fifo)
 		mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_CM_WAIT_FIFO_FULL_EN,
@@ -1175,6 +1177,23 @@ static int mtk_dsi_set_data_rate(struct mtk_dsi *dsi)
 	return ret;
 }
 
+void corot_mipitx_dump(const char *tag)
+{
+	void __iomem *t = ioremap(0x11e50000, 0x1000);
+	int i;
+
+	if (!t)
+		return;
+	for (i = 0; i < 0x80; i += 0x20)
+		pr_err("COROT-TX[%s] %02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		       tag, i,
+		       readl(t + i + 0x00), readl(t + i + 0x04),
+		       readl(t + i + 0x08), readl(t + i + 0x0c),
+		       readl(t + i + 0x10), readl(t + i + 0x14),
+		       readl(t + i + 0x18), readl(t + i + 0x1c));
+	iounmap(t);
+}
+
 static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 {
 	struct mtk_drm_private *priv = dsi->ddp_comp.mtk_crtc->base.dev->dev_private;
@@ -1221,6 +1240,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 		if (dsi->ext) {
 			if (dsi->ext->params->is_cphy)
 				if (priv->data->mmsys_id == MMSYS_MT6983 ||
+					priv->data->mmsys_id == MMSYS_MT6985 ||
 					priv->data->mmsys_id == MMSYS_MT6895) {
 					mtk_mipi_tx_cphy_lane_config_mt6983(dsi->phy, dsi->ext,
 								     !!dsi->slave_dsi);
@@ -1230,6 +1250,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 				}
 			else
 				if (priv->data->mmsys_id == MMSYS_MT6983 ||
+					priv->data->mmsys_id == MMSYS_MT6985 ||
 					priv->data->mmsys_id == MMSYS_MT6895) {
 					mtk_mipi_tx_dphy_lane_config_mt6983(dsi->phy, dsi->ext,
 								     !!dsi->slave_dsi);
@@ -1248,7 +1269,10 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 
 		pm_runtime_get_sync(dsi->host.dev);
 
-		phy_power_on(dsi->phy);
+		corot_mipitx_dump("before-phy-power-on");
+		pr_err("COROT-TX phy=%p ret=%d\n", dsi->phy,
+		       phy_power_on(dsi->phy));
+		corot_mipitx_dump("after-phy-power-on");
 
 		pr_err("COROT-DSI[poweron] phy_power_on done, data_rate=%d MHz\n",
 		       dsi->data_rate);
@@ -1351,6 +1375,7 @@ static void mtk_dsi_clk_hs_mode(struct mtk_dsi *dsi, bool enter)
 
 	//MIPI_TX_MT6983
 	if (priv->data->mmsys_id == MMSYS_MT6983 ||
+		priv->data->mmsys_id == MMSYS_MT6985 ||
 		priv->data->mmsys_id == MMSYS_MT6895) {
 		if (dsi->ext && dsi->ext->params->is_cphy)
 			writel(0xAA, dsi->regs + DSI_PHY_LCPAT);
@@ -1697,10 +1722,18 @@ static void mtk_dsi_tx_buf_rw(struct mtk_dsi *dsi)
 	}
 
 	if (mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
+		/*
+		 * COROT: the vendor divides by the literal 18 here, not by
+		 * buffer_unit.  Buffer_unit is 32 for MT6985, which yields 450
+		 * instead of 800 for DSI_BUF_CON1's valid threshold; the DSI
+		 * then starts transmitting before a full frame is buffered,
+		 * underruns mid-frame and only the first ~56% of the frame
+		 * reaches the panel.
+		 */
 		if (dsi->ext->params->is_cphy) {
-			tmp = 25 * dsi->data_rate * 2 * dsi->lanes / 7 / buffer_unit;
+			tmp = 25 * dsi->data_rate * 2 * dsi->lanes / 7 / 18;
 		} else {
-			tmp = 25 * dsi->data_rate * dsi->lanes / 8 / buffer_unit;
+			tmp = 25 * dsi->data_rate * dsi->lanes / 8 / 18;
 		}
 	}
 
@@ -2058,10 +2091,14 @@ static s32 mtk_dsi_poll_for_idle(struct mtk_dsi *dsi, struct cmdq_pkt *handle)
 	}
 #endif
 
-	/* MT6985 bring-up: the first packets after engine start complete
-	 * well past the 100ms default window; give them up to 1s. */
+	/*
+	 * COROT: on MT6985 DSI_INTSTA bit31 (DSI_BUSY) simply mirrors the
+	 * DSI_START bit, so this poll can never succeed while the engine is
+	 * running - it only costs 1s inside every atomic commit.  Nothing here
+	 * needs the engine to be stopped, so skip it.
+	 */
 	if (of_machine_is_compatible("mediatek,mt6985"))
-		loop_max = 1000 * 1000;
+		return 1;
 
 	while (loop_cnt < loop_max) {
 		tmp = readl(dsi->regs + DSI_INTSTA);
@@ -2215,6 +2252,41 @@ static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 			if (__ratelimit(&ioctl_ratelimit))
 				DDPPR_ERR(pr_fmt("[IRQ] %s: buffer underrun\n"),
 					mtk_dump_comp_str(&dsi->ddp_comp));
+			{
+				static int corot_underrun_n;
+
+				if (corot_underrun_n < 4) {
+					void __iomem *m0 = ioremap(0x14001000, 0x1000);
+					void __iomem *m1 = ioremap(0x14401000, 0x1000);
+					void __iomem *o = ioremap(0x14402000, 0x1000);
+					void __iomem *dc = ioremap(0x1400c000, 0x1000);
+
+					corot_underrun_n++;
+					pr_err("COROT-UNDERRUN[%d] dsi sta=0x%08x start=0x%08x con=0x%08x mode=0x%08x txrx=0x%08x size=0x%08x | mtx0 en=0x%08x sof=0x%08x | mtx1 en=0x%08x sof=0x%08x | ovl en=0x%08x intsta=0x%08x | dsc con=0x%08x\n",
+						corot_underrun_n,
+						readl(dsi->regs + DSI_INTSTA),
+						readl(dsi->regs + DSI_START),
+						readl(dsi->regs + DSI_CON_CTRL),
+						readl(dsi->regs + DSI_MODE_CTRL),
+						readl(dsi->regs + DSI_TXRX_CTRL),
+						readl(dsi->regs + DSI_CMDQ_SIZE),
+						m0 ? readl(m0 + 0x20) : 0,
+						m0 ? readl(m0 + 0x2c) : 0,
+						m1 ? readl(m1 + 0x20) : 0,
+						m1 ? readl(m1 + 0x2c) : 0,
+						o ? readl(o + 0x00) : 0,
+						o ? readl(o + 0x0c) : 0,
+						dc ? readl(dc + 0x00) : 0);
+					if (m0)
+						iounmap(m0);
+					if (m1)
+						iounmap(m1);
+					if (o)
+						iounmap(o);
+					if (dc)
+						iounmap(dc);
+				}
+			}
 
 			if (mtk_crtc)
 				atomic_set(&mtk_crtc->force_high_step, 1);
@@ -3630,6 +3702,18 @@ static int mtk_dsi_start_vdo_mode(struct mtk_ddp_comp *comp, void *handle)
 
 static int mtk_dsi_trigger(struct mtk_ddp_comp *comp, void *handle)
 {
+#ifdef DRM_CMDQ_DISABLE
+	/*
+	 * COROT: with CMDQ disabled the write below is an immediate MMIO write,
+	 * and DSI_START is already 1 from the LK handoff, so writing 1 again is
+	 * a no-op and no frame is ever triggered.  DSI_BUSY (INTSTA bit31)
+	 * tracks the engine running, so command mode needs a real 0 -> 1 edge
+	 * on DSI_START to start a frame - the same pattern the vendor uses in
+	 * DSI_MIPI_deskew().
+	 */
+	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_START, 0,
+		       ~0);
+#endif
 	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_START, 1,
 		       ~0);
 
@@ -4356,8 +4440,11 @@ static void mtk_dsi_config_trigger(struct mtk_ddp_comp *comp,
 				}
 			}
 		}
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			comp->mtk_crtc->config_regs_pa + 0xF0, 0x1, 0x1);
+		/* COROT: the vendor deliberately skips this on MT6985 - a
+		 * different register lives at mmsys+0xF0 on this SoC. */
+		if (priv && priv->data && priv->data->mmsys_id != MMSYS_MT6985)
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->mtk_crtc->config_regs_pa + 0xF0, 0x1, 0x1);
 
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			       comp->regs_pa + dsi->driver_data->reg_cmdq0_ofs,

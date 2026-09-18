@@ -11937,6 +11937,20 @@ void mtk_disp_mutex_src_set(struct mtk_drm_crtc *mtk_crtc, bool is_cmd_mode)
 		       ddp->regs + DISP_REG_MUTEX_SOF(ddp->data, mutex->id));
 
 	if (ddp->data->dispsys_map && ddp->side_regs) {
+		/*
+		 * COROT: MT6985 has a dedicated ovlsys SOF table; the
+		 * DSI0<->DSI1 swap below is a leftover from dual-DSI SoCs and
+		 * would point the ovlsys mutex at a DSI that does not exist.
+		 */
+		if (ddp->data->mutex_ovlsys_sof) {
+			pr_err("COROT-SOFSET: side_regs sof=0x%08x (ovlsys table, val=%d)\n",
+				ddp->data->mutex_ovlsys_sof[val], val);
+			writel_relaxed(
+				ddp->data->mutex_ovlsys_sof[val],
+				ddp->side_regs +
+				DISP_REG_MUTEX_SOF(ddp->data, mutex->id));
+			return;
+		}
 		/* disp0 DSI0 mutex src should mapping to DSI1, and vice versa */
 		if (val == DDP_MUTEX_SOF_DSI0)
 			val = DDP_MUTEX_SOF_DSI1;
@@ -12243,6 +12257,14 @@ void mtk_disp_mutex_enable_cmdq(struct mtk_disp_mutex *mutex,
 {
 	struct mtk_ddp *ddp =
 		container_of(mutex, struct mtk_ddp, mutex[mutex->id]);
+	void __iomem *dbg;
+
+	dbg = ioremap(0x14001000, 0x1000);
+	pr_err("COROT-NOCMDQ: mutex_enable_cmdq id=%d ddp_regs_pa=0x%llx hdl=%p EN_before=0x%08x\n",
+		mutex->id, (unsigned long long)ddp->regs_pa, cmdq_handle,
+		dbg ? readl(dbg + 0x20 + 0x20 * mutex->id) : 0xdeadbeef);
+	if (dbg)
+		iounmap(dbg);
 
 	if (&ddp->mutex[mutex->id] != mutex)
 		DDPAEE("%s:%d, invalid mutex:(%p,%p) id:%d\n",

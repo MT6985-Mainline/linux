@@ -4615,19 +4615,42 @@ static void corot_dump_ovl(const char *tag, void __iomem *base, const char *name
 	}
 }
 
+int corot_dbg_dump = 1;	/* COROT r32: dump display regs at every stage */
+
+static void corot_dump_dsi_buf(const char *stage)
+{
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+
+	if (!d)
+		return;
+	pr_err("COROT[%s] DSIBUF CON0=0x%08x CON1=0x%08x RWTIMES=0x%08x MEMCONTI=0x%08x\n",
+	       stage, readl(d + 0x400), readl(d + 0x404), readl(d + 0x410),
+	       readl(d + 0x90));
+	pr_err("COROT[%s] DSIBUF SODI=0x%05x/0x%05x PREULTRA=0x%05x/0x%05x ULTRA=0x%05x/0x%05x URGENT=0x%05x/0x%05x\n",
+	       stage, readl(d + 0x414), readl(d + 0x418),
+	       readl(d + 0x424), readl(d + 0x428),
+	       readl(d + 0x42c), readl(d + 0x430),
+	       readl(d + 0x434), readl(d + 0x438));
+	pr_err("COROT[%s] DSIBUF DEBUGSEL=0x%08x RESERVED=0x%08x CMDQ_SIZE=0x%08x\n",
+	       stage, readl(d + 0x170), readl(d + 0xf0), readl(d + 0x60));
+	iounmap(d);
+}
+
 void corot_dump_disp(const char *stage)
 {
+	if (!corot_dbg_dump)
+		return;
 	void __iomem *mx, *mu, *ov[3], *rd0, *rd1, *dsc, *dsi;
-	static const u32 obase[3] = { 0x14002000, 0x14003000, 0x14004000 };
+	static const u32 obase[3] = { 0x14402000, 0x14403000, 0x14404000 };
 	static const char *oname[3] = { "OVL0", "OVL0_2L", "OVL1_2L" };
 	int i;
 
 	mx = ioremap(0x14000000, 0x4000);
 	mu = ioremap(0x14001000, 0x1000);
-	rd0 = ioremap(0x14006000, 0x1000);
+	rd0 = ioremap(0x14010000, 0x1000);
 	rd1 = ioremap(0x1401c000, 0x1000);
-	dsc = ioremap(0x14015000, 0x1000);
-	dsi = ioremap(0x14017000, 0x1000);
+	dsc = ioremap(0x1400c000, 0x1000);
+	dsi = ioremap(0x1400d000, 0x1000);
 	for (i = 0; i < 3; i++)
 		ov[i] = ioremap(obase[i], 0x1000);
 	if (!mx || !mu || !rd0 || !dsc || !dsi) {
@@ -4656,7 +4679,7 @@ void corot_dump_disp(const char *stage)
 	pr_err("COROT[%s] AID_SEL OVL0=0x%08x OVL0_2L=0x%08x OVL1_2L=0x%08x\n",
 	       stage, readl(mx + 0xb00), readl(mx + 0xb04), readl(mx + 0xb08));
 	{
-		void __iomem *larb = ioremap(0x14021000, 0x1000);
+		void __iomem *larb = ioremap(0x1440c000, 0x1000);
 
 		if (larb) {
 			pr_err("COROT[%s] LARB0 NONSEC[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
@@ -4697,6 +4720,14 @@ void corot_dump_disp(const char *stage)
 	       stage, readl(dsc + 0xb0), readl(dsc + 0xb4), readl(dsc + 0xb8),
 	       readl(dsc + 0xbc), readl(dsc + 0xc0), readl(dsc + 0xc4),
 	       readl(dsc + 0xc8), readl(dsc + 0xcc));
+	pr_err("COROT[%s] DSC-PPS20 PPS20=0x%08x PPS21=0x%08x PPS22=0x%08x PPS23=0x%08x PPS24=0x%08x PPS25=0x%08x PPS26=0x%08x PPS27=0x%08x\n",
+	       stage, readl(dsc + 0xd0), readl(dsc + 0xd4), readl(dsc + 0xd8),
+	       readl(dsc + 0xdc), readl(dsc + 0xe0), readl(dsc + 0xe4),
+	       readl(dsc + 0xe8), readl(dsc + 0xec));
+	pr_err("COROT[%s] DSC-PPS28 PPS28=0x%08x PPS29=0x%08x PPS30=0x%08x PPS31=0x%08x PPS32=0x%08x PPS33=0x%08x PPS34=0x%08x PPS35=0x%08x\n",
+	       stage, readl(dsc + 0xf0), readl(dsc + 0xf4), readl(dsc + 0xf8),
+	       readl(dsc + 0xfc), readl(dsc + 0x100), readl(dsc + 0x104),
+	       readl(dsc + 0x108), readl(dsc + 0x10c));
 	pr_err("COROT[%s] DSI START=0x%08x INTSTA=0x%08x CON=0x%08x MODE=0x%08x TXRX=0x%08x PSCTRL=0x%08x SIZE_CON=0x%08x VM_CMD=0x%08x\n",
 	       stage, readl(dsi + 0x00), readl(dsi + 0x0c), readl(dsi + 0x10),
 	       readl(dsi + 0x14), readl(dsi + 0x18), readl(dsi + 0x1c),
@@ -4713,6 +4744,7 @@ void corot_dump_disp(const char *stage)
 	       stage, readl(mx + 0xfcc), readl(mx + 0xfd4), readl(mx + 0xfd8),
 	       readl(mx + 0xfdc), readl(mx + 0xf50), readl(mx + 0xf68),
 	       readl(mx + 0xf4c));
+	corot_dump_dsi_buf(stage);
 out:
 	if (mx) iounmap(mx);
 	if (mu) iounmap(mu);
@@ -4722,6 +4754,43 @@ out:
 	if (rd1) iounmap(rd1);
 	if (dsc) iounmap(dsc);
 	if (dsi) iounmap(dsi);
+}
+
+/*
+ * COROT: mask the display interrupt enables.
+ *
+ * Every boot that activates the display used to wedge the whole SoC at ~10.5s:
+ * the DSI underruns continuously (INTSTA bit12 BUFFER_UNDERRUN + bit14
+ * INP_UNFINISH) and mtk_dsi_irq() reacts with mtk_drm_crtc_analysis() +
+ * mtk_drm_crtc_dump() + mtk_smi_dbg_hang_detect(), so the CPU lives in IRQ
+ * context and the machine looks hung (no oops, WDT resets it 31s later).
+ * DSI_INTEN 0x1400d008, MUTEX INTEN 0x14001000+0x00 / 0x14401000+0x00.
+ * Must run before anything slow: the storm starts right after first_enable.
+ */
+void corot_mask_display_irqs_early(void)
+{
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+	void __iomem *m0 = ioremap(0x14001000, 0x1000);
+	void __iomem *m2 = ioremap(0x14401000, 0x1000);
+
+	if (d) {
+		writel(0, d + 0x08);
+		writel(0xffffffff, d + 0x0c);
+	}
+	if (m0) {
+		writel(0, m0 + 0x00);
+		writel(0xffffffff, m0 + 0x04);
+	}
+	if (m2) {
+		writel(0, m2 + 0x00);
+		writel(0xffffffff, m2 + 0x04);
+	}
+	if (d)
+		iounmap(d);
+	if (m0)
+		iounmap(m0);
+	if (m2)
+		iounmap(m2);
 }
 
 void corot_dump_dsi(void)
@@ -4877,6 +4946,8 @@ static int mtk_drm_kms_init(struct drm_device *drm)
 	mtk_drm_init_dummy_table(private);
 
 	pr_err("COROT-STAGE kms_init: BEFORE first_enable (LK handoff state)\n");
+	/* COROT: LK's known-good display configuration, for comparison */
+	corot_dump_disp("lk-handoff");
 	{
 		void __iomem *dsc = ioremap(0x14015000, 0x1000);
 		void __iomem *dsi = ioremap(0x14017000, 0x1000);
@@ -4893,7 +4964,9 @@ static int mtk_drm_kms_init(struct drm_device *drm)
 	}
 	mtk_drm_first_enable(drm);
 
-	pr_err("COROT-STAGE kms_init done, first_enable done\n");
+	/* COROT: mask display IRQs immediately - the underrun storm starts here */
+	corot_mask_display_irqs_early();
+	pr_err("COROT-STAGE kms_init done, first_enable done (irqs masked)\n");
 	corot_dump_disp("kms_init_done");
 
 	/*
@@ -5725,14 +5798,17 @@ static int mtk_drm_probe(struct platform_device *pdev)
 		dev->of_node ? dev->of_node->full_name : "(null)");
 
 	//drm_debug = 0x2; /* DRIVER messages */
+	pr_err("%s1 kzalloc enter\n", "COROT-BC probe:");
 	private = devm_kzalloc(dev, sizeof(*private), GFP_KERNEL);
 	if (!private)
 		return -ENOMEM;
+	pr_err("%s2 kzalloc ok\n", "COROT-BC probe:");
 
 	private->data = of_device_get_match_data(dev);
 	if (private->data && private->data->mmsys_id == MMSYS_MT6985)
 		mtk_drm_top_clk_always_on = true;
 	dev_err(dev, "COROT: of_device_get_match_data=%px\n", private->data);
+	pr_err("%s3 match_data ok\n", "COROT-BC probe:");
 
 	private->reg_data = mtk_ddp_get_mmsys_reg_data(private->data->mmsys_id);
 	if (IS_ERR(private->reg_data)) {
@@ -5741,11 +5817,14 @@ static int mtk_drm_probe(struct platform_device *pdev)
 		return ret;
 	}
 	dev_info(dev, "COROT-DRM: reg_data ok\n");
+	pr_err("%s4 reg_data ok\n", "COROT-BC probe:");
 
 	mutex_init(&private->commit.lock);
 	INIT_WORK(&private->commit.work, mtk_atomic_work);
 
+	pr_err("%s5 helper_init enter\n", "COROT-BC probe:");
 	mtk_drm_helper_init(dev, &private->helper_opt);
+	pr_err("%s6 helper_init done\n", "COROT-BC probe:");
 
 	/* Init disp_global_stage from platform dts */
 	if (mtk_drm_helper_get_opt(private->helper_opt,
@@ -5758,6 +5837,7 @@ static int mtk_drm_probe(struct platform_device *pdev)
 		if (mtk_drm_get_segment_id(pdev, private))
 			DDPPR_ERR("%s, segment get fail\n", __func__);
 	}
+	pr_err("%s7 segment ok\n", "COROT-BC probe:");
 
 	ranges = of_get_property(dev->of_node, "dma-ranges", &len);
 	if (ranges)
@@ -5772,6 +5852,7 @@ static int mtk_drm_probe(struct platform_device *pdev)
 	}
 
 	private->dispsys_num = dispsys_num;
+	pr_err("%s8 dispsys_num=%u\n", "COROT-BC probe:", dispsys_num);
 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	private->config_regs = devm_ioremap_resource(dev, mem);
 	if (IS_ERR(private->config_regs)) {
@@ -5782,6 +5863,7 @@ static int mtk_drm_probe(struct platform_device *pdev)
 	}
 	private->config_regs_pa = mem->start;
 	dev_info(dev, "COROT-DRM: config_regs ok\n");
+	pr_err("%s9 mmsys regs ok\n", "COROT-BC probe:");
 
 	if (dispsys_num <= 1)
 		goto SKIP_SIDE_DISP;
@@ -5811,6 +5893,7 @@ static int mtk_drm_probe(struct platform_device *pdev)
 	of_node_put(side_node);
 
 	private->side_mmsys_dev = side_dev;
+	pr_err("%s10 side mmsys ok\n", "COROT-BC probe:");
 
 SKIP_SIDE_DISP:
 	private->mmsys_dev = dev;

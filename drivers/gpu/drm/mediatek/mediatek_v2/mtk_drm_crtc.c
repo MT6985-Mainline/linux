@@ -5012,6 +5012,1138 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 }
 
 #ifdef DRM_CMDQ_DISABLE
+#ifdef DRM_CMDQ_DISABLE
+/*
+ * COROT DSI register write test.
+ *
+ * DSI_CON_CTRL (0x10): BIT(0)=DSI_RESET, BIT(1)=DSI_EN, BIT(2)=DSI_PHY_RESET.
+ * mtk_dsi_enable() writes DSI_EN but the register reads 0 afterwards, so the
+ * engine is never turned on.  Verify writes land at all (RMW the TXRX register
+ * with its own value) and then try reset -> enable -> start by hand.
+ */
+static void corot_dsi_write_test(const char *tag)
+{
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+	u32 txrx, before;
+
+	if (!d)
+		return;
+
+	before = readl(d + 0x10);
+	txrx = readl(d + 0x18);
+	writel(txrx, d + 0x18);
+	pr_err("COROT-DSIWT[%s] sanity: txrx 0x%08x -> 0x%08x (writes %s)\n",
+	       tag, txrx, readl(d + 0x18),
+	       readl(d + 0x18) == txrx ? "OK" : "DROPPED");
+	pr_err("COROT-DSIWT[%s] con=0x%08x start=0x%08x sta=0x%08x mode=0x%08x txrx=0x%08x size=0x%08x inten=0x%08x\n",
+	       tag, before, readl(d + 0x00), readl(d + 0x0c), readl(d + 0x14),
+	       txrx, readl(d + 0x60), readl(d + 0x08));
+
+	/* clear latched interrupts, then re-enable them */
+	writel(0, d + 0x08);
+	writel(0xffffffff, d + 0x0c);
+
+	writel(2, d + 0x10);			/* DSI_EN */
+	pr_err("COROT-DSIWT[%s] after EN=1        -> con=0x%08x\n",
+	       tag, readl(d + 0x10));
+	writel(2 | 1, d + 0x10);		/* DSI_EN | DSI_RESET */
+	pr_err("COROT-DSIWT[%s] after EN|RESET   -> con=0x%08x\n",
+	       tag, readl(d + 0x10));
+	writel(2, d + 0x10);			/* clear reset, keep EN */
+	pr_err("COROT-DSIWT[%s] after EN only    -> con=0x%08x\n",
+	       tag, readl(d + 0x10));
+
+	/* explicit command-mode + start */
+	writel(0, d + 0x14);			/* MODE_CTRL: CMD_MODE */
+	writel(0, d + 0x00);
+	writel(1, d + 0x00);
+	pr_err("COROT-DSIWT[%s] after START=1    -> con=0x%08x start=0x%08x sta=0x%08x mode=0x%08x\n",
+	       tag, readl(d + 0x10), readl(d + 0x00), readl(d + 0x0c),
+	       readl(d + 0x14));
+
+	/* restore interrupt enables the driver asked for */
+	writel(0x5004, d + 0x08);
+	iounmap(d);
+}
+
+static void corot_trig_log(const char *tag)
+{
+	static const u32 base[4] = {
+		0x14001000, 0x14201000, 0x14401000, 0x14601000
+	};
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+	void __iomem *o = ioremap(0x14402000, 0x1000);
+	char m[4][64];
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		void __iomem *b = ioremap(base[i], 0x1000);
+
+		if (!b) {
+			snprintf(m[i], sizeof(m[i]), "?-");
+			continue;
+		}
+		snprintf(m[i], sizeof(m[i]), "en=%x sof=%x", readl(b + 0x20),
+			 readl(b + 0x2c));
+		iounmap(b);
+	}
+
+	pr_err("COROT-SWEEP[%s] dsi sta=0x%08x start=0x%08x con=0x%08x mode=0x%08x size=0x%08x cmdq0=0x%08x | 14001000 %s | 14201000 %s | 14401000 %s | 14601000 %s | ovl en=0x%08x src=0x%08x l0con=0x%08x sz=0x%08x ad=0x%08x\n",
+	       tag,
+	       d ? readl(d + 0x0c) : 0, d ? readl(d + 0x00) : 0,
+	       d ? readl(d + 0x10) : 0, d ? readl(d + 0x14) : 0,
+	       d ? readl(d + 0x60) : 0, d ? readl(d + 0xd00) : 0,
+	       m[0], m[1], m[2], m[3],
+	       o ? readl(o + 0x0c) : 0, o ? readl(o + 0x2c) : 0,
+	       o ? readl(o + 0x30) : 0, o ? readl(o + 0x38) : 0,
+	       o ? readl(o + 0xf40) : 0);
+	if (d)
+		iounmap(d);
+	if (o)
+		iounmap(o);
+}
+
+/* which: bit0=14001000 bit1=14201000 bit2=14401000 bit3=14601000 */
+static void corot_trig_variant(const char *tag, int which, int times)
+{
+	static const u32 base[4] = {
+		0x14001000, 0x14201000, 0x14401000, 0x14601000
+	};
+	int i, n, k;
+
+	for (k = 0; k < times; k++) {
+		for (i = 0; i < 4; i++) {
+			void __iomem *b;
+
+			if (!(which & (1 << i)))
+				continue;
+			b = ioremap(base[i], 0x1000);
+			if (!b)
+				continue;
+			for (n = 0; n < 4; n++) {
+				if (!readl(b + 0x30 + 0x20 * n))
+					continue;
+				writel(0x41, b + 0x2c + 0x20 * n);
+				writel(0, b + 0x20 + 0x20 * n);
+				writel(1, b + 0x20 + 0x20 * n);
+			}
+			iounmap(b);
+		}
+	}
+	mdelay(60);
+	corot_trig_log(tag);
+}
+
+static void corot_trig_sweep(void)
+{
+	static int done;
+
+	if (done)
+		return;
+	done = 1;
+
+	corot_trig_log("v0-idle");
+	corot_trig_variant("v1-disp", 0x1, 1);
+	corot_trig_variant("v2-ovlsys", 0x4, 1);
+	corot_trig_variant("v3-disp+ovlsys", 0x5, 1);
+	corot_trig_variant("v4-both4x", 0x5, 4);
+	corot_trig_variant("v5-all4", 0xf, 1);
+	corot_trig_variant("v6-all4-4x", 0xf, 4);
+}
+
+static void corot_cg_probe(const char *tag)
+{
+	static const u32 bases[4] = {
+		0x14000000, 0x14200000, 0x14400000, 0x14600000
+	};
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		void __iomem *b = ioremap(bases[i], 0x1000);
+
+		if (!b)
+			continue;
+		pr_err("COROT-CG[%s] 0x%08x sta: mm0=0x%08x mm1=0x%08x mm2=0x%08x | dsi0_gate(bit21 of mm0)=%d\n",
+		       tag, bases[i], readl(b + 0x100), readl(b + 0x110),
+		       readl(b + 0x1a0),
+		       !!(readl(b + 0x100) & (1 << 21)));
+		iounmap(b);
+	}
+}
+
+/*
+ * COROT: ungate the whole display clock tree.
+ *
+ * LK leaves the display engine clocks gated at handoff and our DTS has no real
+ * mmsys clock controller (fixed-clock stubs), so nothing ever opens them:
+ * DSI_EN cannot latch, MUTEX_EN writes have no effect and DSI_BUSY stays set.
+ * mtk_clk_gate_ops_setclr: write BIT to clr_ofs to ungate, sta bit 0 == on.
+ */
+static void corot_ungate_display(const char *tag)
+{
+	static const u32 bases[4] = {
+		0x14000000, 0x14200000, 0x14400000, 0x14600000
+	};
+	int i;
+
+	corot_cg_probe(tag);
+	for (i = 0; i < 4; i++) {
+		void __iomem *b = ioremap(bases[i], 0x1000);
+
+		if (!b)
+			continue;
+		writel(0xffffffff, b + 0x108);	/* mm0 ungate */
+		writel(0xffffffff, b + 0x118);	/* mm1 ungate */
+		writel(0xffffffff, b + 0x1a8);	/* mm2 ungate */
+		iounmap(b);
+	}
+	corot_cg_probe("after");
+}
+
+/* DSI_CON_CTRL: BIT0 = DSI_RESET, BIT1 = DSI_EN, BIT2 = DSI_PHY_RESET */
+static void corot_dsi_kick(const char *tag)
+{
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+
+	if (!d)
+		return;
+	pr_err("COROT-DSIKICK[%s] before con=0x%08x start=0x%08x sta=0x%08x\n",
+	       tag, readl(d + 0x10), readl(d + 0x00), readl(d + 0x0c));
+
+	writel(2, d + 0x10);			/* DSI_EN */
+	pr_err("COROT-DSIKICK[%s] after EN=1 -> con=0x%08x\n",
+	       tag, readl(d + 0x10));
+	writel(0, d + 0x14);			/* command mode */
+	writel(0, d + 0x00);
+	writel(1, d + 0x00);
+	mdelay(5);
+	pr_err("COROT-DSIKICK[%s] after START -> con=0x%08x start=0x%08x sta=0x%08x\n",
+	       tag, readl(d + 0x10), readl(d + 0x00), readl(d + 0x0c));
+	iounmap(d);
+}
+
+/* DSI_SHADOW_DEBUG 0x190, DSI_BYPASS_SHADOW BIT(1), DSI_CON_CTRL 0x10 (BIT1 = DSI_EN) */
+#define COROT_SIMPLEFB_PA	0xfda1f000UL
+
+static struct delayed_work corot_fb_copy_work;
+static int corot_fb_copy_left;
+static int corot_fb_copy_started;
+
+static void corot_fb_copy_fn(struct work_struct *w)
+{
+	void __iomem *o = ioremap(0x14402000, 0x1000);
+	void __iomem *dst = NULL, *src = NULL;
+	u32 addr, pitch, h, bytes;
+	int i;
+
+	if (!o)
+		return;
+	addr = readl(o + 0xf40);
+	pitch = readl(o + 0x44);
+	h = readl(o + 0x38) & 0xffff;
+	iounmap(o);
+
+	if (!addr || !pitch || !h || h > 4096)
+		return;
+	bytes = pitch * h;
+	dst = ioremap(addr, bytes);
+	src = ioremap(COROT_SIMPLEFB_PA, bytes);
+	if (dst && src) {
+		for (i = 0; i < bytes; i += 4)
+			writel(readl(src + i), dst + i);
+		pr_err("COROT-FBCOPY[%d] %u bytes @0x%08x -> ovl 0x%08x (pitch %u h %u)\n",
+		       corot_fb_copy_left, bytes, (unsigned int)COROT_SIMPLEFB_PA,
+		       addr, pitch, h);
+	} else {
+		pr_err("COROT-FBCOPY ioremap failed (dst=%p src=%p bytes=%u)\n",
+		       dst, src, bytes);
+	}
+	if (dst)
+		iounmap(dst);
+	if (src)
+		iounmap(src);
+
+	if (--corot_fb_copy_left > 0)
+		schedule_delayed_work(&corot_fb_copy_work, HZ / 2);
+}
+
+static void corot_fb_copy_start(void)
+{
+	if (corot_fb_copy_started)
+		return;
+	corot_fb_copy_started = 1;
+	corot_fb_copy_left = 30;
+	INIT_DELAYED_WORK(&corot_fb_copy_work, corot_fb_copy_fn);
+	schedule_delayed_work(&corot_fb_copy_work, HZ / 2);
+	pr_err("COROT-FBCOPY started (30 x 0.5s)\n");
+}
+
+/*
+ * COROT: point the OVL's layer 0 at the simplefb buffer.
+ *
+ * fbcon draws into 0xfda1f000 (the DT simple-framebuffer describing LK's
+ * leftover scanout) while the DRM programs the OVL with its own CMA buffer,
+ * so the panel scans memory that is never painted.  The DRM buffer already
+ * uses the same stride (4880) and geometry (1220x2712), so only the address
+ * has to be redirected.  Must be re-applied after every commit because the
+ * DRM reprograms the layer each time.
+ */
+extern void corot_mask_display_irqs_early(void);
+
+/* DSI_INTEN 0x08, DSI_INTSTA 0x0c, MUTEX INTEN 0x00 / INTSTA 0x04 */
+static void corot_mask_display_irqs(void)
+{
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+	void __iomem *m0 = ioremap(0x14001000, 0x1000);
+	void __iomem *m2 = ioremap(0x14401000, 0x1000);
+	u32 d_en, d_sta, m0_en, m2_en;
+
+	d_en = d ? readl(d + 0x08) : 0;
+	d_sta = d ? readl(d + 0x0c) : 0;
+	m0_en = m0 ? readl(m0 + 0x00) : 0;
+	m2_en = m2 ? readl(m2 + 0x00) : 0;
+
+	pr_err("COROT-IRQMASK before: dsi_inten=0x%08x dsi_intsta=0x%08x mtx0_inten=0x%08x mtx2_inten=0x%08x\n",
+	       d_en, d_sta, m0_en, m2_en);
+
+	if (d) {
+		writel(0, d + 0x08);		/* DSI_INTEN = 0 */
+		writel(0xffffffff, d + 0x0c);	/* clear latched */
+	}
+	if (m0) {
+		writel(0, m0 + 0x00);
+		writel(0xffffffff, m0 + 0x04);
+	}
+	if (m2) {
+		writel(0, m2 + 0x00);
+		writel(0xffffffff, m2 + 0x04);
+	}
+
+	pr_err("COROT-IRQMASK after:  dsi_inten=0x%08x dsi_intsta=0x%08x mtx0_inten=0x%08x mtx2_inten=0x%08x\n",
+	       d ? readl(d + 0x08) : 0, d ? readl(d + 0x0c) : 0,
+	       m0 ? readl(m0 + 0x00) : 0, m2 ? readl(m2 + 0x00) : 0);
+
+	if (d)
+		iounmap(d);
+	if (m0)
+		iounmap(m0);
+	if (m2)
+		iounmap(m2);
+}
+
+/*
+ * COROT test pattern target: inside the reserved LK framebuffer area but
+ * outside simplefb's own range, so nothing else writes there.
+ */
+#define COROT_TESTFB_PA		0xfe61f000UL
+
+static void corot_test_pattern(void)
+{
+	static int done;
+	static u32 stage[1024];
+	void __iomem *fb;
+	const u32 pitch = 4880;
+	const int height = 2712;
+	int y, off, i;
+
+	if (done)
+		return;
+	done = 1;
+
+	fb = ioremap(COROT_SIMPLEFB_PA, pitch * height);
+	if (!fb) {
+		pr_err("COROT-TESTPAT ioremap of 0x%08lx failed\n",
+		       (unsigned long)COROT_SIMPLEFB_PA);
+		return;
+	}
+
+	for (y = 0; y < height; y++) {
+		u32 c;
+
+		/*
+		 * COROT ruler: 24 x 113 lines of alternating red/blue, plus two
+		 * reference markers so the boundary can be read off exactly.
+		 */
+		if (y >= 2624)
+			c = 0x0000ff00;			/* BOTTOM 88 lines: GREEN */
+		else if (y >= 1356 && y < 1424)
+			c = 0x00ff00ff;			/* MID band: MAGENTA */
+		else if (y >= 1216 && y < 1224)
+			c = 0x00ffffff;			/* marker: line 1220 */
+		else if (y >= 1224 && y < 1224 + 128 && ((y - 1224) % 64) < 8)
+			c = 0x00ffffff;			/* ladder: 1224, 1288 */
+		else
+			c = ((y / 113) & 1) ? 0x000000ff : 0x00ff0000;
+
+		for (i = 0; i < 1024; i++)
+			stage[i] = c;
+		for (off = 0; off < (int)pitch; off += 4096) {
+			int n = (pitch - off) < 4096 ? (int)(pitch - off) : 4096;
+
+			memcpy_toio((u8 __iomem *)fb + (size_t)y * pitch + off,
+				    stage, n);
+		}
+	}
+	pr_err("COROT-TESTPAT r42 written at 0x%08lx: red/blue bands, MAGENTA 1356-1423, white @1220 + @1224/@1288, GREEN 2624-2711\n",
+	       (unsigned long)COROT_SIMPLEFB_PA);
+	iounmap(fb);
+}
+
+/*
+ * COROT: per-frame MUTEX trigger.
+ *
+ * On MT6985 in command mode the MUTEX is normally pulsed by a GCE event from
+ * the panel TE.  CMDQ/GCE is dead here, so nothing starts a frame: MUTEX_EN
+ * stays 1 but no trigger arrives and the DSI starves (INTSTA bit12
+ * BUFFER_UNDERRUN + bit14 INP_UNFINISH, permanently set).
+ *
+ * Pulse EN on every mutex slot that has modules programmed, only after the
+ * components for the current frame have been written.
+ */
+/*
+ * COROT: 60Hz CPU-side frame trigger.
+ *
+ * MT6985's MUTEX normally starts one frame of the whole OVL -> RDMA -> DSC ->
+ * DSI chain from a GCE event driven by the panel TE.  GCE is dead in this
+ * build, so trigger it from a timer instead.  Mappings are cached because
+ * ioremap() cannot be used in a timer callback.  The DSI interrupt enables are
+ * also re-masked here so the underrun storm cannot come back after a commit
+ * re-arms them.
+ */
+#define COROT_FTRIG_HZ	60
+
+static struct timer_list corot_ftrig_timer;
+static void __iomem *corot_mtx_map[4];
+static void __iomem *corot_dsi_map;
+static void __iomem *corot_ovl_map;
+static void __iomem *corot_dsc_map;
+static unsigned int corot_color_phase;
+
+/* OVL0: SRC_CON 0x2c (bit0 = L0_EN), BGCLR 0x28 */
+static void corot_color_seq(unsigned long ticks)
+{
+	static const u32 bgclr[4] = {
+		0x00ff0000,	/* red   */
+		0x0000ff00,	/* green */
+		0x000000ff,	/* blue  */
+		0x00ffffff,	/* white */
+	};
+	unsigned int phase = (ticks / (COROT_FTRIG_HZ * 4)) % 5;
+
+	return;	/* COROT r42: keep the ruler on screen instead of cycling */
+	u32 reg;
+	int show_bg = (phase < 4);
+
+	if (!corot_ovl_map || phase == corot_color_phase)
+		return;
+	corot_color_phase = phase;
+
+	reg = readl(corot_ovl_map + 0x2c);
+	if (show_bg) {
+		writel(bgclr[phase], corot_ovl_map + 0x28);
+		writel(reg & ~1u, corot_ovl_map + 0x2c);
+	} else {
+		writel(reg | 1u, corot_ovl_map + 0x2c);
+	}
+	pr_err("COROT-COLOR phase %u bgclr=0x%08x src_con=0x%08x\n",
+	       phase, readl(corot_ovl_map + 0x28), readl(corot_ovl_map + 0x2c));
+}
+
+#define COROT_TE_RDY	(1 << 2)	/* DSI_INTSTA bit2: panel TE received */
+#define COROT_DSI_BUSY		(1u << 31)	/* DSI_INTSTA bit31: engine busy */
+#define COROT_DSI_FRMDONE	(1u << 4)	/* DSI_INTSTA bit4: frame done */
+#define COROT_DSI_UNDERRUN	(1u << 12)	/* DSI_INTSTA bit12: buffer underrun */
+#define COROT_DSI_INP_UNFIN	(1u << 14)	/* DSI_INTSTA bit14: input unfinished */
+
+/*
+ * COROT r42: how long we give the display pipeline between two frames.  The
+ * sweep starts slow (500 ms = 13x the nominal 16.7 ms) and ends at the normal
+ * 60 Hz.  If the 45 % boundary is a rate limit the bottom of the screen is
+ * correct during the slow phases and breaks up as the period shrinks.
+ */
+static const unsigned int corot_periods[] = { 16 };
+#define COROT_PERIOD_N		ARRAY_SIZE(corot_periods)
+#define COROT_HOLD_MS		10	/* sweep step length, seconds */
+#define COROT_RETRY_MS		2	/* re-check the engine every 2 ms */
+#define COROT_HELD_MAX		200	/* 400 ms safety valve */
+#define COROT_OVL_MAX_MS	100	/* give up waiting for the OVL after 100 ms */
+
+/*
+ * COROT r43: alternate between "OVL layer disabled, background colour only"
+ * (no DRAM traffic at all) and the normal framebuffer scanout.  Where the
+ * flat colour stops tells us which half of the pipeline is truncating the
+ * frame.
+ */
+static const u32 corot_phase_bg[3] = {
+	0x0000ffff,	/* cyan  */
+	0x00ff8000,	/* orange */
+	0x00ffffff,	/* white */
+};
+#define COROT_PHASE_MS	8000
+
+static void corot_phase_apply(unsigned int n)
+{
+	u32 src_con;
+	const char *layer;
+
+	if (!corot_ovl_map)
+		return;
+
+	src_con = readl(corot_ovl_map + 0x2c);
+	if ((n & 1) == 0) {
+		unsigned int k = (n / 2) % 3;
+
+		writel(corot_phase_bg[k], corot_ovl_map + 0x28);	/* BGCLR */
+		writel(src_con & ~1u, corot_ovl_map + 0x2c);	/* layer off */
+		layer = "off-bg";
+	} else {
+		writel(src_con | 1u, corot_ovl_map + 0x2c);	/* layer on */
+		layer = "on-fb";
+	}
+	pr_err("COROT-PHASE n=%u layer=%s bg=0x%08x src_con=0x%08x roi=0x%08x\n",
+	       n, layer, readl(corot_ovl_map + 0x28),
+	       readl(corot_ovl_map + 0x2c), readl(corot_ovl_map + 0x20));
+}
+
+/*
+ * COROT r44: one-shot trace of a single frame.
+ *
+ * DISP_REG_OVL_ADDCON_DBG (0x244): ROI_X = bits[12:0], ROI_Y = bits[28:16]
+ * DISP_REG_OVL_FLOW_CTRL_DBG (0x240): fsm = bits[9:0], frame_underrun = bit25,
+ *   frame_done = bit26, ovl_running = bit27, ovl_start = bit28
+ */
+static void corot_ovl_trace(void)
+{
+	int i;
+
+	if (!corot_ovl_map)
+		return;
+
+	for (i = 0; i < 200; i++) {		/* 200 x 200us = 40 ms */
+		u32 ad = readl(corot_ovl_map + 0x244);
+		u32 fl = readl(corot_ovl_map + 0x240);
+		u32 ds = corot_dsi_map ? readl(corot_dsi_map + 0x0c) : 0;
+		u32 dc = corot_dsc_map ? readl(corot_dsc_map + 0x08) : 0;
+
+		if ((i % 10) == 0)
+			pr_err("COROT-TRACE t=%4dus ovlY=%4u ovlX=%4u fsm=0x%03x run=%u strt=%u und=%u done=%u | dsi=0x%08x dsc=0x%08x\n",
+			       i * 200, (ad >> 16) & 0x1fff, ad & 0x1fff,
+			       fl & 0x3ff, (fl >> 27) & 1, (fl >> 28) & 1,
+			       (fl >> 25) & 1, (fl >> 26) & 1, ds, dc);
+		udelay(200);
+	}
+}
+
+/*
+ * COROT r46: tight trace of one frame, started right after the push (the OVL
+ * is known to be at Y=0 then).  160 x 250us = 40 ms, one line every 2 ms.
+ */
+static void corot_ovl_trace2(void)
+{
+	unsigned long t0 = jiffies;
+	unsigned int ymin = 0xffff, ymax = 0;
+	int first_idle = -1, first_done = -1;
+	int i;
+
+	if (!corot_ovl_map)
+		return;
+
+	for (i = 0; i < 160; i++) {
+		u32 ad = readl(corot_ovl_map + 0x244);
+		u32 fl = readl(corot_ovl_map + 0x240);
+		unsigned int y = (ad >> 16) & 0x1fff;
+
+		if (y > ymax)
+			ymax = y;
+		if (y < ymin)
+			ymin = y;
+		if (first_idle < 0 && (fl & 0x3ff) != 0x20)
+			first_idle = i * 250 / 1000;
+		if (first_done < 0 && ((fl >> 26) & 1))
+			first_done = i * 250 / 1000;
+
+		if ((i % 8) == 0)
+			pr_err("COROT-T2 t=%3uus ovlY=%4u ovlX=%4u fsm=0x%03x run=%u und=%u done=%u roi=0x%08x pqloop=0x%08x pqsize=0x%08x\n",
+			       i * 250, y, ad & 0x1fff, fl & 0x3ff,
+			       (fl >> 27) & 1, (fl >> 25) & 1, (fl >> 26) & 1,
+			       readl(corot_ovl_map + 0x20),
+			       readl(corot_ovl_map + 0x2e0),
+			       readl(corot_ovl_map + 0x2e4));
+		udelay(250);
+	}
+	pr_err("COROT-T2 end ymin=%u ymax=%u first_idle_ms=%d first_done_ms=%d elapsed_ms=%lu\n",
+	       ymin, ymax, first_idle, first_done,
+	       jiffies_to_msecs(jiffies - t0));
+}
+
+static void corot_size_dump(void)
+{
+	void __iomem *o = corot_ovl_map;
+
+	if (!o)
+		return;
+	pr_err("COROT-SZ ovl sta=%08x intsta=%08x en=%08x roi=%08x dp=%08x ext=%08x src=%08x bg=%08x\n",
+	       readl(o + 0x00), readl(o + 0x08), readl(o + 0x0c), readl(o + 0x20),
+	       readl(o + 0x24), readl(o + 0x324), readl(o + 0x2c), readl(o + 0x28));
+	pr_err("COROT-SZ ovl pqloop=%08x pqsize=%08x roit0=%08x smidbg=%08x flow=%08x addcon=%08x rdma0dbg=%08x\n",
+	       readl(o + 0x2e0), readl(o + 0x2e4), readl(o + 0x740),
+	       readl(o + 0x230), readl(o + 0x240), readl(o + 0x244),
+	       readl(o + 0x24c));
+	pr_err("COROT-SZ ovl L0 con=%08x size=%08x off=%08x pitch=%08x addr=%08x rdma0ctl=%08x sramcfg=%08x\n",
+	       readl(o + 0x30), readl(o + 0x38), readl(o + 0x3c), readl(o + 0x44),
+	       readl(o + 0xf40), readl(o + 0x0c0), readl(o + 0x880));
+	if (corot_dsc_map)
+		pr_err("COROT-SZ dsc con=%08x intsta=%08x picw=%08x pich=%08x slicew=%08x sliceh=%08x chunk=%08x buf=%08x mode=%08x cfg=%08x encw=%08x\n",
+		       readl(corot_dsc_map + 0x00), readl(corot_dsc_map + 0x08),
+		       readl(corot_dsc_map + 0x18), readl(corot_dsc_map + 0x1c),
+		       readl(corot_dsc_map + 0x20), readl(corot_dsc_map + 0x24),
+		       readl(corot_dsc_map + 0x28), readl(corot_dsc_map + 0x2c),
+		       readl(corot_dsc_map + 0x30), readl(corot_dsc_map + 0x34),
+		       readl(corot_dsc_map + 0x3c));
+	if (corot_dsi_map)
+		pr_err("COROT-SZ dsi start=%08x sta=%08x con=%08x psc=%08x vact=%08x size=%08x buf0=%08x buf1=%08x rwt=%08x cmdqsz=%08x\n",
+		       readl(corot_dsi_map + 0x00), readl(corot_dsi_map + 0x0c),
+		       readl(corot_dsi_map + 0x10), readl(corot_dsi_map + 0x1c),
+		       readl(corot_dsi_map + 0x2c), readl(corot_dsi_map + 0x38),
+		       readl(corot_dsi_map + 0x400), readl(corot_dsi_map + 0x404),
+		       readl(corot_dsi_map + 0x410), readl(corot_dsi_map + 0x60));
+}
+
+static void corot_phase_tick(void)
+{
+	static unsigned long phase_start;
+	static unsigned int phase;
+
+	if (phase_start && time_before(jiffies, phase_start + msecs_to_jiffies(COROT_PHASE_MS)))
+		return;
+
+	phase_start = jiffies;
+	corot_phase_apply(phase);
+	phase++;
+}
+
+static void corot_ftrig_tick(struct timer_list *t)
+{
+	static unsigned long pushed, held, held_max, n_busy, n_ur, n_inp, n_frm;
+	static unsigned long n_force, n_steps, next_report, next_push;
+	static unsigned long n_dsc_err, n_dsc_zf, n_dsc_aeof;
+	static unsigned int y_last;
+	static unsigned long last_push_j;
+	static unsigned long n_act, n_done, n_und;
+	static int t2_done;
+	static unsigned int y_max, y_at_push;
+	static unsigned int period_idx;
+	unsigned int period = corot_periods[period_idx];
+	unsigned int delay = period;
+	u32 sta = 0;
+	int i, n;
+
+	/*
+	 * COROT r42: honour the sweep period first ...
+	 */
+	if (time_before(jiffies, next_push)) {
+		delay = jiffies_to_msecs(next_push - jiffies);
+		if ((int)delay < 1)
+			delay = 1;
+		goto report;
+	}
+
+	/*
+	 * COROT r45: never start a frame while the OVL is still scanning.  The
+	 * DSI goes idle long before the OVL finishes, so gating on the DSI alone
+	 * restarts the OVL mid-frame and the panel only ever receives the first
+	 * ~1400 lines.
+	 */
+	if (corot_ovl_map && (jiffies - last_push_j) < msecs_to_jiffies(COROT_OVL_MAX_MS)) {
+		u32 fl = readl(corot_ovl_map + 0x240);
+
+		if ((fl & 0x3ff) == 0x20) {	/* eng_act: still scanning */
+			n_act++;
+			delay = 1;
+			goto report;
+		}
+	}
+
+	/*
+	 * ... then wait for the engine to go idle.  Writing DSI_START=0 while
+	 * a frame is still being pushed aborts it, so never do that.  The rest
+	 * is diagnostic: how often the DSI is busy, how often it underruns and
+	 * how many frames really complete.
+	 */
+	if (corot_dsi_map) {
+		sta = readl(corot_dsi_map + 0x0c);
+		if (sta & COROT_DSI_UNDERRUN)
+			n_ur++;
+		if (sta & COROT_DSI_INP_UNFIN)
+			n_inp++;
+		if (sta & COROT_DSI_FRMDONE)
+			n_frm++;
+		if (sta & COROT_DSI_BUSY) {
+			n_busy++;
+			held++;
+			if (held < COROT_HELD_MAX) {
+				mod_timer(&corot_ftrig_timer,
+					  jiffies + msecs_to_jiffies(COROT_RETRY_MS));
+				goto report;
+			}
+			n_force++;	/* engine never went idle: push anyway */
+		}
+	}
+
+	/* COROT r45: remember where the OVL had got to when we push */
+	if (corot_ovl_map) {
+		u32 ad = readl(corot_ovl_map + 0x244);
+		u32 fl = readl(corot_ovl_map + 0x240);
+
+		y_at_push = (ad >> 16) & 0x1fff;
+		if ((fl >> 25) & 1)
+			n_und++;
+		if ((fl >> 26) & 1)
+			n_done++;
+	}
+	if (held > held_max)
+		held_max = held;
+	held = 0;
+	pushed++;
+	last_push_j = jiffies;
+	next_push = jiffies + msecs_to_jiffies(period);
+
+	if (pushed == 3) {
+		corot_ovl_trace2();
+		corot_size_dump();
+	}
+
+
+	for (i = 0; i < 4; i++) {
+		void __iomem *b = corot_mtx_map[i];
+
+		if (!b)
+			continue;
+		for (n = 0; n < 4; n++) {
+			if (!readl(b + 0x30 + 0x20 * n))
+				continue;
+			writel(0, b + 0x20 + 0x20 * n);
+			writel(1, b + 0x20 + 0x20 * n);
+		}
+	}
+
+	{
+		/* COROT r44: keep the framebuffer layer on permanently */
+		static int once;
+
+		if (!once) {
+			once = 1;
+			corot_phase_apply(1);
+		}
+	}
+
+	/*
+	 * COROT r43: sample the DSC error flags every frame instead of leaving
+	 * the stale boot-time 0x00000009 in place.
+	 */
+	if (corot_dsc_map) {
+		u32 ds = readl(corot_dsc_map + 0x08);
+
+		if (ds & (1u << 1))
+			n_dsc_err++;
+		if (ds & (1u << 2))
+			n_dsc_zf++;
+		if (ds & (1u << 3))
+			n_dsc_aeof++;
+		writel(0xffffffff, corot_dsc_map + 0x08);
+	}
+
+	if (corot_dsi_map) {
+		writel(0, corot_dsi_map + 0x08);	/* INTEN = 0, no storm */
+		writel(0xffffffff, corot_dsi_map + 0x0c);
+		writel(0, corot_dsi_map + 0x00);	/* START edge */
+		writel(1, corot_dsi_map + 0x00);
+	}
+
+report:
+	if (time_after_eq(jiffies, next_report)) {
+		next_report = jiffies + msecs_to_jiffies(COROT_HOLD_MS * 1000);
+		n_steps++;
+	{
+		u32 ad = corot_ovl_map ? readl(corot_ovl_map + 0x244) : 0;
+		u32 fl = corot_ovl_map ? readl(corot_ovl_map + 0x240) : 0;
+		u32 y = (ad >> 16) & 0x1fff;
+
+		if (y > y_max)
+			y_max = y;
+		y_last = y;
+		pr_err("COROT-FTRIG pushed=%lu ur=%lu inp=%lu frm=%lu busy=%lu force=%lu dscAEOF=%lu | ovlY_now=%u ovlY_atpush=%u ovlY_max=%u fsm=0x%03x act=%lu und=%lu done=%lu | ovl_int=0x%08x dsi=0x%08x dsc=0x%08x\n",
+		       pushed, n_ur, n_inp, n_frm, n_busy, n_force, n_dsc_aeof,
+		       y_last, y_at_push, y_max, fl & 0x3ff,
+		       n_act, n_und, n_done,
+		       corot_ovl_map ? readl(corot_ovl_map + 0x08) : 0,
+		       corot_dsi_map ? readl(corot_dsi_map + 0x0c) : 0,
+		       corot_dsc_map ? readl(corot_dsc_map + 0x08) : 0);
+	}
+		period_idx = (period_idx + 1) % COROT_PERIOD_N;
+	}
+
+	mod_timer(&corot_ftrig_timer, jiffies + msecs_to_jiffies(delay));
+}
+
+static void corot_ftrig_start(void)
+{
+	static const u32 base[4] = {
+		0x14001000, 0x14201000, 0x14401000, 0x14601000
+	};
+	static int started;
+	int i;
+
+	if (started)
+		return;
+	started = 1;
+
+	for (i = 0; i < 4; i++)
+		corot_mtx_map[i] = ioremap(base[i], 0x1000);
+	corot_dsi_map = ioremap(0x1400d000, 0x1000);
+	corot_ovl_map = ioremap(0x14402000, 0x1000);
+	corot_dsc_map = ioremap(0x1400c000, 0x1000);
+
+	timer_setup(&corot_ftrig_timer, corot_ftrig_tick, 0);
+	mod_timer(&corot_ftrig_timer,
+		  jiffies + msecs_to_jiffies(1000 / COROT_FTRIG_HZ));
+	pr_err("COROT-FTRIG r43 timer: 60 Hz, OVL layer off/on every %d ms\n", COROT_PHASE_MS);
+}
+
+static void corot_mutex_frame_trigger(const char *tag)
+{
+	static const u32 base[4] = {
+		0x14001000, 0x14201000, 0x14401000, 0x14601000
+	};
+	int i, n, pulsed = 0;
+
+	for (i = 0; i < 4; i++) {
+		void __iomem *b = ioremap(base[i], 0x1000);
+
+		if (!b)
+			continue;
+		for (n = 0; n < 4; n++) {
+			if (!readl(b + 0x30 + 0x20 * n))
+				continue;
+			writel(0, b + 0x20 + 0x20 * n);
+			writel(1, b + 0x20 + 0x20 * n);
+			pulsed++;
+		}
+		iounmap(b);
+	}
+	pr_err("COROT-FTRIG[%s] pulsed %d mutex slots\n", tag, pulsed);
+}
+
+static void corot_ovl_scan_simplefb(void)
+{
+	void __iomem *o = ioremap(0x14402000, 0x1000);
+
+	if (!o)
+		return;
+	corot_test_pattern();
+	if (readl(o + 0xf40) != (u32)COROT_SIMPLEFB_PA) {
+		pr_err("COROT-OVLFIX: L0 addr 0x%08x -> 0x%08x | con=0x%08x size=0x%08x pitch=0x%08x en=0x%08x src_con=0x%08x\n",
+		       readl(o + 0xf40), (unsigned int)COROT_SIMPLEFB_PA,
+		       readl(o + 0x30), readl(o + 0x38), readl(o + 0x44),
+		       readl(o + 0x0c), readl(o + 0x2c));
+		writel(0, o + 0xf44);			/* ADDR_MSB */
+		writel((unsigned int)COROT_SIMPLEFB_PA, o + 0xf40);
+	}
+	iounmap(o);
+}
+
+static void corot_fb_probe(const char *tag)
+{
+	void __iomem *o = ioremap(0x14402000, 0x1000);
+	void __iomem *fb;
+	u32 addr = 0;
+	int i, nz;
+	u32 first[4];
+
+	if (o) {
+		addr = readl(o + 0xf40);
+		pr_err("COROT-FB[%s] ovl0 L0 con=0x%08x size=0x%08x pitch=0x%08x addr=0x%08x\n",
+		       tag, readl(o + 0x30), readl(o + 0x38),
+		       readl(o + 0x44), addr);
+		iounmap(o);
+	}
+
+	if (addr) {
+		fb = ioremap(addr, 0x100000);
+		if (fb) {
+			nz = 0;
+			for (i = 0; i < 0x100000; i += 4)
+				if (readl(fb + i))
+					nz++;
+			first[0] = readl(fb + 0x00000);
+			first[1] = readl(fb + 0x40000);
+			first[2] = readl(fb + 0x80000);
+			first[3] = readl(fb + 0xc0000);
+			pr_err("COROT-FB[%s] scanout 0x%08x nonzero=%d/262144 words: %08x %08x %08x %08x\n",
+			       tag, addr, nz, first[0], first[1], first[2],
+			       first[3]);
+			iounmap(fb);
+		}
+	}
+
+	/* memory simplefb would have drawn into (LK logo area) */
+	fb = ioremap(0xfda1f000, 0x100000);
+	if (fb) {
+		nz = 0;
+		for (i = 0; i < 0x100000; i += 4)
+			if (readl(fb + i))
+				nz++;
+		pr_err("COROT-FB[%s] simplefb 0xfda1f000 nonzero=%d/262144 words: %08x %08x %08x %08x\n",
+		       tag, nz, readl(fb + 0x00000), readl(fb + 0x40000),
+		       readl(fb + 0x80000), readl(fb + 0xc0000));
+		iounmap(fb);
+	}
+}
+
+/* MT6985 mmsys routing registers, from the vendor driver's MT6985 case */
+#define COROT_MT6985_DISPSYS_BYPASS_MUX_SHADOW	0xc30
+#define COROT_MT6985_OVLSYS_BYPASS_MUX_SHADOW	0xf00
+#define COROT_MT6985_OVLSYS_CROSSBAR_CON	0xf0c
+
+static void corot_mt6985_xbar(const char *tag)
+{
+	static const u32 base[4] = {
+		0x14000000, 0x14200000, 0x14400000, 0x14600000
+	};
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		void __iomem *b = ioremap(base[i], 0x1000);
+
+		if (!b)
+			continue;
+		pr_err("COROT-XBARFIX[%s] 0x%08x C30=0x%08x F00=0x%08x F0C=0x%08x\n",
+		       tag, base[i], readl(b + COROT_MT6985_DISPSYS_BYPASS_MUX_SHADOW),
+		       readl(b + COROT_MT6985_OVLSYS_BYPASS_MUX_SHADOW),
+		       readl(b + COROT_MT6985_OVLSYS_CROSSBAR_CON));
+		if (i == 0) {
+			/* dispsys0: all crossbars bypassed (vendor reg = 0xFF0001) */
+			writel(readl(b + COROT_MT6985_DISPSYS_BYPASS_MUX_SHADOW) |
+				       0xff0001,
+			       b + COROT_MT6985_DISPSYS_BYPASS_MUX_SHADOW);
+		} else {
+			/* ovlsys: bypass shadow + crossbar select (0x1 / 0xFF0000) */
+			writel(readl(b + COROT_MT6985_OVLSYS_BYPASS_MUX_SHADOW) | 0x1,
+			       b + COROT_MT6985_OVLSYS_BYPASS_MUX_SHADOW);
+			writel(readl(b + COROT_MT6985_OVLSYS_CROSSBAR_CON) | 0xff0000,
+			       b + COROT_MT6985_OVLSYS_CROSSBAR_CON);
+		}
+		iounmap(b);
+	}
+}
+
+static void corot_dsi_conscan(const char *what, u32 off)
+{
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+	u32 i, v;
+
+	if (!d)
+		return;
+	writel(0, d + off);
+	pr_err("COROT-CONSCAN[%s] after write 0     -> 0x%08x\n",
+	       what, readl(d + off));
+	for (i = 0; i < 32; i++) {
+		writel(0, d + off);
+		writel(1u << i, d + off);
+		v = readl(d + off);
+		if (v)
+			pr_err("COROT-CONSCAN[%s] bit%02d sticks -> 0x%08x\n",
+			       what, i, v);
+	}
+	writel(0xffffffff, d + off);
+	pr_err("COROT-CONSCAN[%s] all ones         -> 0x%08x\n",
+	       what, readl(d + off));
+	iounmap(d);
+}
+
+static void corot_dsi_conscan_all(void)
+{
+	static int done;
+
+	if (done)
+		return;
+	done = 1;
+	corot_dsi_conscan("CON_CTRL(0x10)", 0x10);
+	corot_dsi_conscan("SHADOW_DEBUG(0x190)", 0x190);
+	corot_dsi_conscan("MODE_CTRL(0x14)", 0x14);
+}
+
+static void corot_dsi_shadow_bypass(void)
+{
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+	u32 v;
+
+	if (!d)
+		return;
+
+	pr_err("COROT-SHADOW before: shdwdbg=0x%08x con=0x%08x start=0x%08x sta=0x%08x mode=0x%08x txrx=0x%08x\n",
+	       readl(d + 0x190), readl(d + 0x10), readl(d + 0x00),
+	       readl(d + 0x0c), readl(d + 0x14), readl(d + 0x18));
+
+	v = readl(d + 0x190);
+	writel(v | 0x2, d + 0x190);		/* DSI_BYPASS_SHADOW */
+	pr_err("COROT-SHADOW after bypass: shdwdbg=0x%08x\n", readl(d + 0x190));
+
+	writel(2, d + 0x10);			/* DSI_EN */
+	pr_err("COROT-SHADOW write EN=1   -> con=0x%08x\n", readl(d + 0x10));
+	writel(0, d + 0x00);			/* stop */
+	pr_err("COROT-SHADOW write START=0 -> start=0x%08x\n", readl(d + 0x00));
+	writel(0, d + 0x14);			/* command mode */
+	writel(1, d + 0x00);			/* start */
+	mdelay(5);
+	pr_err("COROT-SHADOW write START=1 -> start=0x%08x sta=0x%08x con=0x%08x mode=0x%08x\n",
+	       readl(d + 0x00), readl(d + 0x0c), readl(d + 0x10),
+	       readl(d + 0x14));
+	iounmap(d);
+}
+
+static void corot_dsi_state(const char *tag)
+{
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+	u32 sta;
+
+	if (!d)
+		return;
+	sta = readl(d + 0x0c);
+	pr_err("COROT-DSIST[%s] sta=0x%08x(busy=%d underrun=%d te_rdy=%d frmdone=%d) start=0x%08x con=0x%08x mode=0x%08x size=0x%08x cmdq0=0x%08x\n",
+	       tag, sta, !!(sta & (1 << 31)), !!(sta & (1 << 12)),
+	       !!(sta & (1 << 2)), !!(sta & (1 << 4)),
+	       readl(d + 0x00), readl(d + 0x10), readl(d + 0x14),
+	       readl(d + 0x60), readl(d + 0xd00));
+	iounmap(d);
+}
+
+/* COROT: read-only OVL0 layer snapshot (base 0x14402000) */
+static void corot_ovl_dump(const char *tag)
+{
+	void __iomem *o = ioremap(0x14402000, 0x1000);
+
+	if (!o)
+		return;
+	pr_err("COROT-OVL[%s] en=0x%08x src_con=0x%08x roi=0x%08x | L0 con=0x%08x size=0x%08x pitch=0x%08x addr=0x%08x | L1 con=0x%08x size=0x%08x pitch=0x%08x addr=0x%08x | L2 con=0x%08x size=0x%08x addr=0x%08x\n",
+		tag, readl(o + 0x0c), readl(o + 0x2c), readl(o + 0x20),
+		readl(o + 0x30), readl(o + 0x38), readl(o + 0x44),
+		readl(o + 0xf40),
+		readl(o + 0x50), readl(o + 0x58), readl(o + 0x64),
+		readl(o + 0xf60),
+		readl(o + 0x70), readl(o + 0x78), readl(o + 0xf80));
+	iounmap(o);
+}
+
+/*
+ * COROT: per-frame MUTEX trigger emulation.
+ *
+ * On MT6985 in command mode the MUTEX is normally pulsed by a GCE event driven
+ * by the panel TE.  CMDQ/GCE is dead in this build, so nothing ever starts a
+ * frame: MUTEX_EN stays 1 but no SOF arrives, DSI_BUSY (INTSTA BIT(31)) never
+ * clears and the panel keeps whatever is in its own GRAM.
+ *
+ * Pulse EN on every mutex slot that has modules programmed.  Call this only
+ * after the components for the current frame have been written.
+ */
+static void corot_mutex_trigger_pulse(const char *tag)
+{
+	static const u32 blocks[4] = {
+		0x14001000, 0x14201000, 0x14401000, 0x14601000
+	};
+	int b, n, pulsed = 0;
+
+	for (b = 0; b < 4; b++) {
+		void __iomem *m = ioremap(blocks[b], 0x1000);
+
+		if (!m)
+			continue;
+		for (n = 0; n < 4; n++) {
+			if (!readl(m + 0x30 + 0x20 * n))
+				continue;
+			/* EN 0 -> 1 is the trigger edge */
+			writel(0, m + 0x20 + 0x20 * n);
+			writel(1, m + 0x20 + 0x20 * n);
+			pulsed++;
+		}
+		iounmap(m);
+	}
+	pr_err("COROT-TRIG[%s] pulsed %d mutex slots\n", tag, pulsed);
+}
+
+/*
+ * COROT: MT6985's frame path spans dispsys and ovlsys and the module list is
+ * split between the two mutex register blocks.  Both halves must run from the
+ * same SOF trigger, otherwise the DSI is started with no data source and
+ * DSI_BUSY (INTSTA bit31) never clears.
+ *
+ * SOF source 0 (DDP_MUTEX_SOF_SINGLE_MODE) does NOT latch MUTEX_EN on this
+ * SoC; the DSI0|EOF source (0x41) does.  Only touch slots that already have
+ * modules programmed so we never enable an unconfigured mutex.
+ */
+#define COROT_MUTEX_SOF_DSI0_EOF 0x41
+
+static void corot_mutex_enable_all(const char *tag)
+{
+	static const u32 blocks[4] = {
+		0x14001000, 0x14201000, 0x14401000, 0x14601000
+	};
+	int b, n;
+
+	for (b = 0; b < 4; b++) {
+		void __iomem *m = ioremap(blocks[b], 0x1000);
+		char line[256];
+		int len = 0;
+
+		if (!m)
+			continue;
+		line[0] = 0;
+		for (n = 0; n < 4; n++) {
+			u32 mod0 = readl(m + 0x30 + 0x20 * n);
+
+			if (mod0) {
+				if (readl(m + 0x2c + 0x20 * n) == 0)
+					writel(COROT_MUTEX_SOF_DSI0_EOF,
+					       m + 0x2c + 0x20 * n);
+				writel(1, m + 0x20 + 0x20 * n);
+			}
+			len += scnprintf(line + len, sizeof(line) - len,
+					 " n%d[en=%08x sof=%08x mod=%08x]",
+					 n,
+					 readl(m + 0x20 + 0x20 * n),
+					 readl(m + 0x2c + 0x20 * n),
+					 mod0);
+		}
+		if (tag)
+			pr_err("COROT-MTX[%s] 0x%08x%s\n", tag, blocks[b], line);
+		iounmap(m);
+	}
+}
+
+static void corot_pipe_dump(const char *tag)
+{
+	void __iomem *m0 = ioremap(0x14001000, 0x1000);
+	void __iomem *m1 = ioremap(0x14401000, 0x1000);
+	void __iomem *d = ioremap(0x1400d000, 0x1000);
+
+	pr_err("COROT-PIPE[%s] mtx0 en=0x%08x sof=0x%08x mod0=0x%08x | mtx1 en=0x%08x sof=0x%08x mod0=0x%08x | dsi sta=0x%08x start=0x%08x con=0x%08x mode=0x%08x size=0x%08x\n",
+		tag,
+		m0 ? readl(m0 + 0x20) : 0, m0 ? readl(m0 + 0x2c) : 0,
+		m0 ? readl(m0 + 0x30) : 0,
+		m1 ? readl(m1 + 0x20) : 0, m1 ? readl(m1 + 0x2c) : 0,
+		m1 ? readl(m1 + 0x30) : 0,
+		d ? readl(d + 0x0c) : 0, d ? readl(d + 0x00) : 0,
+		d ? readl(d + 0x10) : 0, d ? readl(d + 0x14) : 0,
+		d ? readl(d + 0x60) : 0);
+	if (m0)
+		iounmap(m0);
+	if (m1)
+		iounmap(m1);
+	if (d)
+		iounmap(d);
+}
+#endif
+
 void trigger_without_cmdq(struct drm_crtc *crtc)
 {
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
@@ -5025,18 +6157,52 @@ void trigger_without_cmdq(struct drm_crtc *crtc)
 
 #ifndef CONFIG_FPGA_EARLY_PORTING
 	/* wait for TE, fpga no TE signal */
-	drm_wait_one_vblank(priv->drm, 0);
+	drm_crtc_wait_one_vblank(crtc);
 #endif
 
 	DDPDBG("%s:%d for early porting\n",
 		__func__, __LINE__);
+	/* COROT: keep the display IRQ storm from wedging the SoC */
+	corot_mask_display_irqs_early();
+	/* COROT: our driver revision never programs the MT6985 crossbar */
+	corot_mt6985_xbar("fix");
+
+	/*
+	 * COROT ROOT CAUSE FIX (MT6985):
+	 * MUTEX_EN only latches when the SOF source field is non-zero.
+	 * mtk_disp_mutex_src_set(..., true) writes DDP_MUTEX_SOF_SINGLE_MODE(0),
+	 * which the crtc path uses for frame-trigger panels, so EN stays 0 and
+	 * nothing ever scans out.  The vendor encoder path for frame-trigger
+	 * panels runs src_set(..., false) (SOF = DSI0|EOF = 0x41) and then
+	 * enables the mutex by CPU - do exactly that here.
+	 */
+	mtk_disp_mutex_disable(mtk_crtc->mutex[0]);
+	mtk_disp_mutex_src_set(mtk_crtc, false);
 	/*Trigger without cmdq*/
 	mtk_disp_mutex_enable_cmdq(mtk_crtc->mutex[0], cmdq_handle,
 		mtk_crtc->gce_obj.base);
+	/* COROT: MT6985 splits one logical MUTEX across the dispsys and ovlsys
+	 * register blocks; both halves must run or the DSI is triggered with no
+	 * data source.  Enable every slot that has modules programmed. */
+	corot_mutex_enable_all(NULL);
+
 	mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle,
 		MTK_TRIG_FLAG_TRIGGER);
 	//loop for check idle of dsi, maybe timeout
 	mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle, MTK_TRIG_FLAG_EOF);
+
+	corot_dsi_state("before-ftrig");
+	/* COROT: the per-frame trigger a dead GCE would normally deliver */
+	corot_mutex_frame_trigger("frame");
+	mdelay(20);
+	corot_dsi_state("after-ftrig");
+	/* COROT: and keep it going every frame from now on */
+	corot_ftrig_start();
+
+	/* COROT: scan the memory fbcon actually paints */
+	corot_ovl_scan_simplefb();
+	/* COROT: keep the DSI/MUTEX IRQ handlers from monopolising the CPU */
+	corot_mask_display_irqs();
 
 	DDPDBG("%s-\n",	__func__);
 }
@@ -9986,10 +11152,14 @@ static int mtk_drm_pf_release_thread(void *data)
 				 atomic_read(&mtk_crtc->pf_event));
 		atomic_set(&mtk_crtc->pf_event, 0);
 
+#ifndef DRM_CMDQ_DISABLE
 		if(mtk_drm_lcm_is_connect())
 			pf_time = mtk_check_preset_fence_timestamp(crtc);
 		else
 			pf_time = 0;
+#else
+		pf_time = 0;
+#endif
 #ifndef DRM_CMDQ_DISABLE
 		mutex_lock(&private->commit.lock);
 		fence_idx = atomic_read(&private->crtc_rel_present[crtc_idx]);

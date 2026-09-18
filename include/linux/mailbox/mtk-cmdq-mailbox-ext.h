@@ -11,6 +11,9 @@
 #include <linux/types.h>
 #include <linux/trace_events.h>
 
+typedef bool (*cmdq_mminfra_power)(void);
+typedef bool (*cmdq_mminfra_gce_cg)(u32);
+
 #if IS_ENABLED(CONFIG_MTK_CMDQ_MBOX_EXT)
 typedef void (*util_dump_dbg_reg)(void *chan);
 typedef u8 (*util_track_ctrl)(void *cmdq, phys_addr_t base, bool sec);
@@ -19,9 +22,6 @@ struct cmdq_util_controller_fp {
 	util_track_ctrl track_ctrl;
 	util_thread_ddr_module thread_ddr_module;
 };
-
-typedef bool (*cmdq_mminfra_power)(void);
-typedef bool (*cmdq_mminfra_gce_cg)(u32);
 
 void cmdq_controller_set_fp(struct cmdq_util_controller_fp *cust_cmdq_util);
 #endif
@@ -336,7 +336,9 @@ void cmdq_mmp_wait(struct mbox_chan *chan, void *pkt);
 s32 cmdq_sec_insert_backup_cookie(struct cmdq_pkt *pkt);
 void cmdq_mbox_dump_dbg(void *mbox_cmdq, void *chan, const bool lock);
 void cmdq_chan_dump_dbg(void *chan);
+#if IS_ENABLED(CONFIG_MTK_CMDQ_MBOX_EXT)
 void cmdq_get_mminfra_cb(cmdq_mminfra_power cb);
 void cmdq_get_mminfra_gce_cg_cb(cmdq_mminfra_gce_cg cb);
+#endif
 void cmdq_dump_usage(void);
 #endif /* __MTK_CMDQ_MAILBOX_H__ */

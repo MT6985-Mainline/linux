@@ -50,7 +50,7 @@
 	};
 
 	chosen {
-		bootargs = "8250.nr_uarts=4 clk_ignore_unused console=tty0 printk.devkmsg=on log_buf_len=2M initcall_debug ramoops.mem_address=0x48090000 ramoops.mem_size=0xe0000 ramoops.pmsg_size=0x10000 ramoops.console_size=0x40000";
+		bootargs = "8250.nr_uarts=4 clk_ignore_unused console=tty0 printk.devkmsg=on log_buf_len=2M initcall_debug ramoops.mem_address=0x48090000 ramoops.mem_size=0xe0000 ramoops.pmsg_size=0x10000 ramoops.console_size=0x40000 corot_cmd_buf_pa=0x33ff00000";
 		stdout-path = "serial0:921600n8";
 		/* live atag,videolfb from stock: fb=0xfd91f000 vram=0x026e0000 lcm=m12_42_02_0a_dsc_cmd_lcm_drv */
 		atag,videolfb = /bits/ 8 <
@@ -419,6 +419,10 @@
 		height = <2712>;
 		stride = <4880>;
 		format = "a8r8g8b8";
+		/* Keep this enabled: without a console fb the DRM fbdev
+		 * takeover hangs inside mtk_drm_probe.  The OVL scans the
+		 * DRM's own buffer, so mtk_drm_crtc.c copies this content
+		 * into it for now. */
 		status = "okay";
 	};
 
@@ -583,6 +587,7 @@
 		reg = <0x0 0x1400c000 0x0 0x1000>;
 		interrupts = <GIC_SPI 366 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&mmsys0_clk CLK_MM_DISP_DSC_WRAP0>;
+		gce-subsys = <&gce 0x14000000 SUBSYS_1400XXXX>;
 	};
 
 	disp_rdma0: disp-rdma@14010000 {
@@ -591,6 +596,7 @@
 		interrupts = <GIC_SPI 371 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&mmsys0_clk 8>;
 		clock-names = "rdma0";
+		gce-subsys = <&gce 0x14010000 SUBSYS_1401XXXX>;
 	};
 
 	disp_pwm0: disp-pwm@1100e000 {
@@ -724,8 +730,11 @@
 			     <GIC_SPI 386 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&mmsys0_clk CLK_MM_DISP_MUTEX0>,
 			 <&mmsys1_clk CLK_MM1_DISP_MUTEX0>,
-			 <&ovlsys_clk CLK_OVL_DISP_MUTEX0>,
-			 <&ovlsys1_clk CLK_OVL1_DISP_MUTEX0>;
+				 <&ovlsys_clk CLK_OVL_DISP_MUTEX0>,
+				 <&ovlsys1_clk CLK_OVL1_DISP_MUTEX0>;
+		gce-subsys = <&gce 0x14000000 SUBSYS_1400XXXX>;
+		/* vendor mt6985 uses 2/2; the earlier single-pipeline experiment
+		 * left 1/1 here and that skips the ovlsys side registers. */
 		dispsys_num = <2>;
 		ovlsys_num = <2>;
 	};
@@ -1139,6 +1148,7 @@
 		phy-names = "dphy";
 		#address-cells = <1>;
 		#size-cells = <0>;
+		gce-subsys = <&gce 0x14000000 SUBSYS_1400XXXX>;
 		status = "okay";
 
 		panel@0 {

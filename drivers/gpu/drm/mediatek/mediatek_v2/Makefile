@@ -52,6 +52,14 @@ mediatek-drm-y := mtk_drm_drv.o \
 		  mtk_disp_inlinerotate.o \
 		  mtk_mmlsys_bypass_mode.o
 
+# corot bring-up: GCE-D cannot execute any instruction yet, so program the
+# whole display path from the CPU.  This is the vendor's own no-CMDQ build
+# (upstream corot-t-oss Makefile has the same two lines commented out);
+# mtk_cmdq_dummy.o supplies the CMDQ API stubs and every mtk_ddp_write()
+# becomes a plain writel().
+ccflags-y += -DDRM_CMDQ_DISABLE
+mediatek-drm-y += mtk_cmdq_dummy.o
+
 ifeq ($(CONFIG_DRM_MEDIATEK_DEBUG_FS),y)
 mediatek-drm-y += mtk_drm_debugfs.o
 endif

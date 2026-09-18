@@ -10,6 +10,11 @@
 #include <linux/platform_device.h>
 #include <linux/soc/mediatek/mtk-cmdq-ext.h>
 
+#ifdef DRM_CMDQ_DISABLE
+/* provided by drivers/misc/mediatek/cmdq/mailbox/cmdq-util.c */
+void cmdq_util_prebuilt_init(const u16 mod);
+#endif
+
 #include "mtk_drm_crtc.h"
 #include "mtk_drm_ddp_comp.h"
 #include "mtk_dump.h"

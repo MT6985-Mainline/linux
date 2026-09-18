@@ -474,8 +474,10 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 		mtk_ddp_write_mask(comp, reg_val,
 					DISP_REG_DSC_MODE, 0xFFFF, handle);
 
+		/* COROT: match the vendor (and LK's 0x28) - our tree added
+		 * bit 11 here, which LK's working configuration does not have. */
 		mtk_ddp_write_relaxed(comp,
-			(dsc_params->dsc_cfg == 40) ? 0x0828 : 0x0022,
+			(dsc_params->dsc_cfg == 0) ? 0x22 : dsc_params->dsc_cfg,
 			DISP_REG_DSC_CFG, handle);
 
 		mtk_ddp_write_mask(comp, DSC_CKSM_CAL_EN,

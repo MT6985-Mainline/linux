@@ -55,7 +55,6 @@
 #define SUBSYS_1808XXXX		27
 #define SUBSYS_180aXXXX		28
 #define SUBSYS_180bXXXX		29
-#define SUBSYS_1440XXXX		30
 #define SUBSYS_NO_SUPPORT	99
 
 /* GCE General Purpose Register (GPR) support

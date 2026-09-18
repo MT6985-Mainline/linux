@@ -1676,6 +1676,7 @@ static void mtk_mipi_tx_pll_cphy_deconfig_mt6985(struct mtk_mipi_tx *mipi_tx)
 
 static int mtk_mipi_tx_pll_prepare_mt6985(struct clk_hw *hw)
 {
+	pr_err("COROT-TX[pll_prepare_mt6985] called\n");
 	struct mtk_mipi_tx *mipi_tx = mtk_mipi_tx_from_clk_hw(hw);
 #ifndef CONFIG_FPGA_EARLY_PORTING
 
@@ -3770,12 +3771,18 @@ static int mtk_mipi_tx_power_on(struct phy *phy)
 	struct mtk_mipi_tx *mipi_tx = phy_get_drvdata(phy);
 	int ret;
 
+	pr_err("COROT-TX[power_on] enter mipi_tx=%p pll=%p pll_en=%d\n",
+	       mipi_tx, mipi_tx->pll,
+	       mipi_tx->pll ? __clk_is_enabled(mipi_tx->pll) : -1);
+
 	/* Power up core and enable PLL */
 	ret = clk_prepare_enable(mipi_tx->pll);
 	if (ret < 0)
 		return ret;
 
 	/* Enable DSI Lane LDO outputs, disable pad tie low */
+	pr_err("COROT-TX[power_on] pll enable ret=%d pll_en_now=%d\n", ret,
+	       mipi_tx->pll ? __clk_is_enabled(mipi_tx->pll) : -1);
 	if (mipi_tx->driver_data->power_on_signal)
 		mipi_tx->driver_data->power_on_signal(phy);
 

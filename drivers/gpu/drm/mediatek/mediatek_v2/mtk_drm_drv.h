@@ -25,10 +25,12 @@
 //#define DRM_BYPASS_PQ
 
 #define MTK_DRM_FENCE_SUPPORT
+/* MIPI-TX impedance backup/refill is independent of CMDQ: the mtk_mipi_tx
+ * driver_data tables reference it unconditionally. */
+#define MTK_FILL_MIPI_IMPEDANCE
 #if IS_ENABLED(CONFIG_MTK_CMDQ_MBOX_EXT)
 #define MTK_DRM_CMDQ_ASYNC
 #define CONFIG_MTK_DISPLAY_CMDQ
-#define MTK_FILL_MIPI_IMPEDANCE
 #endif
 
 struct device;
