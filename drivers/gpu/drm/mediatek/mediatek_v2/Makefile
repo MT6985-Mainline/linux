@@ -57,8 +57,8 @@ mediatek-drm-y := mtk_drm_drv.o \
 # (upstream corot-t-oss Makefile has the same two lines commented out);
 # mtk_cmdq_dummy.o supplies the CMDQ API stubs and every mtk_ddp_write()
 # becomes a plain writel().
-ccflags-y += -DDRM_CMDQ_DISABLE
-mediatek-drm-y += mtk_cmdq_dummy.o
+# (option B) the no-CMDQ workaround flag was removed here
+# (option B) mtk_cmdq_dummy.o removed - the real CMDQ helper is used instead
 
 ifeq ($(CONFIG_DRM_MEDIATEK_DEBUG_FS),y)
 mediatek-drm-y += mtk_drm_debugfs.o

@@ -6332,7 +6332,7 @@ void trigger_without_cmdq(struct drm_crtc *crtc)
 	 * the panel is powered by now and no frame has been pushed yet.
 	 * Switching the rate later, with frames flowing, wedges the pipeline.
 	 */
-	pr_err("COROT-MARKER r72-fwdevlink-off: frame trigger reached\n");
+	pr_err("COROT-MARKER r80-cmdqreal: frame trigger reached\n");
 
 	corot_m12_apply_fps(60);
 

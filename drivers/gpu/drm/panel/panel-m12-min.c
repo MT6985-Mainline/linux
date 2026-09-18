@@ -153,18 +153,16 @@ int corot_m12_apply_fps(unsigned int fps)
 	default:
 		return -22;
 	}
-	pr_err("COROT-FPS: request %u Hz, dsi=%p tbl=%p n=%u\n",
+	pr_err("COROT-FPS r80: request %u Hz, dsi=%p tbl=%p n=%u\n",
 	       fps, g_m12_dsi, tbl, nr);
 	if (!g_m12_dsi) {
-		pr_err("COROT-FPS: FAILED - panel dsi device not known yet\n");
+		pr_err("COROT-FPS r80: FAILED - panel dsi not known yet\n");
 		return -19;
 	}
 
 	for (i = 0; i < nr; i++)
 		m12_write_cmd(g_m12_dsi, &tbl[i]);
-	for (i = 0; i < 5; i++)	/* the log-catcher drops single lines */
-		pr_err("COROT-FPS: panel FCON set to %u Hz (repeat %u/5)\n",
-		       fps, i + 1);
+	pr_err("COROT-FPS: panel FCON set to %u Hz\n", fps);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(corot_m12_apply_fps);

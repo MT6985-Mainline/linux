@@ -3732,6 +3732,15 @@ struct mtk_panel_params *mtk_drm_get_lcm_ext_params(struct drm_crtc *crtc)
  * from userspace reliably here, so read via ioremap in-kernel. */
 static int corot_tele_thread(void *data)
 {
+	/*
+	 * COROT r81: disabled.  This reads DSI, MUTEX, OVL and GCE registers
+	 * every 2 s, and reading them while the display stack is being
+	 * reconfigured - or while the GCE is executing - stalls the interconnect
+	 * and the SoC resets.  Same failure mode as the USB dump removed in r64.
+	 */
+	pr_err("COROT r81: telemetry thread disabled\n");
+	return 0;
+#if 0
 	static const unsigned long dsi = 0x1400d000UL;
 	static const unsigned long mutex = 0x14021000UL;
 	static const unsigned long ovl = 0x14402000UL;
@@ -3760,8 +3769,8 @@ static int corot_tele_thread(void *data)
 		ssleep(2);
 	}
 	return 0;
+#endif
 }
-
 static struct task_struct *corot_tele_task;
 
 struct mtk_panel_funcs *mtk_drm_get_lcm_ext_funcs(struct drm_crtc *crtc)

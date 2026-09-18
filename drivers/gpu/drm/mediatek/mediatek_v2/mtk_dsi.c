@@ -8973,7 +8973,7 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 
 	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	dsi->regs = devm_ioremap_resource(dev, regs);
-	pr_err("COROT-MARKER r72-fwdevlink-off: DSI probe reached (image check)\n");
+	pr_err("COROT-MARKER r81-notele: DSI probe reached (image check)\n");
 
 	pr_err("COROT-DSI[probe] INTSTA=0x%08x INTEN=0x%08x START=0x%08x\n",
 	       readl(dsi->regs + DSI_INTSTA), readl(dsi->regs + DSI_INTEN),
