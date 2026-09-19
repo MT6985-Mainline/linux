@@ -46,6 +46,9 @@
 #include "mtk_drm_graphics_base.h"
 #include "mtk_panel_ext.h"
 #include <linux/clk.h>
+/* COROT r94: clk_hw_* / __clk_get_hw and of_clk_get_by_name */
+#include <linux/clk-provider.h>
+#include <linux/of_clk.h>
 #include "mtk_disp_pmqos.h"
 #include "mtk_disp_recovery.h"
 #include "mtk_drm_arr.h"
@@ -5784,6 +5787,117 @@ done:
 	return ret;
 }
 
+/*
+ * COROT r94: report the display clock tree and raise the operating point.
+ *
+ * The vendor raises the MM clock from mtk_disp_pmqos.c on MMQOS bandwidth
+ * requests; with no MMQOS in this tree nothing ever does, so it stays at the
+ * bootloader's low setting.  We are ~2x too slow to finish a frame inside the
+ * panel's window, so ask for the fastest parent each mux offers.
+ *
+ * Everything is printed before and after: which parents exist, their rates, what
+ * was chosen, and the resulting rate.  If a mux refuses, it says so and carries
+ * on - a failed clock change must not take the display down.
+ */
+static const char * const corot_clk_names[] = {
+	"disp", "disp1", "mdp", "mdp1", "ovl", "ovl1", "mm_infra", "mmup"
+};
+/* the three the display data path actually runs on */
+static const char * const corot_clk_raise[] = { "mm_infra", "ovl", "disp" };
+
+static void corot_clk_show(struct device_node *np, const char *name)
+{
+	struct clk *c = of_clk_get_by_name(np, name);
+	struct clk_hw *hw;
+	unsigned int i, n;
+	unsigned long best = 0;
+	struct clk *bestc = NULL;
+	int ret;
+
+	if (IS_ERR(c)) {
+		pr_err("COROT-CLK r94 %-9s: of_clk_get_by_name failed %ld\n",
+		       name, PTR_ERR(c));
+		return;
+	}
+
+	pr_err("COROT-CLK r94 %-9s: rate=%lu Hz\n", name, clk_get_rate(c));
+
+	hw = __clk_get_hw(c);
+	if (!hw) {
+		clk_put(c);
+		return;
+	}
+	n = clk_hw_get_num_parents(hw);
+	pr_err("COROT-CLK r94 %-9s: %u parents\n", name, n);
+	for (i = 0; i < n; i++) {
+		struct clk_hw *p = clk_hw_get_parent_by_index(hw, i);
+		unsigned long r;
+
+		if (!p)
+			continue;
+		r = clk_hw_get_rate(p);
+		pr_err("COROT-CLK r94 %-9s:   [%u] %-22s %lu Hz\n",
+		       name, i, clk_hw_get_name(p), r);
+		if (r > best) {
+			best = r;
+			bestc = p->clk;
+		}
+	}
+
+	/* only the three that pace the pipeline get moved */
+	if (bestc && best > clk_get_rate(c)) {
+		unsigned int k;
+
+		for (k = 0; k < ARRAY_SIZE(corot_clk_raise); k++) {
+			if (strcmp(corot_clk_raise[k], name))
+				continue;
+			ret = clk_set_parent(c, bestc);
+			pr_err("COROT-CLK r94 %-9s: set_parent(%s @ %lu Hz) ret=%d -> now %lu Hz\n",
+			       name, clk_hw_get_name(__clk_get_hw(bestc)), best,
+			       ret, clk_get_rate(c));
+			k = ARRAY_SIZE(corot_clk_raise);
+		}
+	}
+	clk_put(c);
+}
+
+static void corot_clk_report(struct device *dev)
+{
+	/*
+	 * The eight muxes are NOT on dispsys-config: they hang off
+	 * mt6985_scpsys (power-controller@1c001000).  Resolving them from the
+	 * dispsys node returns -EINVAL for every name, which is exactly what the
+	 * first attempt did.
+	 */
+	static const char * const cand[] = {
+		"mediatek,mt6985-scpsys",
+		"mediatek,mt6985-disp",
+	};
+	struct device_node *np;
+	unsigned int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(cand); i++) {
+		np = of_find_compatible_node(NULL, NULL, cand[i]);
+		if (!np)
+			continue;
+		pr_err("COROT-CLK r94: display clock tree on %pOF (compatible %s)\n",
+		       np, cand[i]);
+		for (j = 0; j < ARRAY_SIZE(corot_clk_names); j++)
+			corot_clk_show(np, corot_clk_names[j]);
+		of_node_put(np);
+		return;
+	}
+
+	if (dev->of_node) {
+		pr_err("COROT-CLK r94: no known clock node, falling back to %pOF\n",
+		       dev->of_node);
+		for (j = 0; j < ARRAY_SIZE(corot_clk_names); j++)
+			corot_clk_show(dev->of_node, corot_clk_names[j]);
+		return;
+	}
+	pr_err("COROT-CLK r94: no node to read clocks from at all\n");
+}
+
 static int mtk_drm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -5903,6 +6017,7 @@ static int mtk_drm_probe(struct platform_device *pdev)
 
 	private->side_mmsys_dev = side_dev;
 	pr_err("%s10 side mmsys ok\n", "COROT-BC probe:");
+	corot_clk_report(dev);
 
 SKIP_SIDE_DISP:
 	private->mmsys_dev = dev;

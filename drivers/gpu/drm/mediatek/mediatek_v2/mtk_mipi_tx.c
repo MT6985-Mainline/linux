@@ -1447,6 +1447,10 @@ static int mtk_mipi_tx_pll_dphy_config_mt6985(struct mtk_mipi_tx *mipi_tx)
 		return -EINVAL;
 	}
 
+	pr_err("COROT-PLL r97: adpt=%u data_rate=%u -> rate=%u MHz txdiv=%u div3=%u div3_en=%u\n",
+	       mipi_tx->data_rate_adpt, mipi_tx->data_rate, rate,
+	       txdiv, div3, div3_en);
+
 	if (rate < 2500)
 		mtk_mipi_tx_update_bits(mipi_tx, MIPITX_VOLTAGE_SEL_MT6983,
 			FLD_RG_DSI_PRD_REF_SEL, 0x0);
@@ -1681,10 +1685,22 @@ static int mtk_mipi_tx_pll_prepare_mt6985(struct clk_hw *hw)
 #ifndef CONFIG_FPGA_EARLY_PORTING
 
 	/* if mipitx is on, skip it... */
-	if (mtk_is_mipi_tx_enable(hw)) {
-		DDPINFO("%s: mipitx already on\n", __func__);
-		return 0;
-	}
+	/*
+	 * COROT r98: do NOT skip the configuration when the PHY is already on.
+	 *
+	 * The bootloader turned the MIPI TX on to draw its logo, so this check is
+	 * always true and the PLL has never been programmed by this kernel - the
+	 * COROT-PLL probe added in r97 never printed, which is how we found out.
+	 * The link is therefore running at whatever rate LK picked, and LK only
+	 * ever had to display a static image.
+	 *
+	 * A wrong lane rate is the right shape for a pipeline that delivers
+	 * ~198 lines/ms where ~385 are needed, while the frame period and every
+	 * display clock have been ruled out by experiment.
+	 */
+	pr_err("COROT-PLL r98: pll_prepare_mt6985 mipitx_on=%d phy=%p adpt=%u data_rate=%u -> configuring anyway\n",
+	       mtk_is_mipi_tx_enable(hw), mipi_tx->driver_data->phy,
+	       mipi_tx->data_rate_adpt, mipi_tx->data_rate);
 
 	if (mipi_tx->driver_data->phy)
 		mtk_mipi_tx_pll_cphy_config_mt6985(mipi_tx);

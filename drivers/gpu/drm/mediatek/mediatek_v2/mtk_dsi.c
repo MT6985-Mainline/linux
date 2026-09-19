@@ -1168,10 +1168,23 @@ static int mtk_dsi_set_data_rate(struct mtk_dsi *dsi)
 	/* The bring-up hs_clk is a fixed-clock stub, not a child of the MIPI
 	 * TX PLL, so clk_set_rate above never reaches the PLL. Feed the rate
 	 * directly; pll_prepare consumes data_rate_adpt when programming. */
-	mtk_mipi_tx_pll_rate_set_adpt(dsi->phy, data_rate * 1000000);
+	/*
+	 * COROT r97: pass MHz, not Hz.
+	 *
+	 * Every reader in mtk_mipi_tx.c is written as
+	 *     rate = data_rate_adpt ? data_rate_adpt : data_rate / 1000000;
+	 * so data_rate_adpt is in MHz, and it feeds thresholds like "rate >= 6000"
+	 * that pick the TX divider chain.  Passing data_rate * 1000000 made the
+	 * PLL take the >= 6000 band (txdiv=1, div3=1, div3_en=0) instead of the
+	 * >= 1000 band (txdiv=2, div3=3, div3_en=1) that 1152 Mbps/lane needs, so
+	 * the link ran at a rate nobody chose - which is exactly the ~2x shortfall
+	 * in pixel throughput.  The other four call sites in this file already
+	 * pass MHz.
+	 */
+	mtk_mipi_tx_pll_rate_set_adpt(dsi->phy, data_rate);
 
-	pr_err("COROT-DSI[datarate] set hs_clk to %lu Hz (%d MHz)\n",
-	       mipi_tx_rate, data_rate);
+	pr_err("COROT-DSI[datarate] set hs_clk to %lu Hz (%d MHz) adpt=%u (MHz)\n",
+	       mipi_tx_rate, data_rate, data_rate);
 	ret = clk_set_rate(dsi->hs_clk, mipi_tx_rate);
 	pr_err("COROT-DSI[datarate] clk_set_rate ret=%d\n", ret);
 	return ret;
@@ -1457,6 +1470,10 @@ static int mtk_dsi_get_virtual_width(struct mtk_dsi *dsi,
 }
 
 extern unsigned int disp_spr_bypass;
+/* COROT r89: the panel refresh-rate request lives behind a DSI-ready gate. */
+extern int corot_m12_apply_fps_tag(unsigned int fps, const char *tag);
+extern void corot_m12_dsi_ready(bool on);
+static bool corot_fps_done;
 
 static unsigned int mtk_get_dsi_buf_bpp(struct mtk_dsi *dsi)
 {
@@ -1978,6 +1995,8 @@ static void mtk_dsi_stop(struct mtk_dsi *dsi)
 	writel(0, dsi->regs + DSI_START);
 	writel(0, dsi->regs + DSI_INTEN);
 	writel(0, dsi->regs + DSI_INTSTA);
+	/* COROT r89: the DSI is off again - no DCS writes from here on. */
+	corot_m12_dsi_ready(false);
 }
 
 static void mtk_dsi_set_interrupt_enable(struct mtk_dsi *dsi)
@@ -3017,6 +3036,48 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 	DDPMSG("%s dsi self pattern\n", __func__);
 	mtk_dsi_self_pattern(dsi);
 #endif
+
+	/*
+	 * COROT r89: this is the one point where the DSI is demonstrably alive -
+	 * DSI_START = 0x00000010 and DSI_CON_CTRL = 0x00000021 - and no frame has
+	 * been pushed yet, so program the DDIC's own refresh rate here.  Doing it
+	 * from the frame trigger instead panics: DSI_CON_CTRL is 0x00000000 by
+	 * then and the DCS write raises an asynchronous SError.
+	 */
+	if (!corot_fps_done) {
+		corot_fps_done = true;
+		/*
+		 * COROT r91: the panel refresh-rate request is switched OFF here.
+		 *
+		 * r90 forced every command through mipi_dsi_generic_write() and the
+		 * result was unambiguous: command 1 (0xf0, type 0x29) returns 0,
+		 * command 2 (0x6f, type 0x23) stalls the bus silently - no ret, no
+		 * panic, no SError - and the watchdog resets the SoC.  This kernel's
+		 * DSI command path completes exactly one transfer; a second one
+		 * always dies, whether it is a DCS short write or a generic one.
+		 *
+		 * The vendor sends the whole panel init sequence through the
+		 * GCE-driven DSI CMDQ (mipi_dsi_dcs_write_gce2).  This build has
+		 * -DDRM_CMDQ_DISABLE and stubbed cmdq_* calls, so there is no
+		 * multi-command path available and the 60 Hz FCON sequence cannot be
+		 * delivered from the CPU.  Rather than burn another boot on it, the
+		 * request is disabled and the display path is left alone.
+		 *
+		 * To re-arm: flip one of these to 1 (and revisit the CMDQ port).
+		 */
+		if (0) {
+			pr_err("COROT-FPSR r91 [dsi_en] before: CON=0x%08x START=0x%08x\n",
+			       readl(dsi->regs + DSI_CON_CTRL),
+			       readl(dsi->regs + DSI_START));
+			corot_m12_dsi_ready(true);
+			corot_m12_apply_fps_tag(60, "dsi_en");
+			pr_err("COROT-FPSR r91 [dsi_en] after: CON=0x%08x START=0x%08x\n",
+			       readl(dsi->regs + DSI_CON_CTRL),
+			       readl(dsi->regs + DSI_START));
+		} else {
+			pr_err("COROT-FPSR r91: panel refresh-rate request DISABLED (no multi-command DSI path in this build)\n");
+		}
+	}
 
 	pr_err("COROT-STAGE output_dsi_enable: panel_prepare + set_mode + hs done\n");
 	corot_dump_dsi();
@@ -8973,7 +9034,7 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 
 	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	dsi->regs = devm_ioremap_resource(dev, regs);
-	pr_err("COROT-MARKER r81-notele: DSI probe reached (image check)\n");
+	pr_err("COROT-MARKER r98-pllforce: DSI probe reached (image check)\n");
 
 	pr_err("COROT-DSI[probe] INTSTA=0x%08x INTEN=0x%08x START=0x%08x\n",
 	       readl(dsi->regs + DSI_INTSTA), readl(dsi->regs + DSI_INTEN),

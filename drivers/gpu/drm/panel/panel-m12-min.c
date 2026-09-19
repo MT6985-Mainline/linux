@@ -128,42 +128,115 @@ static const struct m12_cmd m12_fps_144[] = {
 
 static struct mipi_dsi_device *g_m12_dsi;
 
-int corot_m12_apply_fps(unsigned int fps)
+/*
+ * COROT r87: the FCON write has to be observable.
+ *
+ * Since r51 this function could fail in three different ways - never called,
+ * called before the DSI was up, or called and rejected by the panel - and all
+ * three looked identical in the log.  It now reports its call site (tag), the
+ * per-command tally, and a DCS read-back of the register it just wrote.
+ */
+/*
+ * COROT r89: set by mtk_dsi.c once the DSI is demonstrably enabled
+ * (DSI_CON_CTRL = 0x21, DSI_START = 0x10) and cleared by mtk_dsi_stop().
+ */
+static bool g_m12_dsi_ready;
+
+void corot_m12_dsi_ready(bool on)
+{
+	g_m12_dsi_ready = on;
+	pr_err("COROT-FPSR r89 ready=%d\n", on);
+}
+EXPORT_SYMBOL_GPL(corot_m12_dsi_ready);
+
+int corot_m12_apply_fps_tag(unsigned int fps, const char *tag)
 {
 	const struct m12_cmd *tbl = NULL;
 	unsigned int nr = 0, i;
+	int ret, ok = 0, bad = 0, first_bad = -1, first_ret = 0;
+	u8 rb[2] = { 0, 0 };
+	u8 want;
+
+	/*
+	 * COROT r89: refuse to touch the panel unless the DSI has said it is
+	 * enabled.  A DCS command pushed into a disabled DSI raises an
+	 * asynchronous SError and panics the kernel - 5 times out of 5 in the
+	 * r87/r88 runs, always on the second command of the 60 Hz table.  With
+	 * this gate the worst case is a loud skip.
+	 */
+	if (!g_m12_dsi_ready) {
+		pr_err("COROT-FPSR r89 SKIP[%s]: DSI not enabled - a DCS write here panics with SError\n",
+		       tag);
+		return -16;
+	}
 
 	switch (fps) {
 	case 60:
 		tbl = m12_fps_60;
 		nr = sizeof(m12_fps_60) / sizeof(m12_fps_60[0]);
+		want = 0x08;
 		break;
 	case 90:
 		tbl = m12_fps_90;
 		nr = sizeof(m12_fps_90) / sizeof(m12_fps_90[0]);
+		want = 0x04;
 		break;
 	case 120:
 		tbl = m12_fps_120;
 		nr = sizeof(m12_fps_120) / sizeof(m12_fps_120[0]);
+		want = 0x02;
 		break;
 	case 144:
 		tbl = m12_fps_144;
 		nr = sizeof(m12_fps_144) / sizeof(m12_fps_144[0]);
+		want = 0x03;
 		break;
 	default:
 		return -22;
 	}
-	pr_err("COROT-FPS r80: request %u Hz, dsi=%p tbl=%p n=%u\n",
-	       fps, g_m12_dsi, tbl, nr);
+
+	pr_err("COROT-FPSR r87 enter[%s]: fps=%u dsi=%p tbl=%p n=%u want=0x%02x\n",
+	       tag, fps, g_m12_dsi, tbl, nr, want);
 	if (!g_m12_dsi) {
-		pr_err("COROT-FPS r80: FAILED - panel dsi not known yet\n");
+		pr_err("COROT-FPSR r87 FAILED[%s]: panel dsi not known yet\n", tag);
 		return -19;
 	}
 
-	for (i = 0; i < nr; i++)
-		m12_write_cmd(g_m12_dsi, &tbl[i]);
-	pr_err("COROT-FPS: panel FCON set to %u Hz\n", fps);
-	return 0;
+	for (i = 0; i < nr; i++) {
+		ret = m12_write_cmd(g_m12_dsi, &tbl[i]);
+		if (ret < 0) {
+			bad++;
+			if (first_bad < 0) {
+				first_bad = tbl[i].cmd;
+				first_ret = ret;
+			}
+		} else {
+			ok++;
+		}
+	}
+	pr_err("COROT-FPSR r87 result[%s]: cmds=%u ok=%u fail=%u firstfail=0x%02x/%d\n",
+	       tag, nr, ok, bad, first_bad < 0 ? 0 : first_bad, first_ret);
+
+	/* the table ends on page 8, so re-select page 0 before reading FCON */
+	{
+		struct m12_cmd pg0 = {
+			.cmd = 0xf0,
+			.len = 5,
+			.data = { 0x55, 0xaa, 0x52, 0x08, 0x00 },
+		};
+
+		m12_write_cmd(g_m12_dsi, &pg0);
+	}
+	ret = mipi_dsi_dcs_read(g_m12_dsi, 0x2f, rb, 1);
+	pr_err("COROT-FPSR r87 readback[%s]: FCON(0x2f)=0x%02x ret=%d (want 0x%02x)%s\n",
+	       tag, rb[0], ret, want, (ret >= 0 && rb[0] == want) ? " MATCH" : "");
+	return bad ? -5 : 0;
+}
+EXPORT_SYMBOL_GPL(corot_m12_apply_fps_tag);
+
+int corot_m12_apply_fps(unsigned int fps)
+{
+	return corot_m12_apply_fps_tag(fps, "generic");
 }
 EXPORT_SYMBOL_GPL(corot_m12_apply_fps);
 
@@ -190,13 +263,23 @@ static int m12_min_prepare(struct drm_panel *panel)
 
 	/* COROT r51: our mode says 60 Hz, so make the panel actually run at
 	 * 60 Hz instead of inheriting whatever rate LK left. */
-	corot_m12_apply_fps(60);
+	corot_m12_apply_fps_tag(60, "prepare");
 	return 0;
 }
 static int m12_min_enable(struct drm_panel *panel)
 {
 	struct m12_min *ctx = panel_to_m12_min(panel);
-	return mipi_dsi_dcs_set_display_on(ctx->dsi);
+	int ret = mipi_dsi_dcs_set_display_on(ctx->dsi);
+
+	/*
+	 * COROT r87: this runs from drm_panel_enable(), which mtk_dsi_enable()
+	 * calls only after mtk_dsi_set_mode() + mtk_dsi_clk_hs_mode(dsi, 1) -
+	 * the DSI link is up and no frame has been pushed yet.  That is the
+	 * correct moment to program the DDIC's own refresh rate, and it does
+	 * not depend on prepare() having run first.
+	 */
+	corot_m12_apply_fps_tag(60, "enable");
+	return ret;
 }
 
 static int m12_min_disable(struct drm_panel *panel)

@@ -760,18 +760,19 @@
 		 * the interconnect (the probe returns -EPROBE_DEFER in ~8 us and
 		 * our first breadcrumb never prints).
 		 */
-		/* GCE clients: same thread map as 5.15 mt6985 dispsys node */
-		mboxes = <&gce 0 0 CMDQ_THR_PRIO_4>,
-			 <&gce 1 0 CMDQ_THR_PRIO_4>,
-			 <&gce 2 0 CMDQ_THR_PRIO_4>,
-			 <&gce 24 0 CMDQ_THR_PRIO_4>,
-			 <&gce 3 CMDQ_NO_TIMEOUT CMDQ_THR_PRIO_2>,
-			 <&gce 5 CMDQ_NO_TIMEOUT CMDQ_THR_PRIO_2>,
-			 <&gce 25 CMDQ_NO_TIMEOUT CMDQ_THR_PRIO_2>,
-			 <&gce 7 CMDQ_NO_TIMEOUT CMDQ_THR_PRIO_2>,
-			 <&gce 4 0 CMDQ_THR_PRIO_4>,
-			 <&gce 6 0 CMDQ_THR_PRIO_3>,
-			 <&gce 22 0 CMDQ_THR_PRIO_1>;
+		/*
+		 * COROT r88: no `mboxes` property here, on purpose.
+		 *
+		 * This build is CPU-direct: -DDRM_CMDQ_DISABLE, mtk_cmdq_dummy.o, and
+		 * CONFIG_MTK_CMDQ_MBOX_EXT off.  Nothing binds mediatek,mt6985-gce, and
+		 * a mailbox phandle creates a device link to that supplier - so the DRM
+		 * master, 14000000.dispsys-config, deferred forever (-517) while every
+		 * component it needs had already probed, and the display power domain
+		 * was never enabled.  The CPU path never calls the mailbox API.
+		 *
+		 * The GCE thread map below is kept: gce-client-names / gce-subsys /
+		 * gce-events are plain data read with of_parse_phandle, not suppliers.
+		 */
 		gce-client-names = "CLIENT_CFG0",
 			"CLIENT_CFG1",
 			"CLIENT_CFG2",

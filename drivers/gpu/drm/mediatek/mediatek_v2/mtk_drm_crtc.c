@@ -5639,6 +5639,7 @@ static const u32 corot_p48_bg[6] = {
 
 /* provided by drivers/gpu/drm/panel/panel-m12-min.c */
 extern int corot_m12_apply_fps(unsigned int fps);
+extern int corot_m12_apply_fps_tag(unsigned int fps, const char *tag);
 
 /* the panel refresh rate each phase asks for */
 static const unsigned int corot_p51_fps[6] = {
@@ -6332,9 +6333,20 @@ void trigger_without_cmdq(struct drm_crtc *crtc)
 	 * the panel is powered by now and no frame has been pushed yet.
 	 * Switching the rate later, with frames flowing, wedges the pipeline.
 	 */
-	pr_err("COROT-MARKER r80-cmdqreal: frame trigger reached\n");
+	pr_err("COROT-MARKER r89-dsien: frame trigger reached\n");
 
-	corot_m12_apply_fps(60);
+	/*
+	 * COROT r89: the 60 Hz FCON write that used to be issued here is gone.
+	 *
+	 * At this point DSI_CON_CTRL reads 0x00000000 - the controller is
+	 * disabled - and a DCS command pushed into it raises an asynchronous
+	 * SError: "Kernel panic - not syncing: Asynchronous SError Interrupt",
+	 * every single time (5/5 across the r87/r88 boots, always on the second
+	 * command of the table, so neither 'result' nor 'readback' ever printed).
+	 * The write now happens in mtk_output_dsi_enable(), where the DSI reads
+	 * CON=0x00000021 / START=0x00000010, behind a gate that refuses it unless
+	 * the DSI has reported itself enabled.
+	 */
 
 	/* COROT: our driver revision never programs the MT6985 crossbar */
 	corot_mt6985_xbar("fix");
