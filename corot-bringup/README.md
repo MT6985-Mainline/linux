@@ -1,5 +1,17 @@
 # corot (Redmi K60 Ultra / MT6985) — mainline 7.2 display bring-up
 
+## 仓库布局（corot-bringup/）
+
+| 路径 | 内容 |
+|---|---|
+| `patch-chain/` | 复现当前内核状态所需的补丁链，按数字顺序执行（`python3 apply_rNNN.py`）。注意 `apply_r115.py` 需要环境变量 `R115_MAX=1`，且依赖厂商树 `linux-corot-t-oss` 的 `dispsys_config` 时钟表 |
+| `build/` | `build_r131.sh`（当前链的完整构建+打包）、`build_r125..r130.sh`（中间轮次）、`build_channel.sh`（重编 initramfs）、`pack_corot_images.py`（打 boot.img / init_boot.img） |
+| `run/` | 设备侧脚本：`r125run.sh <tag>`（一轮完整测试：刷机→观察→恢复 stock→双通道读日志）、`r125read.sh`（只读日志）、`custuuid.sh`（读 cust UUID）、`scanexpdb.sh`（全分区扫 ring）、`flash2.sh` / `readexpdb.sh`（旧流程） |
+| `README.md` | 本文：状态、根因链、下一步 |
+
+initramfs 侧（log-catcher + UUID 探测）在同组织的 `initramfs` 仓库分支 `corot-mt6985`。
+
+
 This directory is the bring-up kit that goes with this branch: the patch chain,
 the build/pack scripts, the device-side round scripts and the state of the port.
 
