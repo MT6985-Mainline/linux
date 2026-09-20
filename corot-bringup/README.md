@@ -102,3 +102,5 @@ dsi   INTEN=0x00000004 (TE_RDY)  te=1850  ← TE 中断在到（~55/s）
 4. LK 的 `ab_retry` 是倒计数，扣完就停在 fastboot；判据是 LK 日志里的 `kernel_sz=0x…`（我们的镜像 ≈ `0x01218xxx`）。
 5. USB 会抽风：fastboot 枚举失败、adb 掉线、刷写挂死。所有命令都要包 `timeout` + 重试（`r125run.sh` 已做）。
 6. 挂死型故障 LK 不 dump ring —— 想知道挂在哪，就得让**故障发生在用户态之后**（r130 的 `-EPROBE_DEFER` 直到 `system_state >= SYSTEM_RUNNING` 就是干这个）。
+
+> 仓库：https://github.com/MT6985-Mainline/linux （分支 `7.2-mt6985-xiaomi-corot`），initramfs 在同组织 `initramfs` 仓库分支 `corot-mt6985`。
