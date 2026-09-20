@@ -22,6 +22,7 @@
 #include <linux/of_platform.h>
 #include <linux/pm_runtime.h>
 #include <linux/kthread.h>
+#include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/dma-mapping.h>
 #include <linux/kmemleak.h>
@@ -3486,6 +3487,9 @@ static void mtk_drm_get_top_clk(struct mtk_drm_private *priv)
 	struct clk *clk;
 	int ret, i;
 
+	/* COROT r120: breadcrumbs down the path that the 48-clock build dies on */
+	pr_err("COROT-TOPCLK enter node=%pOF\n", node);
+
 	if (disp_helper_get_stage() != DISP_HELPER_STAGE_NORMAL) {
 		spin_lock_init(&top_clk_lock);
 		/* TODO: check display enable from lk */
@@ -3495,6 +3499,7 @@ static void mtk_drm_get_top_clk(struct mtk_drm_private *priv)
 	}
 
 	if (of_property_read_u32(node, "clock-num", &priv->top_clk_num)) {
+		pr_err("COROT-TOPCLK no clock-num property\n");
 		priv->top_clk_num = -1;
 		priv->top_clk = NULL;
 		return;
@@ -3503,29 +3508,42 @@ static void mtk_drm_get_top_clk(struct mtk_drm_private *priv)
 	priv->top_clk = devm_kmalloc_array(dev, priv->top_clk_num,
 					   sizeof(*priv->top_clk), GFP_KERNEL);
 
-	pm_runtime_get_sync(dev);
-	if (priv->side_mmsys_dev)
-		pm_runtime_get_sync(priv->side_mmsys_dev);
+	/*
+	 * COROT r129: the probe-phase power-up is the one that hung in r128
+	 * (no SError, stuck at the boot logo).  Defer it to userspace; the real
+	 * power-up now happens in mtk_drm_top_clk_prepare_enable() below, from
+	 * the first crtc_enable, where the breadcrumbs can see it.
+	 */
+	if (system_state >= SYSTEM_RUNNING) {
+		pm_runtime_get_sync(dev);
+		if (priv->side_mmsys_dev)
+			pm_runtime_get_sync(priv->side_mmsys_dev);
+	} else {
+		pr_err("COROT-TOPCLK get_top_clk power deferred: state=%d num=%d\n",
+		       system_state, priv->top_clk_num);
+	}
 	for (i = 0; i < priv->top_clk_num; i++) {
 		clk = of_clk_get(node, i);
 
+		pr_err("COROT-TOPCLK of_clk_get(%d) = %p\n", i, clk);
 		if (IS_ERR(clk)) {
+			pr_err("COROT-TOPCLK get %d clk FAILED %ld\n", i, PTR_ERR(clk));
 			DDPPR_ERR("%s get %d clk failed\n", __func__, i);
 			priv->top_clk_num = -1;
 			return;
 		}
 
 		priv->top_clk[i] = clk;
-		/* TODO: check display enable from lk */
-		/* Because of align lk hw power status,
-		 * we power on mtcmos at the beginning of
-		 * the display initialization.
-		 * We will power off mtcmos at the end of
-		 * the display initialization.
-		 */
+		/* COROT r129: the gate write needs the domain up; do it later. */
+		if (system_state < SYSTEM_RUNNING) {
+			pr_err("COROT-TOPCLK clock %d recorded, enable deferred\n", i);
+			continue;
+		}
 		ret = clk_prepare_enable(priv->top_clk[i]);
 		if (ret)
 			DDPPR_ERR("top clk prepare enable failed:%d\n", i);
+		if (i < 3 || ret)
+			pr_err("COROT-TOPCLK enabled[%d] ret=%d\n", i, ret);
 	}
 
 	if (disp_helper_get_stage() == DISP_HELPER_STAGE_NORMAL) {
@@ -3542,10 +3560,18 @@ void mtk_drm_top_clk_prepare_enable(struct drm_device *drm)
 	struct mtk_drm_private *priv = drm->dev_private;
 	int i;
 
-	if (priv && priv->data && priv->data->mmsys_id == MMSYS_MT6985) {
-		DDPMSG("MT6985 bring-up: skip top-clock prepare until clocks are wired\n");
-		return;
-	}
+	/*
+	 * COROT r115: the MT6985 short-circuit is gone.
+	 *
+	 * It said "skip top-clock prepare until clocks are wired", and it did
+	 * exactly that - so on this SoC the display domain was never taken out of
+	 * runtime suspend (COROT-SNAP reports suspended=1 at every checkpoint),
+	 * the next crtc_enable read the whole dispsys back as zeros, and the first
+	 * access to the MIPI TX block raised the asynchronous SError.
+	 *
+	 * The clocks are wired now: dispsys_config carries the vendor's full
+	 * 48-entry list and clock-num = 48.
+	 */
 	bool en = 1;
 	int ret;
 	unsigned long flags = 0;
@@ -3553,16 +3579,25 @@ void mtk_drm_top_clk_prepare_enable(struct drm_device *drm)
 	if (priv->top_clk_num <= 0)
 		return;
 
+	pr_err("COROT r129 prepare: pm_runtime_get_sync(mmsys) begin state=%d num=%d\n",
+	       system_state, priv->top_clk_num);
 	//set_swpm_disp_active(true);
 	pm_runtime_get_sync(priv->mmsys_dev);
+	pr_err("COROT r129 prepare: mmsys runtime-resumed\n");
 	if (priv->side_mmsys_dev)
 		pm_runtime_get_sync(priv->side_mmsys_dev);
+	/* COROT r115 NOTE: the vendor also resumes priv->ovlsys_dev and
+	 * priv->side_ovlsys_dev here.  Neither member exists in this tree's
+	 * struct mtk_drm_private, so the ovlsys power domains are still not
+	 * managed - worth porting next if the display comes up but stays dark. */
 	for (i = 0; i < priv->top_clk_num; i++) {
 		if (IS_ERR(priv->top_clk[i])) {
 			DDPPR_ERR("%s invalid %d clk\n", __func__, i);
 			return;
 		}
+		pr_err("COROT r129 prepare: enabling top clk %d\n", i);
 		ret = clk_prepare_enable(priv->top_clk[i]);
+		pr_err("COROT r129 prepare: top clk %d ret=%d\n", i, ret);
 		if (ret)
 			DDPPR_ERR("top clk prepare enable failed:%d\n", i);
 	}
@@ -3585,8 +3620,8 @@ void mtk_drm_top_clk_disable_unprepare(struct drm_device *drm)
 	struct mtk_drm_private *priv = drm->dev_private;
 	int i = 0, cnt = 0;
 
-	if (priv && priv->data && priv->data->mmsys_id == MMSYS_MT6985)
-		return;
+	/* COROT r115: the matching short-circuit is gone too - the release
+	 * has to balance the get, or the domain is never dropped again. */
 	unsigned long flags = 0;
 
 	if (priv->top_clk_num <= 0)
@@ -4785,9 +4820,21 @@ void corot_mask_display_irqs_early(void)
 	void __iomem *m0 = ioremap(0x14001000, 0x1000);
 	void __iomem *m2 = ioremap(0x14401000, 0x1000);
 
+	/*
+	 * COROT r102: mask the underrun pair, NOT the whole register.
+	 *
+	 * DSI_INTEN bits: 2 = TE_RDY, 12 = BUFFER_UNDERRUN, 14 = INP_UNFINISH.
+	 * mtk_dsi_set_interrupt_enable() arms all three (0x00005004).  Writing
+	 * zero here also killed TE_RDY, and TE_RDY is what mtk_dsi_irq() turns
+	 * into mtk_crtc_vblank_irq() - i.e. the frame pacing of a command-mode
+	 * panel.  Without it the DRM never completes a frame.
+	 *
+	 * The storm this function exists to stop is the underrun pair, and those
+	 * two are still masked.
+	 */
 	if (d) {
-		writel(0, d + 0x08);
-		writel(0xffffffff, d + 0x0c);
+		writel(0x00000004, d + 0x08);	/* keep TE_RDY */
+		writel(0x00005000, d + 0x0c);	/* clear only underrun + inp-unfin */
 	}
 	if (m0) {
 		writel(0, m0 + 0x00);
@@ -4807,7 +4854,11 @@ void corot_mask_display_irqs_early(void)
 
 void corot_dump_dsi(void)
 {
-	void __iomem *dsi = ioremap(0x14017000, 0x1000);
+	/* COROT r102: the DSI is at 0x1400d000 (see dsi0 in the dts).  0x14017000
+	 * is not the DSI, so every COROT-DSI line this printed was meaningless -
+	 * and reading a block that may not be clocked is one of the ways to take
+	 * an asynchronous SError. */
+	void __iomem *dsi = ioremap(0x1400d000, 0x1000);
 
 	if (!dsi)
 		return;
@@ -4818,6 +4869,9 @@ void corot_dump_dsi(void)
 	iounmap(dsi);
 }
 /* ============ end COROT dumps ============ */
+
+/* COROT r110: defined next to mtk_drm_bind() below */
+static void corot_snap(struct device *dev, const char *tag);
 
 static int mtk_drm_kms_init(struct drm_device *drm)
 {
@@ -4854,6 +4908,8 @@ static int mtk_drm_kms_init(struct drm_device *drm)
 	drm->mode_config.funcs = &mtk_drm_mode_config_funcs;
 
 	ret = component_bind_all(drm->dev, drm);
+	corot_snap(drm->dev, "after-component-bind-all");
+
 	if (ret)
 		goto err_config_cleanup;
 
@@ -4863,6 +4919,8 @@ static int mtk_drm_kms_init(struct drm_device *drm)
 	 * OVL0 -> COLOR0 -> AAL -> OD -> RDMA0 -> UFOE -> DSI0 ...
 	 */
 	ret = mtk_drm_crtc_create(drm, private->data->main_path_data);
+	corot_snap(drm->dev, "after-crtc0-create");
+
 	if (ret < 0)
 		goto err_component_unbind;
 
@@ -4924,6 +4982,8 @@ static int mtk_drm_kms_init(struct drm_device *drm)
 	 * DRM_IOCTL_WAIT_VBLANK to operate correctly.
 	 */
 	ret = drm_vblank_init(drm, MAX_CRTC);
+	corot_snap(drm->dev, "after-vblank-init");
+
 	if (ret < 0)
 		goto err_unset_dma_parms;
 
@@ -4958,8 +5018,11 @@ static int mtk_drm_kms_init(struct drm_device *drm)
 	mtk_drm_init_dummy_table(private);
 
 	pr_err("COROT-STAGE kms_init: BEFORE first_enable (LK handoff state)\n");
+	corot_snap(drm->dev, "before-first-enable");
+
 	/* COROT: LK's known-good display configuration, for comparison */
-	corot_dump_disp("lk-handoff");
+	/* COROT r113: lk-handoff dump silenced - ~4.5 KB of ring for
+	 * data COROT-SNAP already reports in five registers. */
 	{
 		void __iomem *dsc = ioremap(0x14015000, 0x1000);
 		void __iomem *dsi = ioremap(0x14017000, 0x1000);
@@ -4975,11 +5038,16 @@ static int mtk_drm_kms_init(struct drm_device *drm)
 					      "corot-tele");
 	}
 	mtk_drm_first_enable(drm);
+	corot_snap(drm->dev, "after-first-enable");
+
 
 	/* COROT: mask display IRQs immediately - the underrun storm starts here */
 	corot_mask_display_irqs_early();
 	pr_err("COROT-STAGE kms_init done, first_enable done (irqs masked)\n");
-	corot_dump_disp("kms_init_done");
+	corot_snap(drm->dev, "kms-init-return");
+
+	/* COROT r113: kms_init_done dump silenced - ~4.5 KB of ring for
+	 * data COROT-SNAP already reports in five registers. */
 
 	/*
 	 * When kernel init, SMI larb will get once for keeping
@@ -5245,6 +5313,35 @@ static int compare_of(struct device *dev, void *data)
 	return dev->of_node == data;
 }
 
+/*
+ * COROT r109: is the display block alive right now?
+ *
+ * One line per checkpoint: the mutex, an OVL, the DSC and the DSI, plus the
+ * runtime-PM state of the display's own device.  Process context only - the
+ * mappings are made once, on the first call, and never from an interrupt (see
+ * r103: ioremap() in an IRQ handler is a kernel BUG on this tree).
+ */
+static void corot_snap(struct device *dev, const char *tag)
+{
+	static void __iomem *mtx, *ovl, *dsc, *dsi;
+
+	if (!mtx) {
+		mtx = ioremap(0x14001000, 0x1000);
+		ovl = ioremap(0x14402000, 0x1000);
+		dsc = ioremap(0x1400c000, 0x1000);
+		dsi = ioremap(0x1400d000, 0x1000);
+	}
+
+	pr_err("COROT-SNAP[%-22s] mtx_en=0x%08x ovl_en=0x%08x dsc_con=0x%08x dsi_start=0x%08x dsi_sta=0x%08x suspended=%d\n",
+	       tag,
+	       mtx ? readl(mtx + 0x00) : 0,
+	       ovl ? readl(ovl + 0x00) : 0,
+	       dsc ? readl(dsc + 0x00) : 0,
+	       dsi ? readl(dsi + 0x00) : 0,
+	       dsi ? readl(dsi + 0x0c) : 0,
+	       dev ? pm_runtime_status_suspended(dev) : -1);
+}
+
 static int mtk_drm_bind(struct device *dev)
 {
 	struct mtk_drm_private *private = dev_get_drvdata(dev);
@@ -5256,6 +5353,7 @@ static int mtk_drm_bind(struct device *dev)
 	if (IS_ERR(drm))
 		return PTR_ERR(drm);
 
+	corot_snap(private->mmsys_dev ? private->mmsys_dev : dev, "bind-in");
 	drm->dev_private = private;
 	private->drm = drm;
 
@@ -5263,12 +5361,15 @@ static int mtk_drm_bind(struct device *dev)
 	if (ret < 0)
 		goto err_free;
 
+	corot_snap(private->mmsys_dev ? private->mmsys_dev : dev, "after-kms-init");
 	ret = drm_dev_register(drm, 0);
 	if (ret < 0)
 		goto err_deinit;
 
+	corot_snap(private->mmsys_dev ? private->mmsys_dev : dev, "after-drm-dev-register");
 	drm_client_setup(drm, NULL);
 
+	corot_snap(private->mmsys_dev ? private->mmsys_dev : dev, "after-client-setup");
 	mtk_layering_rule_init(drm);
 #ifdef DRM_OVL_SELF_PATTERN
 	mtk_drm_disp_test_init(drm);
@@ -5836,8 +5937,10 @@ static void corot_clk_show(struct device_node *np, const char *name)
 		if (!p)
 			continue;
 		r = clk_hw_get_rate(p);
-		pr_err("COROT-CLK r94 %-9s:   [%u] %-22s %lu Hz\n",
-		       name, i, clk_hw_get_name(p), r);
+		/* COROT r113: the per-parent listing was 128 lines a boot and
+		 * pushed the interesting output out of the 56 KB ring.  The
+		 * best-parent line below still prints. */
+		(void)r;
 		if (r > best) {
 			best = r;
 			bestc = p->clk;
@@ -5898,8 +6001,99 @@ static void corot_clk_report(struct device *dev)
 	pr_err("COROT-CLK r94: no node to read clocks from at all\n");
 }
 
+/*
+ * COROT r104: bounded display/GCE audit.
+ *
+ * Six shots, five seconds apart, then it stops.  A periodic reader of these
+ * registers is what hung the SoC in r69/r80/r81, so the count is fixed and the
+ * work is never re-armed after the last shot.
+ *
+ * The point is to answer one question with evidence: in the option-B build, is
+ * anything triggering frames?  The register set is deliberately the same one the
+ * CPU-direct telemetry prints, so the two builds can be compared line by line.
+ */
+extern void corot_dsi_counts(unsigned int *frm, unsigned int *te, unsigned int *ur);
+
+#define COROT_AUDIT_SHOTS	6
+#define COROT_AUDIT_MS		5000
+
+/* the work re-arms itself: declare the object, then the callback, then INIT it
+ * at the arming site */
+static struct delayed_work corot_audit_dw;
+static void corot_audit_dump(struct work_struct *w);
+
+static void corot_audit_dump(struct work_struct *w)
+{
+	static int shot;
+	void __iomem *dsi = ioremap(0x1400d000, 0x1000);
+	void __iomem *mtx0 = ioremap(0x14001000, 0x1000);
+	void __iomem *mtx1 = ioremap(0x14401000, 0x1000);
+	void __iomem *ovl = ioremap(0x14402000, 0x1000);
+	void __iomem *dsc = ioremap(0x1400c000, 0x1000);
+	unsigned int frm = 0, te = 0, ur = 0;
+
+	corot_dsi_counts(&frm, &te, &ur);
+	shot++;
+
+	pr_err("COROT-GCEAUDIT[%d] frames=%u te=%u underrun=%u\n", shot, frm, te, ur);
+	pr_err("COROT-GCEAUDIT[%d] dsi   START=0x%08x INTSTA=0x%08x INTEN=0x%08x CON=0x%08x MODE=0x%08x PSCTRL=0x%08x SIZE=0x%08x\n",
+	       shot,
+	       dsi ? readl(dsi + 0x00) : 0, dsi ? readl(dsi + 0x0c) : 0,
+	       dsi ? readl(dsi + 0x08) : 0, dsi ? readl(dsi + 0x10) : 0,
+	       dsi ? readl(dsi + 0x14) : 0, dsi ? readl(dsi + 0x1c) : 0,
+	       dsi ? readl(dsi + 0x38) : 0);
+	pr_err("COROT-GCEAUDIT[%d] mutex mtx0 EN=0x%08x SOF=0x%08x | mtx1 EN=0x%08x SOF=0x%08x\n",
+	       shot,
+	       mtx0 ? readl(mtx0 + 0x00) : 0, mtx0 ? readl(mtx0 + 0x04) : 0,
+	       mtx1 ? readl(mtx1 + 0x00) : 0, mtx1 ? readl(mtx1 + 0x04) : 0);
+	pr_err("COROT-GCEAUDIT[%d] ovl   EN=0x%08x INTSTA=0x%08x ROI=0x%08x SRC_CON=0x%08x DATAPATH=0x%08x\n",
+	       shot,
+	       ovl ? readl(ovl + 0x00) : 0, ovl ? readl(ovl + 0x0c) : 0,
+	       ovl ? readl(ovl + 0x20) : 0, ovl ? readl(ovl + 0x2c) : 0,
+	       ovl ? readl(ovl + 0x24) : 0);
+	pr_err("COROT-GCEAUDIT[%d] dsc   CON=0x%08x INTSTA=0x%08x MODE=0x%08x ENC_W=0x%08x BUF=0x%08x\n",
+	       shot,
+	       dsc ? readl(dsc + 0x00) : 0, dsc ? readl(dsc + 0x08) : 0,
+	       dsc ? readl(dsc + 0x10) : 0, dsc ? readl(dsc + 0x14) : 0,
+	       dsc ? readl(dsc + 0x2c) : 0);
+
+	if (dsi)
+		iounmap(dsi);
+	if (mtx0)
+		iounmap(mtx0);
+	if (mtx1)
+		iounmap(mtx1);
+	if (ovl)
+		iounmap(ovl);
+	if (dsc)
+		iounmap(dsc);
+
+	if (shot < COROT_AUDIT_SHOTS)
+		schedule_delayed_work(&corot_audit_dw,
+				      msecs_to_jiffies(COROT_AUDIT_MS));
+	else
+		pr_err("COROT-GCEAUDIT: done after %d shots\n", shot);
+}
+
 static int mtk_drm_probe(struct platform_device *pdev)
 {
+	/*
+	 * COROT r130: run the whole display bring-up with a live log channel.
+	 *
+	 * In device_initcall time (~0.35 s) nothing user-space exists yet, so a
+	 * hang here is invisible and the round produces no data at all.  Defer
+	 * until kernel_init() has set SYSTEM_RUNNING and started /init: the
+	 * initramfs log-catcher is then already writing cust/boot-log.txt, and
+	 * every breadcrumb below - including the last one before a hang - lands
+	 * on flash where Android can read it.
+	 */
+	if (system_state < SYSTEM_RUNNING) {
+		pr_err("COROT r130 probe deferred: state=%d (waiting for userspace)\n",
+		       system_state);
+		return -EPROBE_DEFER;
+	}
+	pr_err("COROT r130 probe running with userspace up (state=%d)\n", system_state);
+
 	struct device *dev = &pdev->dev;
 	struct mtk_drm_private *private;
 	struct resource *mem;
@@ -6178,6 +6372,9 @@ SKIP_SIDE_DISP:
 		dev_warn(dev, "Failed to remove conflicting framebuffers: %d\n", ret);
 
 	pr_err("COROT-STAGE probe: comps collected, master_add next\n");
+	/* COROT r104: first audit shot five seconds from now */
+	INIT_DELAYED_WORK(&corot_audit_dw, corot_audit_dump);
+	schedule_delayed_work(&corot_audit_dw, msecs_to_jiffies(COROT_AUDIT_MS));
 
 	ret = component_master_add_with_match(dev, &mtk_drm_ops, match);
 	DDPINFO("%s- ret:%d\n", __func__, ret);

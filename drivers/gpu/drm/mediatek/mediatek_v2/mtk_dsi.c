@@ -14,6 +14,9 @@
 #include <linux/delay.h>
 #include <linux/vmalloc.h>
 #include <linux/clk.h>
+/* COROT r104: clears the display interrupt enables; defined in mtk_drm_drv.c
+ * outside every #ifdef, so it exists in both build modes. */
+extern void corot_mask_display_irqs_early(void);
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
 #include <linux/component.h>
@@ -2197,6 +2200,58 @@ void clear_dsi_underrun_event(void)
 	dsi_underrun_trigger = 1;
 }
 
+/*
+ * COROT r103: the register blocks this file's interrupt handler wants to read
+ * must be mapped BEFORE the handler runs.
+ *
+ * ioremap() cannot be called from interrupt context - __get_vm_area_node() has
+ * BUG_ON(in_interrupt()) - and calling it from the DSI underrun branch is
+ * exactly what turned "the panel underran once" into
+ *     kernel BUG at mm/vmalloc.c:3228
+ * and, in turn, into the blanket INTEN = 0 mask that killed TE_RDY.
+ *
+ * ioremap only creates a virtual mapping; it does not touch the hardware, so
+ * doing it at probe time is safe and the handler just uses the pointers.
+ */
+static void __iomem *corot_irq_mtx0;
+static void __iomem *corot_irq_mtx1;
+static void __iomem *corot_irq_ovl;
+static void __iomem *corot_irq_dsc;
+
+static void corot_irq_maps_init(void)
+{
+	if (!corot_irq_mtx0)
+		corot_irq_mtx0 = ioremap(0x14001000, 0x1000);
+	if (!corot_irq_mtx1)
+		corot_irq_mtx1 = ioremap(0x14401000, 0x1000);
+	if (!corot_irq_ovl)
+		corot_irq_ovl = ioremap(0x14402000, 0x1000);
+	if (!corot_irq_dsc)
+		corot_irq_dsc = ioremap(0x1400c000, 0x1000);
+
+	pr_err("COROT-IRQMAP mtx0=%p mtx1=%p ovl=%p dsc=%p\n",
+	       corot_irq_mtx0, corot_irq_mtx1, corot_irq_ovl, corot_irq_dsc);
+}
+
+/*
+ * COROT r104: frame accounting.
+ *
+ * "Does the display get triggered at all" needs a number, not an inference from
+ * the picture - especially in the option-B build, where none of the CPU-direct
+ * telemetry is compiled in.  These are bumped in the DSI interrupt handler from
+ * the raw INTSTA value, before the handler's own masking of the status word.
+ */
+static unsigned int corot_dsi_frm_n;
+static unsigned int corot_dsi_te_n;
+static unsigned int corot_dsi_ur_n;
+
+void corot_dsi_counts(unsigned int *frm, unsigned int *te, unsigned int *ur)
+{
+	*frm = corot_dsi_frm_n;
+	*te = corot_dsi_te_n;
+	*ur = corot_dsi_ur_n;
+}
+
 static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 {
 	struct mtk_dsi *dsi = dev_id;
@@ -2243,6 +2298,14 @@ static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 	 * Read LCM will clear the bit.
 	 */
 	/* do not clear vm command done */
+	/* COROT r104: frame accounting, from the raw status word */
+	if (status & FRAME_DONE_INT_FLAG)
+		corot_dsi_frm_n++;
+	if (status & TE_RDY_INT_FLAG)
+		corot_dsi_te_n++;
+	if (status & BUFFER_UNDERRUN_INT_FLAG)
+		corot_dsi_ur_n++;
+
 	status &= 0xffde;
 	if (status) {
 		writel(~status, dsi->regs + DSI_INTSTA);
@@ -2274,11 +2337,18 @@ static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 			{
 				static int corot_underrun_n;
 
-				if (corot_underrun_n < 4) {
-					void __iomem *m0 = ioremap(0x14001000, 0x1000);
-					void __iomem *m1 = ioremap(0x14401000, 0x1000);
-					void __iomem *o = ioremap(0x14402000, 0x1000);
-					void __iomem *dc = ioremap(0x1400c000, 0x1000);
+				/*
+				 * COROT r103: NO ioremap here.  This runs in hard
+				 * interrupt context and ioremap() BUGs there; the
+				 * mappings are made once by corot_irq_maps_init()
+				 * at probe time.  If they are missing the dump is
+				 * skipped - a missing line is cheap, a BUG is not.
+				 */
+				if (corot_underrun_n < 4 && corot_irq_mtx0) {
+					void __iomem *m0 = corot_irq_mtx0;
+					void __iomem *m1 = corot_irq_mtx1;
+					void __iomem *o = corot_irq_ovl;
+					void __iomem *dc = corot_irq_dsc;
 
 					corot_underrun_n++;
 					pr_err("COROT-UNDERRUN[%d] dsi sta=0x%08x start=0x%08x con=0x%08x mode=0x%08x txrx=0x%08x size=0x%08x | mtx0 en=0x%08x sof=0x%08x | mtx1 en=0x%08x sof=0x%08x | ovl en=0x%08x intsta=0x%08x | dsc con=0x%08x\n",
@@ -2296,14 +2366,8 @@ static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 						o ? readl(o + 0x00) : 0,
 						o ? readl(o + 0x0c) : 0,
 						dc ? readl(dc + 0x00) : 0);
-					if (m0)
-						iounmap(m0);
-					if (m1)
-						iounmap(m1);
-					if (o)
-						iounmap(o);
-					if (dc)
-						iounmap(dc);
+					/* COROT r103: no iounmap either - the
+					 * mappings live for the life of the driver. */
 				}
 			}
 
@@ -2750,6 +2814,14 @@ static int mtk_preconfig_dsi_enable(struct mtk_dsi *dsi)
 	mtk_dsi_cmdq_size_sel(dsi);
 
 	mtk_dsi_set_interrupt_enable(dsi);
+	/*
+	 * COROT r104: mtk_dsi_set_interrupt_enable() has just re-armed
+	 * INTEN = 0x00005004 (BUFFER_UNDERRUN | INP_UNFINISH | TE_RDY).  Put the
+	 * mask back immediately, but a mask that keeps TE_RDY - see r102.  Without
+	 * this the underrun interrupt fires on every frame; with the r103 fix it no
+	 * longer kills the kernel, but it is still pure noise.
+	 */
+	corot_mask_display_irqs_early();
 
 #if !IS_ENABLED(CONFIG_DRM_PANEL_L11_38_0A_0A_DSC_CMD) \
 	&& !IS_ENABLED(CONFIG_DRM_PANEL_L11A_38_0A_0A_DSC_CMD) \
@@ -9034,7 +9106,12 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 
 	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	dsi->regs = devm_ioremap_resource(dev, regs);
-	pr_err("COROT-MARKER r98-pllforce: DSI probe reached (image check)\n");
+	/*
+	 * COROT r103: the mappings the DSI interrupt handler needs, made here
+	 * because ioremap() is not legal in interrupt context.
+	 */
+	corot_irq_maps_init();
+	pr_err("COROT-MARKER r131-dualmap: DSI probe reached (image check)\n");
 
 	pr_err("COROT-DSI[probe] INTSTA=0x%08x INTEN=0x%08x START=0x%08x\n",
 	       readl(dsi->regs + DSI_INTSTA), readl(dsi->regs + DSI_INTEN),

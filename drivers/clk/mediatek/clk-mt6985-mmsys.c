@@ -562,6 +562,10 @@ static const struct of_device_id of_match_clk_mt6985_mmsys[] = {
 
 static int clk_mt6985_mmsys_grp_probe(struct platform_device *pdev)
 {
+	/* COROT r120: error-level, because the ring only keeps pr_err and this is
+	 * exactly the point after which the boot goes silent. */
+	pr_err("COROT-CLKPROBE enter %pOF\n", pdev->dev.of_node);
+
 	int r;
 
 #if MT_CCF_BRINGUP
@@ -569,6 +573,7 @@ static int clk_mt6985_mmsys_grp_probe(struct platform_device *pdev)
 #endif
 
 	r = mtk_clk_simple_probe(pdev);
+	pr_err("COROT-CLKPROBE done  %pOF ret=%d\n", pdev->dev.of_node, r);
 	if (r)
 		dev_err(&pdev->dev,
 			"could not register clock provider: %s: %d\n",

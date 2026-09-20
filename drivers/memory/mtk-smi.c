@@ -222,11 +222,46 @@ void mtk_smi_larb_put(struct device *larbdev)
 }
 EXPORT_SYMBOL_GPL(mtk_smi_larb_put);
 
+/*
+ * COROT r112: the init-power-on mechanism, restored.
+ *
+ * The vendor keeps MTCMOS up from SMI probe until DRM init hands the hardware
+ * over: every device whose node carries `init-power-on' takes one runtime-PM
+ * reference at probe time, and mtk_smi_init_power_off() (called at the end of
+ * mtk_drm_kms_init) gives them all back.  The port kept the get and replaced
+ * this release with an empty function, so the references were never returned.
+ *
+ * The vendor stores struct mtk_smi *; this tree stores the device itself, which
+ * is all pm_runtime_put_sync() needs.
+ */
+#define MAX_INIT_POWER_ON_DEV	32
+
+static struct device *init_power_on_dev[MAX_INIT_POWER_ON_DEV];
+static unsigned int init_power_on_num;
+
+static void corot_init_power_on_hold(struct device *dev)
+{
+	if (!of_property_read_bool(dev->of_node, "init-power-on"))
+		return;
+
+	if (init_power_on_num >= MAX_INIT_POWER_ON_DEV) {
+		dev_warn(dev, "init-power-on: table full\n");
+		return;
+	}
+	init_power_on_dev[init_power_on_num++] = dev;
+	pr_err("COROT-INITPWR: hold on %pOF (%u)\n", dev->of_node,
+	       init_power_on_num);
+}
+
 void mtk_smi_init_power_off(void)
 {
-	/* No-op in mainline: larbs are runtime-PM managed by the component
-	 * framework, so there is nothing to release at init time.
-	 */
+	unsigned int i;
+
+	pr_err("COROT-INITPWR: releasing %u init-power-on reference(s)\n",
+	       init_power_on_num);
+	for (i = 0; i < init_power_on_num; i++)
+		pm_runtime_put_sync(init_power_on_dev[i]);
+	init_power_on_num = 0;
 }
 EXPORT_SYMBOL_GPL(mtk_smi_init_power_off);
 
@@ -781,7 +816,18 @@ static const struct mtk_smi_larb_gen mtk_smi_larb_mt8195 = {
 	.ostd		            = mtk_smi_larb_mt8195_ostd,
 };
 
+/*
+ * COROT r92: MT6985.  Only config_port is provided: the vendor's own driver
+ * carries per-port OSTD/bw tables we do not have, and the generic gen2 port
+ * configuration is what makes a larb usable.  Documented as a deliberate
+ * simplification, not an oversight.
+ */
+static const struct mtk_smi_larb_gen mtk_smi_larb_mt6985 = {
+	.config_port = mtk_smi_larb_config_port_gen2_general,
+};
+
 static const struct of_device_id mtk_smi_larb_of_ids[] = {
+	{.compatible = "mediatek,mt6985-smi-larb", .data = &mtk_smi_larb_mt6985},
 	{.compatible = "mediatek,mt2701-smi-larb", .data = &mtk_smi_larb_mt2701},
 	{.compatible = "mediatek,mt2712-smi-larb", .data = &mtk_smi_larb_mt2712},
 	{.compatible = "mediatek,mt6779-smi-larb", .data = &mtk_smi_larb_mt6779},
@@ -918,6 +964,9 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
 			dev_notice(dev, "Unable to enable SMI LARB%d. ret:%d\n",
 				larb->larbid, ret);
 			pm_runtime_put_sync(dev);
+		} else {
+			/* COROT r112: register it so it can be released */
+			corot_init_power_on_hold(dev);
 		}
 	}
 
@@ -1096,7 +1145,25 @@ static const struct mtk_smi_common_plat mtk_smi_common_mt8365 = {
 	.bus_sel  = F_MMU1_LARB(2) | F_MMU1_LARB(4),
 };
 
+/*
+ * COROT r92: MT6985 commons.  bus_sel/init left at zero - the vendor programs
+ * these for its own MM DVFS port mapping, and a zero bus_sel is a no-op rather
+ * than a wrong value.  has_gals is set because the MT6985 nodes supply the
+ * gals clocks and the driver sizes its clk_bulk_get by it.
+ */
+static const struct mtk_smi_common_plat mtk_smi_common_mt6985 = {
+	.type     = MTK_SMI_GEN2,
+	.has_gals = true,
+};
+
+static const struct mtk_smi_common_plat mtk_smi_sub_common_mt6985 = {
+	.type     = MTK_SMI_GEN2_SUB_COMM,
+	.has_gals = true,
+};
+
 static const struct of_device_id mtk_smi_common_of_ids[] = {
+	{.compatible = "mediatek,mt6985-smi-common", .data = &mtk_smi_common_mt6985},
+	{.compatible = "mediatek,mt6985-smi-sub-common", .data = &mtk_smi_sub_common_mt6985},
 	{.compatible = "mediatek,mt2701-smi-common", .data = &mtk_smi_common_gen1},
 	{.compatible = "mediatek,mt2712-smi-common", .data = &mtk_smi_common_gen2},
 	{.compatible = "mediatek,mt6779-smi-common", .data = &mtk_smi_common_mt6779},

@@ -551,6 +551,41 @@ static void corot_gce_thread_dump(struct cmdq *cmdq, const char *tag, u32 thr)
 		readl(thread->base + CMDQ_THR_SPR + 0x0c));
 }
 
+/*
+ * COROT r104: does the GCE actually fetch and execute?
+ *
+ * The environment dump already fires on enable and on error, but "no errors"
+ * only proves the GCE is quiet.  These three shots read the threads the dispsys
+ * node really uses and report each one's CURR_ADDR / END_ADDR / CNT / IRQ_ENABLE:
+ * a thread whose CNT advances across shots is a GCE that is running packets,
+ * while PC == start with IRQ status 0x10 is the GCE-D DDR-access failure that
+ * GCE_GCTL_VALUE exists to avoid.
+ */
+static const u32 corot_audit_thr[] = { 0, 1, 2, 3, 4, 5, 6, 7, 22, 24, 25 };
+static atomic_t corot_thr_audit_left = ATOMIC_INIT(3);
+static struct delayed_work corot_thr_audit_dw;
+static struct cmdq *corot_thr_audit_cmdq;
+
+static void corot_gce_thread_audit(struct work_struct *w)
+{
+	struct cmdq *cmdq = corot_thr_audit_cmdq;
+	unsigned int i;
+	int left;
+
+	if (!cmdq)
+		return;
+
+	left = atomic_dec_return(&corot_thr_audit_left);
+	corot_gce_env_dump(cmdq, "audit", 0);
+	for (i = 0; i < ARRAY_SIZE(corot_audit_thr); i++)
+		corot_gce_thread_dump(cmdq, "audit", corot_audit_thr[i]);
+	pr_err("COROT-GCEAUDIT: thread shot done, %d left\n", left);
+
+	if (left > 0)
+		schedule_delayed_work(&corot_thr_audit_dw,
+				      msecs_to_jiffies(5000));
+}
+
 static s32 cmdq_clk_enable(struct cmdq *cmdq)
 {
 	s32 usage, err, err_timer;
@@ -562,6 +597,14 @@ static s32 cmdq_clk_enable(struct cmdq *cmdq)
 	spin_lock_irqsave(&cmdq->lock, flags);
 
 	usage = atomic_inc_return(&cmdq->usage);
+		if (usage == 1 && corot_thr_audit_cmdq != cmdq) {
+			corot_thr_audit_cmdq = cmdq;
+			INIT_DELAYED_WORK(&corot_thr_audit_dw,
+					  corot_gce_thread_audit);
+			schedule_delayed_work(&corot_thr_audit_dw,
+					      msecs_to_jiffies(6000));
+			pr_err("COROT-GCEAUDIT: thread audit armed\n");
+		}
 	err = clk_enable(cmdq->clock);
 	if (usage <= 0 || err < 0)
 		cmdq_err("ref count error after inc:%d err:%d suspend:%s",

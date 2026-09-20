@@ -10,6 +10,7 @@
 /dts-v1/;
 
 #include <dt-bindings/gce/mt6985-gce.h>
+#include <dt-bindings/memory/mt6985-larb-port.h>
 #include <dt-bindings/clock/mt6985-clk.h>
 #include <dt-bindings/pinctrl/mt6985-pinfunc.h>
 #include <dt-bindings/phy/phy.h>
@@ -741,6 +742,150 @@
 
 	dispsys_config: dispsys-config@14000000 {
 		compatible = "mediatek,mt6985-disp";
+		/*
+		 * COROT r107: the vendor's DRM option table.  mtk_drm_helper_init()
+		 * looks each name up here by name; anything missing stays 0, and
+		 * MTK_DRM_OPT_PRIM_DUAL_PIPE = 0 means mtk_crtc_is_dual_pipe() is
+		 * false, which means the panel's second DSC pipe is never created.
+		 * That is the half-screen.
+		 */
+		helper-name = 			"MTK_DRM_OPT_STAGE",
+			"MTK_DRM_OPT_USE_CMDQ",
+			"MTK_DRM_OPT_USE_M4U",
+			"MTK_DRM_OPT_MMQOS_SUPPORT",
+			"MTK_DRM_OPT_MMDVFS_SUPPORT",
+			"MTK_DRM_OPT_SODI_SUPPORT",
+			"MTK_DRM_OPT_IDLE_MGR",
+			"MTK_DRM_OPT_IDLEMGR_SWTCH_DECOUPLE",
+			"MTK_DRM_OPT_IDLEMGR_BY_REPAINT",
+			"MTK_DRM_OPT_IDLEMGR_ENTER_ULPS",
+			"MTK_DRM_OPT_IDLEMGR_KEEP_LP11",
+			"MTK_DRM_OPT_DYNAMIC_RDMA_GOLDEN_SETTING",
+			"MTK_DRM_OPT_IDLEMGR_DISABLE_ROUTINE_IRQ",
+			"MTK_DRM_OPT_MET_LOG",
+			"MTK_DRM_OPT_USE_PQ",
+			"MTK_DRM_OPT_ESD_CHECK_RECOVERY",
+			"MTK_DRM_OPT_ESD_CHECK_SWITCH",
+			"MTK_DRM_OPT_PRESENT_FENCE",
+			"MTK_DRM_OPT_RDMA_UNDERFLOW_AEE",
+			"MTK_DRM_OPT_DSI_UNDERRUN_AEE",
+			"MTK_DRM_OPT_ODDMR_OD_AEE",
+			"MTK_DRM_OPT_ODDMR_DMR_AEE",
+			"MTK_DRM_OPT_HRT",
+			"MTK_DRM_OPT_HRT_MODE",
+			"MTK_DRM_OPT_DELAYED_TRIGGER",
+			"MTK_DRM_OPT_OVL_EXT_LAYER",
+			"MTK_DRM_OPT_AOD",
+			"MTK_DRM_OPT_RPO",
+			"MTK_DRM_OPT_DUAL_PIPE",
+			"MTK_DRM_OPT_DC_BY_HRT",
+			"MTK_DRM_OPT_OVL_WCG",
+			"MTK_DRM_OPT_OVL_SBCH",
+			"MTK_DRM_OPT_COMMIT_NO_WAIT_VBLANK",
+			"MTK_DRM_OPT_MET",
+			"MTK_DRM_OPT_REG_PARSER_RAW_DUMP",
+			"MTK_DRM_OPT_VP_PQ",
+			"MTK_DRM_OPT_GAME_PQ",
+			"MTK_DRM_OPT_MMPATH",
+			"MTK_DRM_OPT_HBM",
+			"MTK_DRM_OPT_VDS_PATH_SWITCH",
+			"MTK_DRM_OPT_LAYER_REC",
+			"MTK_DRM_OPT_CLEAR_LAYER",
+			"MTK_DRM_OPT_LFR",
+			"MTK_DRM_OPT_SF_PF",
+			"MTK_DRM_OPT_DYN_MIPI_CHANGE",
+			"MTK_DRM_OPT_PRIM_DUAL_PIPE",
+			"MTK_DRM_OPT_MSYNC2_0",
+			"MTK_DRM_OPT_MML_PRIMARY",
+			"MTK_DRM_OPT_MML_SUPPORT_CMD_MODE",
+			"MTK_DRM_OPT_MML_PQ",
+			"MTK_DRM_OPT_MML_IR",
+			"MTK_DRM_OPT_DUAL_TE",
+			"MTK_DRM_OPT_RES_SWITCH",
+			"MTK_DRM_OPT_RES_SWITCH_ON_AP",
+			"MTK_DRM_OPT_PREFETCH_TE",
+			"MTK_DRM_OPT_VIDLE_APSRC_OFF",
+			"MTK_DRM_OPT_VIDLE_DSI_PLL_OFF",
+			"MTK_DRM_OPT_CHECK_TRIGGER_MERGE",
+			"MTK_DRM_OPT_VIRTUAL_DISP",
+			"MTK_DRM_OPT_OVL_BW_MONITOR",
+			"MTK_DRM_OPT_GPU_CACHE",
+			"MTK_DRM_OPT_SPHRT",
+			"MTK_DRM_OPT_SDPA_OVL_SWITCH",
+			"MTK_DRM_OPT_TILE_OVERHEAD";
+		helper-value = 			<0>, /*MTK_DRM_OPT_STAGE*/
+			<1>, /*MTK_DRM_OPT_USE_CMDQ*/
+			<1>, /*MTK_DRM_OPT_USE_M4U*/
+			<0>, /*MTK_DRM_OPT_MMQOS_SUPPORT*/
+			<0>, /*MTK_DRM_OPT_MMDVFS_SUPPORT*/
+			<0>, /*MTK_DRM_OPT_SODI_SUPPORT*/
+			<1>, /*MTK_DRM_OPT_IDLE_MGR*/
+			<0>, /*MTK_DRM_OPT_IDLEMGR_SWTCH_DECOUPLE*/
+			<1>, /*MTK_DRM_OPT_IDLEMGR_BY_REPAINT*/
+			<0>, /*MTK_DRM_OPT_IDLEMGR_ENTER_ULPS*/
+			<0>, /*MTK_DRM_OPT_IDLEMGR_KEEP_LP11*/
+			<0>, /*MTK_DRM_OPT_DYNAMIC_RDMA_GOLDEN_SETTING*/
+			<1>, /*MTK_DRM_OPT_IDLEMGR_DISABLE_ROUTINE_IRQ*/
+			<0>, /*MTK_DRM_OPT_MET_LOG*/
+			<1>, /*MTK_DRM_OPT_USE_PQ*/
+			<1>, /*MTK_DRM_OPT_ESD_CHECK_RECOVERY*/
+			<1>, /*MTK_DRM_OPT_ESD_CHECK_SWITCH*/
+			<1>, /*MTK_DRM_OPT_PRESENT_FENCE*/
+			<0>, /*MTK_DRM_OPT_RDMA_UNDERFLOW_AEE*/
+			<1>, /*MTK_DRM_OPT_DSI_UNDERRUN_AEE*/
+			<0>, /*MTK_DRM_OPT_ODDMR_OD_AEE*/
+			<0>, /*MTK_DRM_OPT_ODDMR_DMR_AEE*/
+			<1>, /*MTK_DRM_OPT_HRT*/
+			<1>, /*MTK_DRM_OPT_HRT_MODE*/
+			<0>, /*MTK_DRM_OPT_DELAYED_TRIGGER*/
+			<1>, /*MTK_DRM_OPT_OVL_EXT_LAYER*/
+			<0>, /*MTK_DRM_OPT_AOD*/
+			<1>, /*MTK_DRM_OPT_RPO*/
+			<0>, /*MTK_DRM_OPT_DUAL_PIPE*/
+			<0>, /*MTK_DRM_OPT_DC_BY_HRT*/
+			<0>, /*MTK_DRM_OPT_OVL_WCG*/
+			<0>, /*MTK_DRM_OPT_OVL_SBCH*/
+			<1>, /*MTK_DRM_OPT_COMMIT_NO_WAIT_VBLANK*/
+			<0>, /*MTK_DRM_OPT_MET*/
+			<0>, /*MTK_DRM_OPT_REG_PARSER_RAW_DUMP*/
+			<0>, /*MTK_DRM_OPT_VP_PQ*/
+			<0>, /*MTK_DRM_OPT_GAME_PQ*/
+			<0>, /*MTK_DRM_OPT_MMPATH*/
+			<0>, /*MTK_DRM_OPT_HBM*/
+			<0>, /*MTK_DRM_OPT_VDS_PATH_SWITCH*/
+			<0>, /*MTK_DRM_OPT_LAYER_REC*/
+			<1>, /*MTK_DRM_OPT_CLEAR_LAYER*/
+			<0>, /*MTK_DRM_OPT_LFR*/
+			<0>, /*MTK_DRM_OPT_SF_PF*/
+			<1>, /*MTK_DRM_OPT_DYN_MIPI_CHANGE*/
+			<1>, /*MTK_DRM_OPT_PRIM_DUAL_PIPE*/
+			<1>, /*MTK_DRM_OPT_MSYNC2_0*/
+			<0>, /*MTK_DRM_OPT_MML_PRIMARY*/
+			<0>, /*MTK_DRM_OPT_MML_SUPPORT_CMD_MODE*/
+			<0>, /*MTK_DRM_OPT_MML_PQ*/
+			<0>, /*MTK_DRM_OPT_MML_IR*/
+			<0>, /*MTK_DRM_OPT_DUAL_TE*/
+			<0>, /*MTK_DRM_OPT_RES_SWITCH*/
+			<0>, /*MTK_DRM_OPT_RES_SWITCH_ON_AP*/
+			<0>, /*MTK_DRM_OPT_PREFETCH_TE*/
+			<0>, /*MTK_DRM_OPT_VIDLE_APSRC_OFF*/
+			<0>, /*MTK_DRM_OPT_VIDLE_DSI_PLL_OFF*/
+			<0>, /*MTK_DRM_OPT_CHECK_TRIGGER_MERGE*/
+			<0>, /*MTK_DRM_OPT_VIRTUAL_DISP*/
+			<0>, /*MTK_DRM_OPT_OVL_BW_MONITOR*/
+			<0>, /*MTK_DRM_OPT_GPU_CACHE*/
+			<1>, /*MTK_DRM_OPT_SPHRT*/
+			<1>, /*MTK_DRM_OPT_SDPA_OVL_SWITCH*/
+			<1>; /*MTK_DRM_OPT_TILE_OVERHEAD*/
+		/*
+		 * COROT r107: the display power domain.  Without it nothing powers the
+		 * block and every register reads back 0 - the option-B SError.
+		 */
+		power-domains = <&mt6985_scpsys MT6985_POWER_DOMAIN_DIS0_SHUTDOWN>;
+		/* COROT r107: the GCE the DRM is meant to drive, and the master's
+		 * display IOMMU port. */
+		mediatek,mailbox-gce = <&gce>;
+		iommus = <&disp_iommu M4U_PORT_L0_DISP_OVL1_2L_RDMA1>;
 		reg = <0x0 0x14000000 0x0 0x1000>,
 		      <0x0 0x14200000 0x0 0x1000>,
 		      <0x0 0x14400000 0x0 0x1000>,
@@ -751,6 +896,17 @@
 		#size-cells = <2>;
 		#clock-cells = <1>;
 		dma-ranges = <0x0 0x0 0x0 0x0 0x4 0x0>;
+		/*
+		 * COROT r115: the vendor's full dispsys clock list.
+		 *
+		 * mtk_drm_kms_init() reads these by INDEX with of_clk_get(node, i)
+		 * and sizes its array from the `clock-num' property, so the list has
+		 * to match the vendor's exactly - this is what takes the display
+		 * domain out of runtime suspend.  The node used to list only
+		 * <&mmsys0_clk CLK_MM_CONFIG>, which is why MT6985's top-clock
+		 * prepare was short-circuited in the driver.
+		 */
+		clock-num = <1>;
 		clocks = <&mmsys0_clk CLK_MM_CONFIG>;
 		clock-names = "mmsys0";
 		/*
@@ -773,6 +929,18 @@
 		 * The GCE thread map below is kept: gce-client-names / gce-subsys /
 		 * gce-events are plain data read with of_parse_phandle, not suppliers.
 		 */
+		/* COROT r92: back with the real CMDQ stack, which does use it. */
+		mboxes = <&gce 0 0 CMDQ_THR_PRIO_4>,
+			 <&gce 1 0 CMDQ_THR_PRIO_4>,
+			 <&gce 2 0 CMDQ_THR_PRIO_4>,
+			 <&gce 24 0 CMDQ_THR_PRIO_4>,
+			 <&gce 3 CMDQ_NO_TIMEOUT CMDQ_THR_PRIO_2>,
+			 <&gce 5 CMDQ_NO_TIMEOUT CMDQ_THR_PRIO_2>,
+			 <&gce 25 CMDQ_NO_TIMEOUT CMDQ_THR_PRIO_2>,
+			 <&gce 7 CMDQ_NO_TIMEOUT CMDQ_THR_PRIO_2>,
+			 <&gce 4 0 CMDQ_THR_PRIO_4>,
+			 <&gce 6 0 CMDQ_THR_PRIO_3>,
+			 <&gce 22 0 CMDQ_THR_PRIO_1>;
 		gce-client-names = "CLIENT_CFG0",
 			"CLIENT_CFG1",
 			"CLIENT_CFG2",
@@ -952,8 +1120,19 @@
 			CMDQ_SYNC_TOKEN_PREBUILT_VFMT_LOCK
 			CMDQ_SYNC_TOKEN_PREBUILT_DISP_LOCK
 			CMDQ_SYNC_TOKEN_HW_TRACE_LOCK>;
-		clocks = <&clk26m>, <&clk26m>;
+		/*
+		 * COROT r92: the vendor's real GCE clocks, not clk26m stubs.
+		 * devm_clk_get(dev, "gce") was enabling a 26 MHz stub, so the
+		 * GCE's own clock gate was never opened - which is consistent with
+		 * it accepting a packet and never executing it.
+		 */
+		clocks = <&mminfra_clk CLK_MMINFRA_GCE_D>,
+			 <&mminfra_clk CLK_MMINFRA_GCE_26M>;
 		clock-names = "gce", "gce-timer";
+		/* COROT r92: the SMI the GCE fetches its command buffer through,
+		 * and the IOMMU port it is mapped on. */
+		mediatek,smi = <&smi_mdp_2x1_subcommon>;
+		iommus = <&mdp_iommu M4U_PORT_L39_GCE_DM>;
 	};
 
 
@@ -1181,5 +1360,534 @@
 				};
 			};
 		};
+	};
+
+	/*
+	 * COROT r92: the SMI / LARB / IOMMU tree, ported from the vendor DTS.
+	 *
+	 * The GCE is a DMA engine that fetches its command buffer from DRAM
+	 * through the SMI, and that is exactly where it failed: an error IRQ on
+	 * the first instruction of the packet, iova:0, no IOMMU domain, and
+	 * "failed to get mediatek,smi".  Nothing in this tree provided any of it.
+	 *
+	 * Driver constraints honoured here (read out of the tree, not guessed):
+	 *   - the compatible must be in mtk_smi_common_of_ids[] /
+	 *     mtk_smi_larb_of_ids[] or the driver dereferences NULL plat data;
+	 *   - clocks are matched BY NAME: a GEN2+has_gals common wants
+	 *     apb/smi/gals0/gals1, a GEN2_SUB_COMM+has_gals one wants apb/smi/gals0,
+	 *     a larb wants apb/smi and optionally gals;
+	 *   - a sub-common's mediatek,smi must point at an already bound device,
+	 *     so the commons are declared and bound before the sub-commons;
+	 *   - the IOMMU driver follows larb[0]'s mediatek,smi chain while the
+	 *     compatible contains "sub-common", so the common's compatible must not
+	 *     contain it and the sub-common's must;
+	 *   - every larb named in mediatek,larbs must have a bound device or the
+	 *     IOMMU returns -EPROBE_DEFER.
+	 *
+	 * Only the first mediatek,smi phandle is kept: both drivers read index 0.
+	 * power-domains are dropped on larbs and sub-commons because whether this
+	 * tree's hand-written mt6985 scpsys registers the OVLSYS/MDP/DIS
+	 * sub-domains is unproven, and the bootloader leaves them powered.
+	 * MM_INFRA is kept on the commons and the IOMMUs - r86 proved it resolves.
+	 */
+
+	smi_disp_common: smi-common@1e801000 {
+		compatible = "mediatek,mt6985-smi-common",
+			"mediatek,smi-common", "syscon";
+		reg = <0 0x1e801000 0 0x1000>;
+		mediatek,common-id = <0>;
+		power-domains = <&mt6985_scpsys MT6985_POWER_DOMAIN_MM_INFRA>;
+		clocks = <&mminfra_clk CLK_MMINFRA_GCE_D>, <&mminfra_clk CLK_MMINFRA_GCE_M>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_GCE_26M>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_mdp_common: smi-common@1e80f000 {
+		compatible = "mediatek,mt6985-smi-common",
+			"mediatek,smi-common", "syscon";
+		reg = <0 0x1e80f000 0 0x1000>;
+		mediatek,common-id = <1>;
+		power-domains = <&mt6985_scpsys MT6985_POWER_DOMAIN_MM_INFRA>;
+		clocks = <&mminfra_clk CLK_MMINFRA_GCE_D>, <&mminfra_clk CLK_MMINFRA_GCE_M>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_GCE_26M>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_sysram_common: smi-common@1e80b000 {
+		compatible = "mediatek,mt6985-smi-common",
+			"mediatek,smi-common", "syscon";
+		reg = <0 0x1e80b000 0 0x1000>;
+		mediatek,common-id = <2>;
+		power-domains = <&mt6985_scpsys MT6985_POWER_DOMAIN_MM_INFRA>;
+		clocks = <&mminfra_clk CLK_MMINFRA_GCE_D>, <&mminfra_clk CLK_MMINFRA_GCE_M>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_GCE_26M>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_dram_disp1_2x1_subcomm0: smi-sub-common@1401e000 {
+		compatible = "mediatek,mt6985-smi-sub-common",
+			"mediatek,smi-common", "syscon", "mediatek,smi-sub-common";
+		reg = <0 0x1401e000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,common-id = <13>;
+		clocks = <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>, <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>, <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>, <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_dram_disp1_2x1_subcomm1: smi-sub-common@1421e000 {
+		compatible = "mediatek,mt6985-smi-sub-common",
+			"mediatek,smi-common", "syscon", "mediatek,smi-sub-common";
+		reg = <0 0x1421e000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,common-id = <11>;
+		clocks = <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>, <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>, <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>, <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_mdp_2x1_subcommon: smi-sub-common@1e819000 {
+		compatible = "mediatek,mt6985-smi-sub-common",
+			"mediatek,smi-common", "syscon", "mediatek,smi-sub-common";
+		reg = <0 0x1e819000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,common-id = <9>;
+		clocks = <&mminfra_clk CLK_MMINFRA_GCE_D>, <&mminfra_clk CLK_MMINFRA_GCE_M>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_GCE_26M>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_sram_disp1_2x1_subcomm0: smi-sub-common@1401f000 {
+		compatible = "mediatek,mt6985-smi-sub-common",
+			"mediatek,smi-common", "syscon", "mediatek,smi-sub-common";
+		reg = <0 0x1401f000 0 0x1000>;
+		mediatek,smi = <&smi_sysram_common>;
+		mediatek,common-id = <14>;
+		clocks = <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>, <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>, <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>, <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_sram_disp1_2x1_subcomm1: smi-sub-common@1421f000 {
+		compatible = "mediatek,mt6985-smi-sub-common",
+			"mediatek,smi-common", "syscon", "mediatek,smi-sub-common";
+		reg = <0 0x1421f000 0 0x1000>;
+		mediatek,smi = <&smi_sysram_common>;
+		mediatek,common-id = <12>;
+		clocks = <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>, <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>, <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>, <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_sram_ovl_2x1_subcomm0: smi-sub-common@1440e000 {
+		compatible = "mediatek,mt6985-smi-sub-common",
+			"mediatek,smi-common", "syscon", "mediatek,smi-sub-common";
+		reg = <0 0x1440e000 0 0x1000>;
+		mediatek,smi = <&smi_sram_disp1_2x1_subcomm0>;
+		mediatek,common-id = <22>;
+		clocks = <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>, <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>, <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>, <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_sram_ovl_2x1_subcomm1: smi-sub-common@1460e000 {
+		compatible = "mediatek,mt6985-smi-sub-common",
+			"mediatek,smi-common", "syscon", "mediatek,smi-sub-common";
+		reg = <0 0x1460e000 0 0x1000>;
+		mediatek,smi = <&smi_sram_disp1_2x1_subcomm1>;
+		mediatek,common-id = <23>;
+		clocks = <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>, <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>, <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>, <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>;
+		clock-names = "apb", "smi", "gals0", "gals1";
+		status = "okay";
+	};
+
+	smi_larb0: smi-larb0@1440c000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1440c000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <0>;
+		init-power-on;
+		clocks = <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>, <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>, <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb1: smi-larb1@1440d000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1440d000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <1>;
+		init-power-on;
+		clocks = <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>, <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>, <&ovlsys_clk CLK_OVL_SMI_SUB_COMMON0>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb2: smi-larb2@1f002000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1f002000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <2>;
+		clocks = <&mdpsys_clk CLK_MDP_SMI0>, <&mdpsys_clk CLK_MDP_SMI0>, <&mdpsys_clk CLK_MDP_SMI0>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb3: smi-larb3@1f802000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1f802000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <3>;
+		clocks = <&mdpsys1_clk CLK_MDP1_SMI0>, <&mdpsys1_clk CLK_MDP1_SMI0>, <&mdpsys1_clk CLK_MDP1_SMI0>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb4: smi-larb4@1602e000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1602e000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <4>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb5: smi-larb5@1600d000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1600d000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <5>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb6: smi-larb6@16009000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x16009000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <6>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb7: smi-larb7@17010000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x17010000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <7>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb8: smi-larb8@17810000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x17810000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <8>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb9: smi-larb9@15001000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15001000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <9>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb10: smi-larb10@15120000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15120000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <10>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb11: smi-larb11@15230000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15230000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <11>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb12: smi-larb12@15340000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15340000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <12>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb13: smi-larb13@1a001000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a001000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <13>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb14: smi-larb14@1a002000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a002000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <14>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb15: smi-larb15@15140000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15140000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <15>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb16: smi-larb16@1a026000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a026000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <16>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb17: smi-larb17@1a027000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a027000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <17>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb18: smi-larb18@15006000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15006000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <18>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb19: smi-larb19@1b201000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1b201000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <19>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb20: smi-larb20@1460c000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1460c000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <20>;
+		init-power-on;
+		clocks = <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>, <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>, <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb21: smi-larb21@1460d000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1460d000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <21>;
+		init-power-on;
+		clocks = <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>, <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>, <&ovlsys1_clk CLK_OVL1_SMI_SUB_COMMON0>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb22: smi-larb22@15530000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15530000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <22>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb23: smi-larb23@15630000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15630000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <23>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb25: smi-larb25@1a02c000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a02c000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <25>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb26: smi-larb26@1a02d000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a02d000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <26>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb27: smi-larb27@1a003000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a003000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <27>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb28: smi-larb28@15720000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x15720000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <28>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb29: smi-larb29@1a004000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a004000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <29>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb30: smi-larb30@1a028000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a028000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <30>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb31: smi-larb31@1a02a000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a02a000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <31>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb32: smi-larb32@1401d000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1401d000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <32>;
+		init-power-on;
+		clocks = <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>, <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>, <&mmsys0_clk CLK_MM_SMI_SUB_COMM0>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb33: smi-larb33@1421d000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1421d000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <33>;
+		init-power-on;
+		clocks = <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>, <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>, <&mmsys1_clk CLK_MM1_SMI_SUB_COMM0>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb34: smi-larb34@1a029000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a029000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <34>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb35: smi-larb35@1a02b000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x1a02b000 0 0x1000>;
+		mediatek,smi = <&smi_disp_common>;
+		mediatek,larb-id = <35>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	smi_larb37: smi-larb37@17c10000 {
+		compatible = "mediatek,mt6985-smi-larb", "mediatek,smi-larb";
+		reg = <0 0x17c10000 0 0x1000>;
+		mediatek,smi = <&smi_mdp_common>;
+		mediatek,larb-id = <37>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>, <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "apb", "smi", "gals";
+		status = "okay";
+	};
+
+	disp_iommu: iommu@1e802000 {
+		compatible = "mediatek,mt6985-disp-iommu";
+		reg = <0 0x1e802000 0 0x1000>;
+		interrupts = <GIC_SPI 442 IRQ_TYPE_LEVEL_HIGH 0>;
+		mediatek,larbs = <&smi_larb0 &smi_larb2 &smi_larb5>, <&smi_larb6 &smi_larb7 &smi_larb10>, <&smi_larb16 &smi_larb17 &smi_larb19>, <&smi_larb21 &smi_larb22 &smi_larb23>, <&smi_larb25 &smi_larb28 &smi_larb29>, <&smi_larb31 &smi_larb33 &smi_larb34>, <&smi_larb35>;
+		power-domains = <&mt6985_scpsys MT6985_POWER_DOMAIN_MM_INFRA>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "bclk";
+		#iommu-cells = <1>;
+		status = "okay";
+	};
+
+	mdp_iommu: iommu@1e810000 {
+		compatible = "mediatek,mt6985-mdp-iommu";
+		reg = <0 0x1e810000 0 0x1000>;
+		interrupts = <GIC_SPI 447 IRQ_TYPE_LEVEL_HIGH 0>;
+		mediatek,larbs = <&smi_larb1 &smi_larb3 &smi_larb4>, <&smi_larb8 &smi_larb9 &smi_larb11>, <&smi_larb12 &smi_larb13 &smi_larb14>, <&smi_larb15 &smi_larb17 &smi_larb18>, <&smi_larb20 &smi_larb26 &smi_larb27>, <&smi_larb30 &smi_larb32 &smi_larb35>, <&smi_larb37>;
+		power-domains = <&mt6985_scpsys MT6985_POWER_DOMAIN_MM_INFRA>;
+		clocks = <&mminfra_clk CLK_MMINFRA_SMI>;
+		clock-names = "bclk";
+		#iommu-cells = <1>;
+		status = "okay";
 	};
 };

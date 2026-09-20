@@ -631,6 +631,9 @@ static int call_driver_probe(struct device *dev, const struct device_driver *drv
 	case 0:
 		break;
 	case -EPROBE_DEFER:
+		/* COROT r121: name the device that asked for the deferral */
+		pr_err("COROT-DEFER %s <- %s\n",
+		       dev_name(dev), drv ? drv->name : "(none)");
 		/* Driver requested deferred probing */
 		dev_dbg(dev, "Driver %s requests probe deferral\n", drv->name);
 		break;
@@ -651,6 +654,11 @@ static int call_driver_probe(struct device *dev, const struct device_driver *drv
 
 static int really_probe(struct device *dev, const struct device_driver *drv)
 {
+	/* COROT r121: error level on purpose - the ring only keeps pr_err, and
+	 * without this the boot stops with no trace at all. */
+	pr_err("COROT-PROBE %s <- %s\n",
+	       dev_name(dev), drv ? drv->name : "(none)");
+
 	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &&
 			   !drv->suppress_bind_attrs;
 	int ret, link_ret;

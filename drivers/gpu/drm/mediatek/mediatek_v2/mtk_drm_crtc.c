@@ -2692,6 +2692,35 @@ static unsigned int dual_comp_map_mt6983(unsigned int comp_id)
 	return ret;
 }
 
+static unsigned int dual_comp_map_mt6985(unsigned int comp_id)
+{
+	/* COROT r131: ported from the vendor's mt6985 table, keeping only the
+	 * entries whose target component id exists in this tree.  The rest of
+	 * the ovlsys-side ids (OVL4_2L..OVL7_2L, OVLSYS_WDMA2/3) are not
+	 * declared here yet, so those stay unmapped (0) and the caller falls
+	 * back to the primary pipe instead of dereferencing a NULL. */
+	switch (comp_id) {
+	case DDP_COMPONENT_OVL0:
+		return DDP_COMPONENT_OVL1;
+	case DDP_COMPONENT_OVL0_2L_NWCG:
+		return DDP_COMPONENT_OVL2_2L_NWCG;
+	case DDP_COMPONENT_OVL1_2L_NWCG:
+		return DDP_COMPONENT_OVL3_2L_NWCG;
+	case DDP_COMPONENT_OVL2_2L_NWCG:
+		return DDP_COMPONENT_OVL0_2L_NWCG;
+	case DDP_COMPONENT_OVL3_2L_NWCG:
+		return DDP_COMPONENT_OVL1_2L_NWCG;
+	case DDP_COMPONENT_AAL0:
+		return DDP_COMPONENT_AAL1;
+	case DDP_COMPONENT_WDMA0:
+		return DDP_COMPONENT_WDMA1;
+	default:
+		DDPMSG("COROT r131: comp %u has no MT6985 dual-pipe counterpart in this port\n",
+		       comp_id);
+		return 0;
+	}
+}
+
 static unsigned int dual_comp_map_mt6895(unsigned int comp_id)
 {
 	unsigned int ret = 0;
@@ -2738,6 +2767,9 @@ unsigned int dual_pipe_comp_mapping(unsigned int mmsys_id, unsigned int comp_id)
 	switch (mmsys_id) {
 	case MMSYS_MT6983:
 		ret = dual_comp_map_mt6983(comp_id);
+		break;
+	case MMSYS_MT6985:
+		ret = dual_comp_map_mt6985(comp_id);
 		break;
 	case MMSYS_MT6895:
 		ret = dual_comp_map_mt6895(comp_id);
@@ -5306,9 +5338,21 @@ static void corot_mask_display_irqs(void)
 	pr_err("COROT-IRQMASK before: dsi_inten=0x%08x dsi_intsta=0x%08x mtx0_inten=0x%08x mtx2_inten=0x%08x\n",
 	       d_en, d_sta, m0_en, m2_en);
 
+	/*
+	 * COROT r102: mask the underrun pair, NOT the whole register.
+	 *
+	 * DSI_INTEN bits: 2 = TE_RDY, 12 = BUFFER_UNDERRUN, 14 = INP_UNFINISH.
+	 * mtk_dsi_set_interrupt_enable() arms all three (0x00005004).  Writing
+	 * zero here also killed TE_RDY, and TE_RDY is what mtk_dsi_irq() turns
+	 * into mtk_crtc_vblank_irq() - i.e. the frame pacing of a command-mode
+	 * panel.  Without it the DRM never completes a frame.
+	 *
+	 * The storm this function exists to stop is the underrun pair, and those
+	 * two are still masked.
+	 */
 	if (d) {
-		writel(0, d + 0x08);		/* DSI_INTEN = 0 */
-		writel(0xffffffff, d + 0x0c);	/* clear latched */
+		writel(0x00000004, d + 0x08);	/* keep TE_RDY, mask the underrun pair */
+		writel(0x00005000, d + 0x0c);	/* clear only the latched underruns */
 	}
 	if (m0) {
 		writel(0, m0 + 0x00);
@@ -6776,6 +6820,7 @@ void mtk_crtc_dual_layer_config(struct mtk_drm_crtc *mtk_crtc,
 	struct mtk_plane_state plane_state_l;
 	struct mtk_plane_state plane_state_r;
 	struct mtk_ddp_comp *p_comp;
+	unsigned int comp_id_r;
 
 	mtk_drm_layer_dispatch_to_dual_pipe(priv->data->mmsys_id, plane_state,
 		&plane_state_l, &plane_state_r,
@@ -6784,7 +6829,26 @@ void mtk_crtc_dual_layer_config(struct mtk_drm_crtc *mtk_crtc,
 	if (plane_state->comp_state.comp_id == 0)
 		plane_state_r.comp_state.comp_id = 0;
 
-	p_comp = priv->ddp_comp[dual_pipe_comp_mapping(priv->data->mmsys_id, comp->id)];
+	/*
+	 * COROT r131: this dereference killed the kernel.
+	 *
+	 * dual_pipe_comp_mapping() returned 0 for MT6985 (no case for this SoC),
+	 * so p_comp became priv->ddp_comp[0] - DDP_COMPONENT_OVL0, which has no
+	 * DT node on corot - and the very next call oopsed:
+	 *     pc : mtk_crtc_dual_layer_config+0xb4/0x16c   x0 = 0
+	 *     mtk_crtc_restore_plane_setting <- mtk_drm_crtc_enable <- fbcon
+	 * The right-hand pipe components (the ovlsys OVLs, the second DSC and
+	 * MUTEX) are not ported yet, so until they are, configure the primary
+	 * pipe only and say exactly which counterpart was missing.
+	 */
+	comp_id_r = dual_pipe_comp_mapping(priv->data->mmsys_id, comp->id);
+	if (comp_id_r == 0 || priv->ddp_comp[comp_id_r] == NULL) {
+		pr_err_ratelimited("COROT r131: no dual-pipe counterpart for comp %u (mapped %u) - primary pipe only\n",
+				   comp->id, comp_id_r);
+		mtk_ddp_comp_layer_config(comp, idx, &plane_state_l, cmdq_handle);
+		return;
+	}
+	p_comp = priv->ddp_comp[comp_id_r];
 	mtk_ddp_comp_layer_config(p_comp, idx,
 				&plane_state_r, cmdq_handle);
 	DDPINFO("%s+ comp_id:%d, comp_id:%d\n",
