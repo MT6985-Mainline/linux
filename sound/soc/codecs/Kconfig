@@ -2278,6 +2278,12 @@ config SND_SOC_TDA7419
 	depends on I2C
 	select REGMAP_I2C
 
+config SND_SOC_TFA98XX
+	tristate
+	help
+	  Core support for the NXP/Goodix TFA98xx smart amp family
+	  (non-DSP solution).
+
 config SND_SOC_TFA9879
 	tristate "NXP Semiconductors TFA9879 amplifier"
 	depends on I2C
@@ -2836,6 +2842,20 @@ config SND_SOC_MT6359_ACCDET
 	  for ASoC codec soc-jack detection mechanism.
 	  Select N if you don't have jack on board.
 
+config SND_SOC_MT6368
+	tristate "MediaTek MT6368 Codec"
+	help
+	  Enable support for the platform which uses MT6368 as
+	  audio codec device.
+
+config SND_SOC_TFA9874
+	tristate "Goodix/TFA TFA9874 smart amplifier"
+	depends on I2C
+	select SND_SOC_TFA98XX
+	help
+	  Goodix-branded TFA9874 smart speaker amplifiers as used on
+	  Xiaomi Redmi Note 11T Pro (xaga), driven over I2S without DSP.
+
 config SND_SOC_MT6660
 	tristate "Mediatek MT6660 Speaker Amplifier"
 	depends on I2C
@@ -2921,3 +2941,12 @@ config SND_SOC_LPASS_TX_MACRO
 	tristate "Qualcomm TX Macro in LPASS(Low Power Audio SubSystem)"
 
 endmenu
+
+config SND_SOC_MT6368_ACCDET
+	tristate "MediaTek MT6368 ACCDET driver"
+	depends on SND_SOC_MT6368
+	depends on MFD_MTK_SPMI_PMIC
+	select SND_SOC_JACK
+	help
+	  ACCDET means Accessory Detection technology,
+	  MediaTek develop it for ASoC codec soc-jack

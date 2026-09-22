@@ -77,6 +77,17 @@ obj-$(CONFIG_COMPAT_VDSO)		+= vdso32-wrap.o
 $(obj)/vdso-wrap.o: $(obj)/vdso/vdso.so
 $(obj)/vdso32-wrap.o: $(obj)/vdso32/vdso.so
 
+# COROT: embed the board DTB into the kernel image so setup.c can override
+# LK's FDT with our own device tree. Keep it in .rodata so
+# initial_boot_params stays valid after boot.
+obj-$(CONFIG_OF) += corot-dtb.o
+$(srctree)/arch/arm64/boot/dts/mediatek/mt6985-xiaomi-corot.dtb: FORCE
+	$(Q)$(MAKE) -C $(srctree) ARCH=arm64 LLVM=1 mediatek/mt6985-xiaomi-corot.dtb
+$(obj)/corot-dtb.o: $(srctree)/arch/arm64/boot/dts/mediatek/mt6985-xiaomi-corot.dtb FORCE
+	$(call if_changed,objcopy)
+OBJCOPYFLAGS_corot-dtb.o := -I binary -O elf64-littleaarch64 -B aarch64 \
+	--rename-section .data=.rodata,alloc,readonly
+
 obj-y					+= probes/
 obj-y					+= head.o
 always-$(KBUILD_BUILTIN)		+= vmlinux.lds

@@ -847,6 +847,15 @@ static const struct gce_plat gce_plat_mt8196 = {
 	.gce_num = 2
 };
 
+/* MT6985 (corot): same GCE generation as mt8188, single instance.
+ * Display uses threads up to 25, so 32 threads like mt8188. */
+static const struct gce_plat gce_plat_mt6985 = {
+	.thread_nr = 32,
+	.shift = 3,
+	.control_by_sw = true,
+	.gce_num = 1
+};
+
 static const struct of_device_id cmdq_of_ids[] = {
 	{.compatible = "mediatek,mt6779-gce", .data = (void *)&gce_plat_mt6779},
 	{.compatible = "mediatek,mt8173-gce", .data = (void *)&gce_plat_mt8173},

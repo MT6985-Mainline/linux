@@ -19,6 +19,29 @@
 #include "mtu3_dr.h"
 #include "mtu3_debug.h"
 
+/* Some MT6985 boards have no controller VBUS detect pin; VBUS is
+ * managed by the PMIC, so force the device-side VBUS-valid state. */
+void ssusb_set_force_vbus(struct ssusb_mtk *ssusb, bool vbus_on)
+{
+	u32 u2ctl;
+	u32 misc;
+
+	if (!ssusb->force_vbus)
+		return;
+
+	u2ctl = mtu3_readl(ssusb->ippc_base, SSUSB_U2_CTRL(0));
+	misc = mtu3_readl(ssusb->mac_base, U3D_MISC_CTRL);
+	if (vbus_on) {
+		u2ctl &= ~SSUSB_U2_PORT_OTG_SEL;
+		misc |= VBUS_FRC_EN | VBUS_ON;
+	} else {
+		u2ctl |= SSUSB_U2_PORT_OTG_SEL;
+		misc &= ~(VBUS_FRC_EN | VBUS_ON);
+	}
+	mtu3_writel(ssusb->ippc_base, SSUSB_U2_CTRL(0), u2ctl);
+	mtu3_writel(ssusb->mac_base, U3D_MISC_CTRL, misc);
+}
+
 /* u2-port0 should be powered on and enabled; */
 int ssusb_check_clocks(struct ssusb_mtk *ssusb, u32 ex_clks)
 {
@@ -154,6 +177,19 @@ static int ssusb_rscs_init(struct ssusb_mtk *ssusb)
 		goto phy_err;
 	}
 
+	if (ssusb->dr_mode == USB_DR_MODE_PERIPHERAL) {
+		int i;
+
+		for (i = 0; i < ssusb->num_phys; i++) {
+			ret = phy_set_mode(ssusb->phys[i], PHY_MODE_USB_DEVICE);
+			if (ret) {
+				dev_err(ssusb->dev, "failed to set PHY %d to device mode: %d\n",
+					i, ret);
+				goto phy_err;
+			}
+		}
+	}
+
 	return 0;
 
 phy_err:
@@ -272,6 +308,7 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 		ssusb->dr_mode = USB_DR_MODE_OTG;
 
 	of_property_read_u32(node, "mediatek,u3p-dis-msk", &ssusb->u3p_dis_msk);
+	ssusb->force_vbus = of_property_read_bool(node, "mediatek,force-vbus");
 
 	if (ssusb->dr_mode == USB_DR_MODE_PERIPHERAL)
 		goto out;
@@ -322,6 +359,46 @@ out:
 		 ssusb->u2p_dis_msk, ssusb->u3p_dis_msk);
 
 	return 0;
+}
+
+/*
+ * corot USB bring-up evidence: the host never sees the gadget, so record what
+ * the controller itself believes.  U3D_POWER_MANAGEMENT SOFT_CONN is the D+
+ * pull-up, U3D_DEVICE_CONTROL DC_SESSION is the session state the controller
+ * derived from the PHY, and SSUSB_U2_CTRL(0) carries the VBUSVALID / OTG_SEL
+ * / PDN / DIS bits the port is configured with.
+ */
+static struct ssusb_mtk *corot_usb;
+static struct delayed_work corot_usb_dw;
+static int corot_usb_dumps;
+
+static void corot_usb_dump_work(struct work_struct *work)
+{
+	struct ssusb_mtk *ssusb = corot_usb;
+	u32 pm, dc, misc, u2ctl, pw1, pw2;
+
+	if (!ssusb || !ssusb->mac_base || !ssusb->ippc_base)
+		return;
+
+	pm = mtu3_readl(ssusb->mac_base, U3D_POWER_MANAGEMENT);
+	dc = mtu3_readl(ssusb->mac_base, U3D_DEVICE_CONTROL);
+	misc = mtu3_readl(ssusb->mac_base, U3D_MISC_CTRL);
+	u2ctl = mtu3_readl(ssusb->ippc_base, SSUSB_U2_CTRL(0));
+	pw1 = mtu3_readl(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL1);
+	pw2 = mtu3_readl(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL2);
+
+	pr_err("COROT-USBREG[%d] pm=0x%08x soft_conn=%u hs_en=%u dc=0x%08x session=%u misc=0x%08x vbus_frc=%u vbus_on=%u u2ctl0=0x%08x vbusvalid=%u otg_sel=%u host=%u pdn=%u dis=%u pw_ctrl1=0x%08x pw_ctrl2=0x%08x\n",
+		corot_usb_dumps, pm,
+		!!(pm & SOFT_CONN), !!(pm & HS_ENABLE),
+		dc, !!(dc & DC_SESSION),
+		misc, !!(misc & VBUS_FRC_EN), !!(misc & VBUS_ON),
+		u2ctl, !!(u2ctl & SSUSB_U2_PORT_VBUSVALID),
+		!!(u2ctl & SSUSB_U2_PORT_OTG_SEL), !!(u2ctl & SSUSB_U2_PORT_HOST),
+		!!(u2ctl & SSUSB_U2_PORT_PDN), !!(u2ctl & SSUSB_U2_PORT_DIS),
+		pw1, pw2);
+
+	if (++corot_usb_dumps < 8)
+		schedule_delayed_work(&corot_usb_dw, msecs_to_jiffies(4000));
 }
 
 static int mtu3_probe(struct platform_device *pdev)
@@ -433,6 +510,16 @@ static int mtu3_probe(struct platform_device *pdev)
 	device_enable_async_suspend(dev);
 	pm_runtime_put_autosuspend(dev);
 	pm_runtime_forbid(dev);
+
+	/*
+	 * COROT r64: the USB register dump is deliberately NOT scheduled any
+	 * more.  It fires every 4 s starting 5 s after probe, and reading a
+	 * runtime-suspended MTU3 block stalls the interconnect - that is the
+	 * hard hang (and watchdog reset) seen 9.4 s into most boots.  The dump
+	 * belonged to the USB bring-up work, not to the display, so it goes.
+	 */
+	corot_usb = ssusb;
+	(void)corot_usb_dump_work;
 
 	return 0;
 
