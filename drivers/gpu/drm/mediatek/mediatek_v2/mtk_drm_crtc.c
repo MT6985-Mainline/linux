@@ -23,6 +23,7 @@
 #include <uapi/drm/mi_disp.h>
 #include <drm/drm_vblank.h>
 #include <linux/dma-mapping.h>
+#include <linux/timer.h> /* r273 */
 #include <linux/delay.h>
 #include <drm/drm_crtc.h>
 #include <linux/kmemleak.h>
@@ -2692,35 +2693,6 @@ static unsigned int dual_comp_map_mt6983(unsigned int comp_id)
 	return ret;
 }
 
-static unsigned int dual_comp_map_mt6985(unsigned int comp_id)
-{
-	/* COROT r131: ported from the vendor's mt6985 table, keeping only the
-	 * entries whose target component id exists in this tree.  The rest of
-	 * the ovlsys-side ids (OVL4_2L..OVL7_2L, OVLSYS_WDMA2/3) are not
-	 * declared here yet, so those stay unmapped (0) and the caller falls
-	 * back to the primary pipe instead of dereferencing a NULL. */
-	switch (comp_id) {
-	case DDP_COMPONENT_OVL0:
-		return DDP_COMPONENT_OVL1;
-	case DDP_COMPONENT_OVL0_2L_NWCG:
-		return DDP_COMPONENT_OVL2_2L_NWCG;
-	case DDP_COMPONENT_OVL1_2L_NWCG:
-		return DDP_COMPONENT_OVL3_2L_NWCG;
-	case DDP_COMPONENT_OVL2_2L_NWCG:
-		return DDP_COMPONENT_OVL0_2L_NWCG;
-	case DDP_COMPONENT_OVL3_2L_NWCG:
-		return DDP_COMPONENT_OVL1_2L_NWCG;
-	case DDP_COMPONENT_AAL0:
-		return DDP_COMPONENT_AAL1;
-	case DDP_COMPONENT_WDMA0:
-		return DDP_COMPONENT_WDMA1;
-	default:
-		DDPMSG("COROT r131: comp %u has no MT6985 dual-pipe counterpart in this port\n",
-		       comp_id);
-		return 0;
-	}
-}
-
 static unsigned int dual_comp_map_mt6895(unsigned int comp_id)
 {
 	unsigned int ret = 0;
@@ -2767,9 +2739,6 @@ unsigned int dual_pipe_comp_mapping(unsigned int mmsys_id, unsigned int comp_id)
 	switch (mmsys_id) {
 	case MMSYS_MT6983:
 		ret = dual_comp_map_mt6983(comp_id);
-		break;
-	case MMSYS_MT6985:
-		ret = dual_comp_map_mt6985(comp_id);
 		break;
 	case MMSYS_MT6895:
 		ret = dual_comp_map_mt6895(comp_id);
@@ -5338,21 +5307,9 @@ static void corot_mask_display_irqs(void)
 	pr_err("COROT-IRQMASK before: dsi_inten=0x%08x dsi_intsta=0x%08x mtx0_inten=0x%08x mtx2_inten=0x%08x\n",
 	       d_en, d_sta, m0_en, m2_en);
 
-	/*
-	 * COROT r102: mask the underrun pair, NOT the whole register.
-	 *
-	 * DSI_INTEN bits: 2 = TE_RDY, 12 = BUFFER_UNDERRUN, 14 = INP_UNFINISH.
-	 * mtk_dsi_set_interrupt_enable() arms all three (0x00005004).  Writing
-	 * zero here also killed TE_RDY, and TE_RDY is what mtk_dsi_irq() turns
-	 * into mtk_crtc_vblank_irq() - i.e. the frame pacing of a command-mode
-	 * panel.  Without it the DRM never completes a frame.
-	 *
-	 * The storm this function exists to stop is the underrun pair, and those
-	 * two are still masked.
-	 */
 	if (d) {
-		writel(0x00000004, d + 0x08);	/* keep TE_RDY, mask the underrun pair */
-		writel(0x00005000, d + 0x0c);	/* clear only the latched underruns */
+		writel(0, d + 0x08);		/* DSI_INTEN = 0 */
+		writel(0xffffffff, d + 0x0c);	/* clear latched */
 	}
 	if (m0) {
 		writel(0, m0 + 0x00);
@@ -5508,6 +5465,8 @@ static void corot_color_seq(unsigned long ticks)
 static const unsigned int corot_periods[] = { 16 };
 #define COROT_PERIOD_N		ARRAY_SIZE(corot_periods)
 #define COROT_HOLD_MS		10	/* sweep step length, seconds */
+#define COROT_R308_MIN_MS 33	/* COROT r308: 30 Hz floor */
+static struct mtk_drm_crtc *corot_r309_crtc;	/* COROT r309 */
 #define COROT_RETRY_MS		2	/* re-check the engine every 2 ms */
 #define COROT_HELD_MAX		200	/* 400 ms safety valve */
 #define COROT_OVL_MAX_MS	100	/* give up waiting for the OVL after 100 ms */
@@ -5672,6 +5631,10 @@ static void corot_phase_tick(void)
  * OVL background colour is emitted, so a phase that fixes the truncation
  * fills the WHOLE screen with its colour.
  */
+static void corot_r307_xbar(void);	/* COROT r307 */
+static void corot_r312_ruler(void);	/* COROT r312 */
+static void corot_r301_fbcheck(void);
+static void corot_r299_blank(void);	/* COROT r299 forward decl */
 static const u32 corot_p48_bg[6] = {
 	0x00ff0000,	/* 0 red     - baseline */
 	0x0000ff00,	/* 1 green   - OVL ROI height 1000 */
@@ -5683,6 +5646,7 @@ static const u32 corot_p48_bg[6] = {
 
 /* provided by drivers/gpu/drm/panel/panel-m12-min.c */
 extern int corot_m12_apply_fps(unsigned int fps);
+extern int corot_r265_send_cmd(const u8 *buf, unsigned int len);	/* r289 */
 extern int corot_m12_apply_fps_tag(unsigned int fps, const char *tag);
 
 /* the panel refresh rate each phase asks for */
@@ -5702,6 +5666,52 @@ static void corot_fps_work(struct work_struct *w)
 	corot_m12_apply_fps(corot_fps_want);
 }
 static DECLARE_WORK(corot_fps_wq, corot_fps_work);
+
+/* COROT r269: pause flag for the frame-push timer (see fps_delayed). */
+static bool corot_ftrig_pause;
+
+/* COROT r266: deliver the 60 Hz table once streaming is up -- the
+ * r168 re-arm sender only gets CMD_DONE with the link live, and
+ * the host read path (FCON readback) stalls, so raw mode is set
+ * around the delivery and the panel driver skips the readback. */
+static void corot_fps_delayed(struct work_struct *w)
+{
+	extern bool corot_r265_active;
+
+	pr_err("COROT-FPSR r273: stopping frame push, delivering 60 Hz table\n");
+	corot_r301_fbcheck();
+	corot_r312_ruler();	/* COROT r312: colour ruler on the panel */
+	corot_r307_xbar();	/* COROT r307: route the pixels through the DSC */
+	/* COROT r300: r299's blank removed -- it ran after the console test text
+	 * was printed and would erase it (and its word count was 4x short). */
+	/* COROT r289: full-screen panel window, one full-height transfer. */
+	{
+		static const u8 col[] = { 0x2a, 0x00, 0x00, 0x04, 0xc3 };
+		static const u8 page[] = { 0x2b, 0x00, 0x00, 0x0a, 0x97 };
+		int rc1 = corot_r265_send_cmd(col, sizeof(col));
+		int rc2 = corot_r265_send_cmd(page, sizeof(page));
+
+		if (corot_ovl_map)
+			writel(0, corot_ovl_map + 0x3c);
+		pr_err("COROT r289 window: FULL pages=0..2711 col=0..1219 rc=%d/%d ovl_off=0x%08x\n",
+		       rc1, rc2, corot_ovl_map ? readl(corot_ovl_map + 0x3c) : 0);
+	}
+	timer_delete_sync(&corot_ftrig_timer);	/* r273: no timer/prepare concurrency */
+	msleep(60);	/* let the in-flight window (<= 7.1 ms) drain */
+	{
+		extern void corot_m12_dsi_ready(bool on);
+
+		corot_m12_dsi_ready(true);	/* r267: the r89 gate needs this */
+	}
+	corot_r265_active = true;
+	corot_m12_apply_fps_tag(60, "stream");
+	corot_r265_active = false;
+	msleep(50);	/* panel re-times at 60 Hz */
+	corot_ftrig_timer.expires = jiffies;
+	add_timer(&corot_ftrig_timer);
+	pr_err("COROT-FPSR r273: frame push resumed at 60 Hz\n");
+}
+static DECLARE_DELAYED_WORK(corot_fps_dw, corot_fps_delayed);
 #define COROT_P48_N	6
 #define COROT_P48_MS	12000
 
@@ -5710,8 +5720,19 @@ static unsigned int corot_p48;
 /* what the tick has always done: INTEN=0, clear INTSTA, START 0->1 */
 static void corot_dsi_trigger_min(void)
 {
+	static unsigned int r291_n;
+
 	if (!corot_dsi_map)
 		return;
+	/* COROT r291: the DDP/CMDQ timing path writes the DSC "virtual" height
+	 * (half the panel) into VACT_NL, so each transfer only covered the top
+	 * half.  Override it here -- immediately before START, so nothing can
+	 * overwrite it before the transfer runs. */
+	writel(2712, corot_dsi_map + 0x2c);
+	if ((r291_n++ % 300) == 0)
+		pr_err("COROT r291: forced VACT_NL=0x%08x (want 0x00000a98) size_con=0x%08x psctrl=0x%08x\n",
+		       readl(corot_dsi_map + 0x2c), readl(corot_dsi_map + 0x38),
+		       readl(corot_dsi_map + 0x1c));
 	writel(0, corot_dsi_map + 0x08);
 	writel(0xffffffff, corot_dsi_map + 0x0c);
 	writel(0, corot_dsi_map + 0x00);
@@ -5964,6 +5985,59 @@ static void corot_ftrig_tick(struct timer_list *t)
 	}
 
 	/* r51 wants ROI and rwt at their baseline values */
+	/* COROT r295: full-height transfer.  The DDP/CMDQ timing path programs the
+	 * DSI for the DSC "virtual" (half-panel) frame, so every transfer stopped at
+	 * 1398 lines (1356 + porches) and the bottom half of the panel was never
+	 * written.  r280/r281 proved that writes here (immediately before the
+	 * trigger) stick and take effect -- r290/r291 were in paths that never ran.
+	 * Restore the full-height values. */
+	{
+		static unsigned int r295_n;
+
+		/* COROT r310: never checked before -- the DSI's own vertical timing.
+		 * dsi_us max = 7100 us = a 144 Hz frame, and 7.1 ms at ~197 lines/ms
+		 * is the 1398-line transfer we keep seeing.  Force the mode's 60 Hz
+		 * values (VSA 10, VBP 54, VFP 10; 10+54+2712+10 = vtotal 2786). */
+		writel(10, corot_dsi_map + 0x20);		/* VSA_NL */
+		writel(54, corot_dsi_map + 0x24);		/* VBP_NL */
+		writel(10, corot_dsi_map + 0x28);		/* VFP_NL */
+		writel(2712, corot_dsi_map + 0x2c);		/* VACT_NL */
+		writel(0x0a980197, corot_dsi_map + 0x38);	/* SIZE_CON: h=2712, w=1220 */
+		writel(0x00059c0b, corot_dsi_map + 0x410);	/* TX_BUF_RW_TIMES for 2712 */
+		if ((r295_n++ % 300) == 0)
+			pr_err("COROT r295: VACT_NL=0x%08x SIZE_CON=0x%08x rwt=0x%08x psctrl=0x%08x (want a98/0a980197/59c0b)\n",
+			       readl(corot_dsi_map + 0x2c), readl(corot_dsi_map + 0x38),
+			       readl(corot_dsi_map + 0x410), readl(corot_dsi_map + 0x1c));
+	}
+	/* COROT r296: leave DSC packet mode.  psctrl read 0x2c0504c4 in every run
+	 * (PS_WC=1220, PS_SEL=5 = DSC compressed) because the vendor branch in
+	 * mtk_dsi_set_size() hard-codes SIZE_CON low = 407; the DSI therefore
+	 * stopped at 1398 lines no matter what VACT_NL said.  Use the driver's
+	 * uncompressed RGB888 configuration instead: PS_SEL=3, PS_WC=1220*3. */
+	{
+		static unsigned int r296_n;
+
+		/* COROT r297: keep the extent (SIZE_CON low = 1220 instead of the
+		 * vendor's hard-coded 407), but put the packet format back to the
+		 * original DSC packing -- r296's RGB888 change made both halves noise
+		 * while the extent fix itself is what un-froze the bottom half. */
+		/* COROT r303: vendor DSC packet sizing for TWO slices.  The tree's
+		 * Xiaomi #else branch overwrites ps_wc with 1220 and size low with a
+		 * hard-coded 407, leaving the DSI stream inconsistent with the DSC's
+		 * two-slice output -- which the panel decodes as garbage. */
+		/* COROT r304: back to the r302 values -- this is the configuration in
+		 * which the DSC was alive (dsc=0x1) and content was visible live. */
+		/* COROT r307: leave PSCTRL/SIZE_CON to the driver.  With the DSC now in
+		 * the path the packet size must be the DSC's (the vendor/Xiaomi values
+		 * ps_wc=1220, size low=407); forcing our uncompressed values here kept
+		 * the link bandwidth-limited. */
+		pr_err("COROT r307: driver psctrl=0x%08x size_con=0x%08x (left alone)\n",
+		       readl(corot_dsi_map + 0x1c), readl(corot_dsi_map + 0x38));
+		if ((r296_n++ % 300) == 0)
+			pr_err("COROT r307: PSCTRL=0x%08x SIZE_CON=0x%08x VACT=0x%08x (driver values now)\n",
+			       readl(corot_dsi_map + 0x1c), readl(corot_dsi_map + 0x38),
+			       readl(corot_dsi_map + 0x2c));
+	}
 	corot_dsi_trigger_min();	/* INTEN=0, INTSTA clear, START 0->1 */
 
 	/*
@@ -5986,8 +6060,29 @@ report:
 		       corot_dsi_map ? readl(corot_dsi_map + 0x0c) : 0,
 		       corot_dsc_map ? readl(corot_dsc_map + 0x08) : 0,
 		       corot_dsi_map ? readl(corot_dsi_map + 0x10) : 0);
+	if (corot_ovl_map)
+		pr_err("COROT r306 geom: ovl roi=0x%08x off=0x%08x l0=0x%08x msb=0x%08x | dsi vact=0x%08x size=0x%08x psctrl=0x%08x\n",
+		       readl(corot_ovl_map + 0x38), readl(corot_ovl_map + 0x3c),
+		       readl(corot_ovl_map + 0xf40), readl(corot_ovl_map + 0xf44),
+		       corot_dsi_map ? readl(corot_dsi_map + 0x2c) : 0,
+		       corot_dsi_map ? readl(corot_dsi_map + 0x38) : 0,
+		       corot_dsi_map ? readl(corot_dsi_map + 0x1c) : 0);
+	if (corot_dsi_map)
+		pr_err("COROT r310 dsi timing: vsa=%u vbp=%u vfp=%u vact=%u (want 10/54/10/2712)\n",
+		       readl(corot_dsi_map + 0x20), readl(corot_dsi_map + 0x24),
+		       readl(corot_dsi_map + 0x28), readl(corot_dsi_map + 0x2c));
+	if (corot_r309_crtc)
+		pr_err("COROT r309 heights: crtc.mode=%u adjusted=%u (want 2712/2712)\n",
+		       corot_r309_crtc->base.mode.vdisplay,
+		       corot_r309_crtc->base.state ? corot_r309_crtc->base.state->adjusted_mode.vdisplay : 0);
 	}
 
+	/* COROT r308: the chain only reaches ~1398 lines in a 16.6 ms frame, so
+	 * nothing is being truncated -- the OVL simply runs out of frame time.
+	 * Floor the interval at 30 Hz (33 ms) to see whether a full 2712-line frame
+	 * then arrives. */
+	if (delay < COROT_R308_MIN_MS)
+		delay = COROT_R308_MIN_MS;
 	mod_timer(&corot_ftrig_timer, jiffies + msecs_to_jiffies(delay));
 }
 
@@ -6051,8 +6146,12 @@ static void corot_ovl_scan_simplefb(void)
 		       readl(o + 0xf40), (unsigned int)COROT_SIMPLEFB_PA,
 		       readl(o + 0x30), readl(o + 0x38), readl(o + 0x44),
 		       readl(o + 0x0c), readl(o + 0x2c));
-		writel(0, o + 0xf44);			/* ADDR_MSB */
-		writel((unsigned int)COROT_SIMPLEFB_PA, o + 0xf40);
+		/* COROT r302: do NOT override the layer address.  The driver points
+		 * the OVL at mtk_fb_get_dma(fb) -- the buffer fbcon actually draws
+		 * into (mediatekdrmfb).  Forcing simplefb here kept the panel on stale
+		 * handoff content while the console painted elsewhere. */
+		pr_err("COROT r302: leaving OVL layer address at 0x%08x/0x%08x (driver's fb)\n",
+		       readl(o + 0xf40), readl(o + 0xf44));
 	}
 	iounmap(o);
 }
@@ -6109,6 +6208,106 @@ static void corot_fb_probe(const char *tag)
 #define COROT_MT6985_DISPSYS_BYPASS_MUX_SHADOW	0xc30
 #define COROT_MT6985_OVLSYS_BYPASS_MUX_SHADOW	0xf00
 #define COROT_MT6985_OVLSYS_CROSSBAR_CON	0xf0c
+
+/* COROT r299: blank the whole framebuffer to fbcon's background colour.  The
+ * display path works now (r298 put the DSC back in the path: dsc went from
+ * 0x9 = ZERO_FIFO to 0x1), so what the panel shows from here on is the actual
+ * framebuffer content -- and the top half still holds old test-fill garbage. */
+/* COROT r301: read (not write) the buffer the display scans, so we can tell
+ * "nothing was ever drawn here" from "drawn but never displayed". */
+static void corot_r301_fbcheck(void)
+{
+	void __iomem *fb;
+	unsigned int i, nz = 0;
+
+	fb = ioremap(COROT_SIMPLEFB_PA, 1220u * 2712u * 4u);
+	if (!fb) {
+		pr_err("COROT r301: fb ioremap failed\n");
+		return;
+	}
+	for (i = 0; i < (1220u * 2712u); i++)
+		if (readl(fb + i * 4u))
+			nz++;
+	pr_err("COROT r301: scanout simplefb nonzero=%u/%u words | head=%08x %08x %08x %08x | mid=%08x %08x\n",
+	       nz, 1220u * 2712u,
+	       readl(fb + 0x00000), readl(fb + 0x00004),
+	       readl(fb + 0x01000), readl(fb + 0x01004),
+	       readl(fb + (1220u * 1356u * 4u)), readl(fb + (1220u * 1356u * 4u) + 4u));
+	iounmap(fb);
+}
+
+/* COROT r307: program the crossbars so the pixels actually travel through the
+ * DSC.  The boot-time xbar code bypasses every crossbar (0xc30 |= 0xff0001),
+ * which leaves the DSC out of the path -- hence the uncompressed ~410 MB/s
+ * ceiling and the 1398-line frame. */
+static void corot_r307_xbar(void)
+{
+	void __iomem *b = ioremap(0x14000000, 0x1000);
+
+	if (!b)
+		return;
+	writel(readl(b + 0xc30) & ~0xff0001u, b + 0xc30);	/* un-bypass */
+	writel(readl(b + 0xf74) | BIT(2), b + 0xf74);	/* DLI_RELAY0 -> PQ_OUT_CB3 */
+	writel(readl(b + 0xfa4) | BIT(1), b + 0xfa4);	/* PQ_IN_CB2 -> PANEL_COMP_OUT_CB1 */
+	writel(readl(b + 0xf4c) | BIT(3), b + 0xf4c);	/* PQ_OUT_CB1 -> COMP_OUT_CB3 */
+	writel(readl(b + 0xf48) | BIT(1), b + 0xf48);	/* POSTALIGN0 -> DSC0 */
+	writel(readl(b + 0xea4) | BIT(0), b + 0xea4);	/* DSC0 -> MERGE0_OUT_CB0 */
+	writel(readl(b + 0xf0c) | BIT(0), b + 0xf0c);	/* COMP_OUT_CB0 -> DSI0 */
+	pr_err("COROT r307 xbar: C30=0x%08x f48=0x%08x ea4=0x%08x f0c=0x%08x (DSC in path)\n",
+	       readl(b + 0xc30), readl(b + 0xf48), readl(b + 0xea4), readl(b + 0xf0c));
+	iounmap(b);
+}
+
+/* COROT r312: paint a colour ruler into the buffer the display scans, so the
+ * panel itself reports how many lines the hardware really refreshes. */
+static void corot_r312_ruler(void)
+{
+	static const u32 band[7] = {
+		0x00ff0000, 0x0000ff00, 0x00ff8000, 0x00ffff00,
+		0x0000ffff, 0x000000ff, 0x00ff00ff
+	};
+	void __iomem *o, *fb;
+	u32 pa;
+	unsigned int y, x;
+
+	if (!corot_ovl_map)
+		return;
+	o = corot_ovl_map;
+	pa = readl(o + 0xf40);
+	if (!pa)
+		return;
+	fb = ioremap(pa, 1220u * 2712u * 4u);
+	if (!fb)
+		return;
+
+	for (y = 0; y < 2712u; y++) {
+		u32 c = band[(y / 128u) % 7u];
+
+		if (y == 1398u)
+			c = 0x00ff00ff;	/* bright magenta: where every frame stops */
+		else if (y == 2711u)
+			c = 0x00ffffff;	/* white: the very bottom */
+		for (x = 0; x < 1220u; x++)
+			writel(c, fb + (y * 1220u + x) * 4u);
+	}
+	iounmap(fb);
+}
+
+static void corot_r299_blank(void)
+{
+	void __iomem *fb;
+	unsigned int i, n = (1220u * 2712u) / 4u;
+
+	fb = ioremap(COROT_SIMPLEFB_PA, 1220u * 2712u * 4u);
+	if (!fb) {
+		pr_err("COROT r299: fb ioremap failed\n");
+		return;
+	}
+	for (i = 0; i < n; i++)
+		writel(0x00000000, fb + i * 4u);
+	iounmap(fb);
+	pr_err("COROT r299: framebuffer blanked to black (%u words)\n", n);
+}
 
 static void corot_mt6985_xbar(const char *tag)
 {
@@ -6425,7 +6624,13 @@ void trigger_without_cmdq(struct drm_crtc *crtc)
 	mdelay(20);
 	corot_dsi_state("after-ftrig");
 	/* COROT: and keep it going every frame from now on */
+	corot_r309_crtc = mtk_crtc;	/* COROT r309: for the height print */
 	corot_ftrig_start();
+
+	/* COROT r266: 3 s in, switch the panel to 60 Hz so the frame
+	 * window (~16.6 ms) covers a full 2712-line frame (~13.7 ms). */
+	pr_err("COROT-FPSR r275: delivery scheduled for +3 s\n");
+	queue_delayed_work(system_unbound_wq, &corot_fps_dw, 3 * HZ);
 
 	/* COROT: scan the memory fbcon actually paints */
 	corot_ovl_scan_simplefb();
@@ -6820,7 +7025,6 @@ void mtk_crtc_dual_layer_config(struct mtk_drm_crtc *mtk_crtc,
 	struct mtk_plane_state plane_state_l;
 	struct mtk_plane_state plane_state_r;
 	struct mtk_ddp_comp *p_comp;
-	unsigned int comp_id_r;
 
 	mtk_drm_layer_dispatch_to_dual_pipe(priv->data->mmsys_id, plane_state,
 		&plane_state_l, &plane_state_r,
@@ -6829,26 +7033,7 @@ void mtk_crtc_dual_layer_config(struct mtk_drm_crtc *mtk_crtc,
 	if (plane_state->comp_state.comp_id == 0)
 		plane_state_r.comp_state.comp_id = 0;
 
-	/*
-	 * COROT r131: this dereference killed the kernel.
-	 *
-	 * dual_pipe_comp_mapping() returned 0 for MT6985 (no case for this SoC),
-	 * so p_comp became priv->ddp_comp[0] - DDP_COMPONENT_OVL0, which has no
-	 * DT node on corot - and the very next call oopsed:
-	 *     pc : mtk_crtc_dual_layer_config+0xb4/0x16c   x0 = 0
-	 *     mtk_crtc_restore_plane_setting <- mtk_drm_crtc_enable <- fbcon
-	 * The right-hand pipe components (the ovlsys OVLs, the second DSC and
-	 * MUTEX) are not ported yet, so until they are, configure the primary
-	 * pipe only and say exactly which counterpart was missing.
-	 */
-	comp_id_r = dual_pipe_comp_mapping(priv->data->mmsys_id, comp->id);
-	if (comp_id_r == 0 || priv->ddp_comp[comp_id_r] == NULL) {
-		pr_err_ratelimited("COROT r131: no dual-pipe counterpart for comp %u (mapped %u) - primary pipe only\n",
-				   comp->id, comp_id_r);
-		mtk_ddp_comp_layer_config(comp, idx, &plane_state_l, cmdq_handle);
-		return;
-	}
-	p_comp = priv->ddp_comp[comp_id_r];
+	p_comp = priv->ddp_comp[dual_pipe_comp_mapping(priv->data->mmsys_id, comp->id)];
 	mtk_ddp_comp_layer_config(p_comp, idx,
 				&plane_state_r, cmdq_handle);
 	DDPINFO("%s+ comp_id:%d, comp_id:%d\n",

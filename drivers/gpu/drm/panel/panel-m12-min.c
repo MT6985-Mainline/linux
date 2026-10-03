@@ -49,6 +49,17 @@ static int m12_write_cmd(struct mipi_dsi_device *dsi,
 
 	buf[0] = c->cmd;
 	memcpy(&buf[1], c->data, c->len);
+
+	/* r265: while the dsi_en fps window is open, every command
+	 * goes through the r168 re-arm sender -- the host path dies on
+	 * the second transfer. */
+	{
+		extern int corot_r265_send_cmd(const u8 *buf, unsigned int len);
+		extern bool corot_r265_active;
+
+		if (corot_r265_active)
+			return corot_r265_send_cmd(buf, c->len + 1);
+	}
 	for (try = 0; try < 3; try++) {
 		if (c->cmd >= 0xb0)
 			ret = mipi_dsi_generic_write(dsi, buf, c->len + 1);
@@ -102,28 +113,36 @@ static const struct m12_cmd m12_fps_60[] = {
 	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00), M12C(0x6f,0x44),
 	M12C(0xb3,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14),
 	M12C(0x2f,0x08),
-	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0xe9,0x00,0x00,0x00,0x00), M12C(0x5f,0x01),
+	/* COROT r288: vendor page-8 tail (was: e9 00000000 + 5f=01) */
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0x6f,0x07),
+	M12C(0xb9,0x00,0x00,0x00,0x00), M12C(0x5f,0x00),
 };
 
 static const struct m12_cmd m12_fps_90[] = {
 	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00), M12C(0x6f,0x44),
 	M12C(0xb3,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38),
 	M12C(0x2f,0x04),
-	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0xe9,0x00,0x00,0x00,0x00), M12C(0x5f,0x01),
+	/* COROT r288: vendor page-8 tail (was: e9 00000000 + 5f=01) */
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0x6f,0x07),
+	M12C(0xb9,0x00,0x00,0x00,0x00), M12C(0x5f,0x00),
 };
 
 static const struct m12_cmd m12_fps_120[] = {
 	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00), M12C(0x6f,0x44),
 	M12C(0xb3,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38),
 	M12C(0x2f,0x02),
-	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0xe9,0x00,0x00,0x00,0x00), M12C(0x5f,0x01),
+	/* COROT r288: vendor page-8 tail (was: e9 00000000 + 5f=01) */
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0x6f,0x07),
+	M12C(0xb9,0x00,0x00,0x00,0x00), M12C(0x5f,0x00),
 };
 
 static const struct m12_cmd m12_fps_144[] = {
 	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00), M12C(0x6f,0x44),
 	M12C(0xb3,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38,0x00,0x38),
 	M12C(0x2f,0x03),
-	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0xe9,0x00,0x00,0x00,0x00), M12C(0x5f,0x01),
+	/* COROT r288: vendor page-8 tail (was: e9 00000000 + 5f=01) */
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08), M12C(0x6f,0x07),
+	M12C(0xb9,0x00,0x00,0x00,0x00), M12C(0x5f,0x00),
 };
 
 static struct mipi_dsi_device *g_m12_dsi;
@@ -227,6 +246,14 @@ int corot_m12_apply_fps_tag(unsigned int fps, const char *tag)
 
 		m12_write_cmd(g_m12_dsi, &pg0);
 	}
+	{
+		extern bool corot_r265_active;
+
+		if (corot_r265_active) {
+			pr_err("COROT-FPSR r266: readback skipped (raw mode)\n");
+			return bad ? -5 : 0;
+		}
+	}
 	ret = mipi_dsi_dcs_read(g_m12_dsi, 0x2f, rb, 1);
 	pr_err("COROT-FPSR r87 readback[%s]: FCON(0x2f)=0x%02x ret=%d (want 0x%02x)%s\n",
 	       tag, rb[0], ret, want, (ret >= 0 && rb[0] == want) ? " MATCH" : "");
@@ -324,7 +351,13 @@ static const struct drm_panel_funcs m12_min_panel_funcs = {
  */
 #define M12_DSC_ENABLE              1
 #define M12_DSC_VER                 17
-#define M12_DSC_SLICE_MODE          1
+/* COROT r298: was 1 (vendor DSC dual-slice layout).  With slice_mode==1
+ * mtk_crtc_is_dual_pipe() returns true for CRTC0 and the whole CRTC/OVL path
+ * splits into two pipes, so only 1398 of 2712 lines are ever produced -- the
+ * bottom half of the panel was never written.  This bring-up bypasses the DSC
+ * anyway, so describe the panel as single-pipe and let one pipe cover the full
+ * frame. */
+#define M12_DSC_SLICE_MODE          0
 #define M12_DSC_RGB_SWAP            0
 #define M12_DSC_DSC_CFG             40
 #define M12_DSC_RCT_ON              1
@@ -333,8 +366,8 @@ static const struct drm_panel_funcs m12_min_panel_funcs = {
 #define M12_DSC_BP_ENABLE           1
 #define M12_DSC_BIT_PER_PIXEL       128
 #define M12_DSC_SLICE_HEIGHT        12
-#define M12_DSC_SLICE_WIDTH         610
-#define M12_DSC_CHUNK_SIZE          610
+#define M12_DSC_SLICE_WIDTH         610	/* COROT r306: back to the vendor value */
+#define M12_DSC_CHUNK_SIZE          610	/* COROT r306: back to the vendor value */
 #define M12_DSC_XMIT_DELAY          512
 #define M12_DSC_DEC_DELAY           562
 #define M12_DSC_SCALE_VALUE         32

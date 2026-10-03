@@ -519,7 +519,13 @@ static int mtu3_probe(struct platform_device *pdev)
 	 * belonged to the USB bring-up work, not to the display, so it goes.
 	 */
 	corot_usb = ssusb;
-	(void)corot_usb_dump_work;
+	/* COROT r293: the diagnostic existed but was never scheduled, so we never
+	 * saw why the host does not enumerate the gadget.  Run it. */
+	corot_usb = ssusb;
+	INIT_DELAYED_WORK(&corot_usb_dw, corot_usb_dump_work);
+	corot_usb_dumps = 0;
+	schedule_delayed_work(&corot_usb_dw, msecs_to_jiffies(2000));
+	pr_err("COROT r293: USB attach diagnostic armed\n");
 
 	return 0;
 

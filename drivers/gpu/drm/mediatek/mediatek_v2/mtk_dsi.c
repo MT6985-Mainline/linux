@@ -14,9 +14,6 @@
 #include <linux/delay.h>
 #include <linux/vmalloc.h>
 #include <linux/clk.h>
-/* COROT r104: clears the display interrupt enables; defined in mtk_drm_drv.c
- * outside every #ifdef, so it exists in both build modes. */
-extern void corot_mask_display_irqs_early(void);
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
 #include <linux/component.h>
@@ -1445,6 +1442,18 @@ static int mtk_dsi_get_virtual_heigh(struct mtk_dsi *dsi,
 
 	if (!virtual_heigh)
 		virtual_heigh = crtc->mode.vdisplay;
+	/* COROT r311: this return value is what sets the frame length for the
+	 * mutex/DPU.  If the panel hook reports the DSC "virtual" (half-panel)
+	 * height, every frame stops at 1356 + porches = 1398 lines no matter what
+	 * we force into the DSI registers downstream.  Show it, then force the
+	 * full panel height. */
+	pr_err("COROT r311: virtual_heigh hook=%d res_switch=%d adjusted=%u -> %u (forcing %u)\n",
+	       (int)(panel_ext && panel_ext->funcs
+		     && panel_ext->funcs->get_virtual_heigh),
+	       mtk_crtc->res_switch, adjusted_mode.vdisplay, virtual_heigh,
+	       adjusted_mode.vdisplay ? adjusted_mode.vdisplay : crtc->mode.vdisplay);
+	if (adjusted_mode.vdisplay)
+		virtual_heigh = adjusted_mode.vdisplay;
 	DDPINFO("%s,virtual_heigh %d\n", __func__, virtual_heigh);
 	return virtual_heigh;
 }
@@ -1954,7 +1963,20 @@ static void mtk_dsi_config_vdo_timing(struct mtk_dsi *dsi)
 	else
 		vact = mtk_dsi_get_virtual_heigh(dsi,
 			dsi->master_dsi->encoder.crtc);
+	/* COROT r290: the vendor helper returns the DSC virtual (half-panel)
+	 * height, so each transfer only ever covered the top half -- the bottom
+	 * half was never written.  On the uncompressed path the transfer must
+	 * span the whole panel. */
+	{
+		unsigned int virt = vact;
+
+		vact = vm->vactive;
+		pr_err("COROT r290 VACT: virtual=%u forced=%u (vdisplay=%u)\n",
+		       virt, vact, vm->vactive);
+	}
 	writel(vact, dsi->regs + DSI_VACT_NL);
+	pr_err("COROT r290 VACT_NL readback=0x%08x\n",
+	       readl(dsi->regs + DSI_VACT_NL));
 
 	writel(dsi->hsa_byte, dsi->regs + DSI_HSA_WC);
 	writel(dsi->hbp_byte, dsi->regs + DSI_HBP_WC);
@@ -2200,56 +2222,22 @@ void clear_dsi_underrun_event(void)
 	dsi_underrun_trigger = 1;
 }
 
-/*
- * COROT r103: the register blocks this file's interrupt handler wants to read
- * must be mapped BEFORE the handler runs.
- *
- * ioremap() cannot be called from interrupt context - __get_vm_area_node() has
- * BUG_ON(in_interrupt()) - and calling it from the DSI underrun branch is
- * exactly what turned "the panel underran once" into
- *     kernel BUG at mm/vmalloc.c:3228
- * and, in turn, into the blanket INTEN = 0 mask that killed TE_RDY.
- *
- * ioremap only creates a virtual mapping; it does not touch the hardware, so
- * doing it at probe time is safe and the handler just uses the pointers.
+/* r276: underrun diagnostic windows, mapped ONCE from process context.
+ * Reading them from the IRQ is fine; ioremap() from the IRQ is not --
+ * __get_vm_area_node() BUGs in interrupt context and panics the kernel.
  */
-static void __iomem *corot_irq_mtx0;
-static void __iomem *corot_irq_mtx1;
-static void __iomem *corot_irq_ovl;
-static void __iomem *corot_irq_dsc;
+static void __iomem *corot_ur_m0, *corot_ur_m1, *corot_ur_o, *corot_ur_dc;
 
-static void corot_irq_maps_init(void)
+static void corot_ur_map_once(void)
 {
-	if (!corot_irq_mtx0)
-		corot_irq_mtx0 = ioremap(0x14001000, 0x1000);
-	if (!corot_irq_mtx1)
-		corot_irq_mtx1 = ioremap(0x14401000, 0x1000);
-	if (!corot_irq_ovl)
-		corot_irq_ovl = ioremap(0x14402000, 0x1000);
-	if (!corot_irq_dsc)
-		corot_irq_dsc = ioremap(0x1400c000, 0x1000);
-
-	pr_err("COROT-IRQMAP mtx0=%p mtx1=%p ovl=%p dsc=%p\n",
-	       corot_irq_mtx0, corot_irq_mtx1, corot_irq_ovl, corot_irq_dsc);
-}
-
-/*
- * COROT r104: frame accounting.
- *
- * "Does the display get triggered at all" needs a number, not an inference from
- * the picture - especially in the option-B build, where none of the CPU-direct
- * telemetry is compiled in.  These are bumped in the DSI interrupt handler from
- * the raw INTSTA value, before the handler's own masking of the status word.
- */
-static unsigned int corot_dsi_frm_n;
-static unsigned int corot_dsi_te_n;
-static unsigned int corot_dsi_ur_n;
-
-void corot_dsi_counts(unsigned int *frm, unsigned int *te, unsigned int *ur)
-{
-	*frm = corot_dsi_frm_n;
-	*te = corot_dsi_te_n;
-	*ur = corot_dsi_ur_n;
+	if (corot_ur_m0)
+		return;
+	corot_ur_m0 = ioremap(0x14001000, 0x1000);
+	corot_ur_m1 = ioremap(0x14401000, 0x1000);
+	corot_ur_o = ioremap(0x14402000, 0x1000);
+	corot_ur_dc = ioremap(0x1400c000, 0x1000);
+	pr_err("COROT r276: underrun diag windows mapped %p %p %p %p\n",
+	       corot_ur_m0, corot_ur_m1, corot_ur_o, corot_ur_dc);
 }
 
 static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
@@ -2298,14 +2286,6 @@ static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 	 * Read LCM will clear the bit.
 	 */
 	/* do not clear vm command done */
-	/* COROT r104: frame accounting, from the raw status word */
-	if (status & FRAME_DONE_INT_FLAG)
-		corot_dsi_frm_n++;
-	if (status & TE_RDY_INT_FLAG)
-		corot_dsi_te_n++;
-	if (status & BUFFER_UNDERRUN_INT_FLAG)
-		corot_dsi_ur_n++;
-
 	status &= 0xffde;
 	if (status) {
 		writel(~status, dsi->regs + DSI_INTSTA);
@@ -2337,18 +2317,11 @@ static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 			{
 				static int corot_underrun_n;
 
-				/*
-				 * COROT r103: NO ioremap here.  This runs in hard
-				 * interrupt context and ioremap() BUGs there; the
-				 * mappings are made once by corot_irq_maps_init()
-				 * at probe time.  If they are missing the dump is
-				 * skipped - a missing line is cheap, a BUG is not.
-				 */
-				if (corot_underrun_n < 4 && corot_irq_mtx0) {
-					void __iomem *m0 = corot_irq_mtx0;
-					void __iomem *m1 = corot_irq_mtx1;
-					void __iomem *o = corot_irq_ovl;
-					void __iomem *dc = corot_irq_dsc;
+				if (corot_underrun_n < 4 && corot_ur_m0) {
+					void __iomem *m0 = corot_ur_m0;
+					void __iomem *m1 = corot_ur_m1;
+					void __iomem *o = corot_ur_o;
+					void __iomem *dc = corot_ur_dc;
 
 					corot_underrun_n++;
 					pr_err("COROT-UNDERRUN[%d] dsi sta=0x%08x start=0x%08x con=0x%08x mode=0x%08x txrx=0x%08x size=0x%08x | mtx0 en=0x%08x sof=0x%08x | mtx1 en=0x%08x sof=0x%08x | ovl en=0x%08x intsta=0x%08x | dsc con=0x%08x\n",
@@ -2366,8 +2339,6 @@ static irqreturn_t mtk_dsi_irq_status(int irq, void *dev_id)
 						o ? readl(o + 0x00) : 0,
 						o ? readl(o + 0x0c) : 0,
 						dc ? readl(dc + 0x00) : 0);
-					/* COROT r103: no iounmap either - the
-					 * mappings live for the life of the driver. */
 				}
 			}
 
@@ -2814,14 +2785,6 @@ static int mtk_preconfig_dsi_enable(struct mtk_dsi *dsi)
 	mtk_dsi_cmdq_size_sel(dsi);
 
 	mtk_dsi_set_interrupt_enable(dsi);
-	/*
-	 * COROT r104: mtk_dsi_set_interrupt_enable() has just re-armed
-	 * INTEN = 0x00005004 (BUFFER_UNDERRUN | INP_UNFINISH | TE_RDY).  Put the
-	 * mask back immediately, but a mask that keeps TE_RDY - see r102.  Without
-	 * this the underrun interrupt fires on every frame; with the r103 fix it no
-	 * longer kills the kernel, but it is still pure noise.
-	 */
-	corot_mask_display_irqs_early();
 
 #if !IS_ENABLED(CONFIG_DRM_PANEL_L11_38_0A_0A_DSC_CMD) \
 	&& !IS_ENABLED(CONFIG_DRM_PANEL_L11A_38_0A_0A_DSC_CMD) \
@@ -6403,6 +6366,282 @@ done:
 	return 0;
 }
 
+
+/* COROT r265: CPU-direct DCS delivery with per-command re-arm.
+ * The mipi_dsi host path completes exactly one transfer and stalls on the
+ * second (r90 -- the reason r91 gated the panel fps request off).  The
+ * r168 recipe -- mmsys SW_RST_0 bit21 hard reset, LK handoff state
+ * restore, packet into the CMDQ buffer, START edge, poll CMD_DONE -- is
+ * the only sender proven to work repeatedly on this DSI.  Used at the
+ * dsi_en point to deliver the panel's 60 Hz table before any frame flows,
+ * widening the DDIC's receive window past the ~7.05 ms truncation. */
+#define COROT_R265_DSI_PA	0x1400d000UL
+#define COROT_R265_MMSYS_PA	0x14000000UL
+static void __iomem *corot_r265_dsi;
+static struct mtk_dsi *corot_r265_owner;	/* r277 */
+static void __iomem *corot_r265_mmsys;
+bool corot_r265_active;
+EXPORT_SYMBOL_GPL(corot_r265_active);
+
+static const struct { u32 off; u32 val; } corot_r265_lk_state[] = {
+	{ 0x000, 0x00000001 },	/* START */
+	{ 0x004, 0x00000000 },
+	{ 0x008, 0x00000004 },	/* INTEN: TE_RDY */
+	{ 0x00c, 0x00000000 },	/* INTSTA: clear */
+	{ 0x010, 0x00000000 },	/* CON_CTRL (0 in the working state too) */
+	{ 0x014, 0x00000000 },	/* MODE: CMD */
+	{ 0x018, 0x0001023c },	/* TXRX */
+	{ 0x01c, 0x2c0504c4 },	/* PSCTRL */
+	{ 0x020, 0x00000000 },
+	{ 0x024, 0x00000000 },
+	{ 0x028, 0x00000000 },
+	{ 0x02c, 0x00000a98 },	/* VACT = 2712 */
+	{ 0x030, 0x00000000 },
+	{ 0x034, 0x00000000 },
+	{ 0x038, 0x0a980197 },	/* SIZE_CON */
+	{ 0x03c, 0x00000000 },
+	{ 0x060, 0x00008001 },	/* CMDQ_SIZE (bit15 set by LK) */
+	{ 0x064, 0x00010000 },
+	{ 0x0d8, 0xdff00016 },
+	{ 0x0dc, 0xfff00000 },
+	{ 0x0ec, 0x00000055 },
+	{ 0x0f0, 0x001f1f01 },	/* PHY LCCON */
+	{ 0x0f4, 0x00000008 },
+	{ 0x0f8, 0x000000b8 },
+	{ 0x0fc, 0x0e170c0e },
+	{ 0x100, 0x15411334 },
+	{ 0x104, 0x0d300103 },
+	{ 0x108, 0x0015240a },
+	{ 0x10c, 0x012c0000 },
+	{ 0x110, 0x00000000 },
+	{ 0x114, 0x00010001 },	/* PHY LD0CON */
+	{ 0x118, 0x00000001 },
+	{ 0x128, 0x00010001 },
+	{ 0x12c, 0x00000001 },
+	{ 0x148, 0x00010001 },
+	{ 0x14c, 0x01010001 },
+	{ 0x150, 0x01010001 },
+	{ 0x154, 0x01010101 },
+	{ 0x158, 0x00000101 },
+	{ 0x15c, 0x1000008d },
+	{ 0x160, 0x00010001 },
+	{ 0x164, 0x00000001 },
+	{ 0x400, 0x00000001 },	/* DSI buffer */
+	{ 0x404, 0x0ac90320 },
+	{ 0x408, 0x00000000 },
+	{ 0x40c, 0x00007fff },
+	{ 0x410, 0x00059c0b },
+	{ 0x414, 0x00000610 },
+	{ 0x418, 0x000001f8 },
+	{ 0x41c, 0x00000000 },
+};
+
+static void corot_r265_map(void)
+{
+	if (!corot_r265_dsi) {
+		corot_r265_dsi = ioremap(COROT_R265_DSI_PA, 0x1000);
+		corot_r265_mmsys = ioremap(COROT_R265_MMSYS_PA, 0x1000);
+	}
+}
+
+static void corot_r265_reset_restore(void)
+{
+	unsigned int i;
+	u32 v;
+
+	corot_r265_map();
+	if (!corot_r265_dsi || !corot_r265_mmsys)
+		return;
+
+	/* reset-BAR semantics: 0 = held in reset, 1 = running */
+	v = readl(corot_r265_mmsys + 0x160);
+	writel(v & ~BIT(21), corot_r265_mmsys + 0x160);
+	writel(readl(corot_r265_mmsys + 0x160) | BIT(21),
+	       corot_r265_mmsys + 0x160);
+
+	for (i = 0; i < ARRAY_SIZE(corot_r265_lk_state); i++)
+		writel(corot_r265_lk_state[i].val,
+		       corot_r265_dsi + corot_r265_lk_state[i].off);
+	writel(0, corot_r265_dsi + 0x0c);	/* INTSTA clear */
+}
+
+
+/* COROT r271: the restored LK state leaves the PHY in ULPS (the panel
+ * sleeps on its GRAM at handoff) -- a sleeping link drops every packet.
+ * Exit sequence from the vendor mtk_dsi_exit_ulps() (r170 port). */
+#define COROT_R271_LCCON	0x104
+#define COROT_R271_LD0CON	0x108
+#define COROT_R271_LC_HS_TX_EN	BIT(0)
+#define COROT_R271_LC_ULPM_EN	BIT(1)
+#define COROT_R271_LD0_ULPM_EN	BIT(1)
+#define COROT_R271_LDX_ULPM_AS_L0	BIT(3)
+#define COROT_R271_SLEEPOUT_START	BIT(2)
+#define COROT_R271_SLEEPOUT_DONE	BIT(6)
+
+static void corot_r271_leave_ulps(void)
+{
+	u32 v, i, sta = 0;
+
+	if (!corot_r265_dsi)
+		return;
+
+	v = readl(corot_r265_dsi + COROT_R271_LCCON);
+	writel((v | COROT_R271_LC_HS_TX_EN) & ~COROT_R271_LC_ULPM_EN,
+	       corot_r265_dsi + COROT_R271_LCCON);
+
+	v = readl(corot_r265_dsi + COROT_R271_LD0CON);
+	writel(v & ~(COROT_R271_LD0_ULPM_EN | COROT_R271_LDX_ULPM_AS_L0),
+	       corot_r265_dsi + COROT_R271_LD0CON);
+
+	writel(readl(corot_r265_dsi + 0x14) & ~BIT(20), corot_r265_dsi + 0x14);
+
+	writel(readl(corot_r265_dsi + 0x08) | COROT_R271_SLEEPOUT_DONE,
+	       corot_r265_dsi + 0x08);
+	writel(readl(corot_r265_dsi + 0x00) & ~COROT_R271_SLEEPOUT_START,
+	       corot_r265_dsi + 0x00);
+	writel(readl(corot_r265_dsi + 0x00) | COROT_R271_SLEEPOUT_START,
+	       corot_r265_dsi + 0x00);
+
+	for (i = 0; i < 5000; i++) {
+		sta = readl(corot_r265_dsi + 0x0c);
+		if (sta & COROT_R271_SLEEPOUT_DONE)
+			break;
+		udelay(10);
+	}
+
+	writel(readl(corot_r265_dsi + 0x08) & ~COROT_R271_SLEEPOUT_DONE,
+	       corot_r265_dsi + 0x08);
+	writel(readl(corot_r265_dsi + 0x00) & ~COROT_R271_SLEEPOUT_START,
+	       corot_r265_dsi + 0x00);
+	writel(sta, corot_r265_dsi + 0x0c);
+	pr_err("COROT r271 ulps exit: sta=0x%08x sleepout_done=%d after %d us\n",
+	       sta, !!(sta & COROT_R271_SLEEPOUT_DONE), i * 10);
+}
+
+
+/* COROT r272: the driver's own enable sequence -- the only one measured to
+ * make the CPU command engine transmit (r196). */
+static struct mtk_dsi *corot_r272_priv;
+
+static int corot_r272_prepare(struct mtk_dsi **out)
+{
+	struct mtk_dsi *dsi = corot_r272_priv;
+
+	if (!dsi || !dsi->regs)
+		return -2;
+	mtk_dsi_poweron(dsi);
+	mtk_dsi_enable(dsi);
+	mtk_dsi_phy_timconfig(dsi, NULL);
+	mtk_dsi_rxtx_control(dsi);
+	if (dsi->driver_data->dsi_buffer)
+		mtk_dsi_tx_buf_rw(dsi);
+	*out = dsi;
+	return 0;
+}
+
+int corot_r265_send_cmd(const u8 *buf, unsigned int len)
+{
+	u32 sta, type, words, i;
+	int ok = 0;
+
+	/* r274: prepare once per delivery, not per packet -- poweron takes
+	 * power/clk references it never releases, and 8 back-to-back calls
+	 * leak 8 of them (the stage269 crash suspect). */
+	if (!corot_r265_dsi) {
+		struct mtk_dsi *d272;
+		int rc272 = corot_r272_prepare(&d272);
+
+		if (rc272 || !d272)
+			return -ENODEV;
+		corot_r265_dsi = d272->regs;
+		corot_r265_owner = d272;	/* r277: for the driver's own helpers */
+	}
+
+	if (len > 2) {
+		type = (buf[0] >= 0xb0) ? 0x29 : 0x39;	/* generic/DCS long */
+		writel((len << 16) | (type << 8) | 0x0a, /* LONG|HSTX */
+		       corot_r265_dsi + 0xd00);
+		for (i = 0; i < len; i++) {
+			u32 off = 0xd04 + (i / 4) * 4;
+			u32 sh = (i % 4) * 8;
+			u32 cur = readl(corot_r265_dsi + off);
+
+			writel((cur & ~(0xffu << sh)) | ((u32)buf[i] << sh),
+			       corot_r265_dsi + off);
+		}
+		words = 1 + ((len + 3) / 4);
+	} else {
+		if (buf[0] >= 0xb0)
+			type = (len == 2) ? 0x13 : 0x03;
+		else
+			type = (len == 2) ? 0x15 : 0x05;
+		sta = ((len == 2 ? buf[1] : 0) << 24) | (buf[0] << 16) |
+		      (type << 8) | 0x08;		/* SHORT|HSTX */
+		writel(sta, corot_r265_dsi + 0xd00);
+		words = 1;
+	}
+	/* r270: SEL must EDGE -- count first with SEL clear, then set SEL
+	 * in a second write (r174/r176).  The LK restore leaves SEL set, so
+	 * a single words|BIT(15) write never produces the trigger edge. */
+	writel(words, corot_r265_dsi + 0x60);
+	writel(readl(corot_r265_dsi + 0x60) | BIT(15),
+	       corot_r265_dsi + 0x60);
+
+	/* r277: BIT(0) is DSI_RESET, BIT(1) is DSI_EN.  r268 wrote BIT(0)
+	 * (the comment even said "CON bit0"), so every packet was issued with
+	 * the engine held in RESET: INTSTA read 0x00000000, no BUSY, no
+	 * CMD_DONE, all 7 table commands returned -ETIME.  Also wake the link
+	 * first -- corot_r271_leave_ulps() had no caller, and a PHY in ULPS
+	 * drops packets silently, which is the same signature. */
+	pr_err("COROT r277 pre : CON=0x%08x INTSTA=0x%08x LCCON=0x%08x LD0CON=0x%08x\n",
+	       readl(corot_r265_dsi + DSI_CON_CTRL),
+	       readl(corot_r265_dsi + DSI_INTSTA),
+	       readl(corot_r265_dsi + DSI_PHY_LCCON),
+	       readl(corot_r265_dsi + DSI_PHY_LD0CON));
+	if (corot_r265_owner)
+		mtk_dsi_exit_ulps(corot_r265_owner);
+	if (!(readl(corot_r265_dsi + DSI_CON_CTRL) & DSI_EN) && corot_r265_owner)
+		mtk_dsi_enable(corot_r265_owner);
+	writel(readl(corot_r265_dsi + DSI_CON_CTRL) & ~DSI_RESET,
+	       corot_r265_dsi + DSI_CON_CTRL);
+	writel(readl(corot_r265_dsi + DSI_CON_CTRL) | DSI_EN,
+	       corot_r265_dsi + DSI_CON_CTRL);
+	pr_err("COROT r277 post: CON=0x%08x LCCON=0x%08x LD0CON=0x%08x\n",
+	       readl(corot_r265_dsi + DSI_CON_CTRL),
+	       readl(corot_r265_dsi + DSI_PHY_LCCON),
+	       readl(corot_r265_dsi + DSI_PHY_LD0CON));
+	/* make CMD_DONE visible in INTSTA */
+	writel(readl(corot_r265_dsi + 0x08) | BIT(1),
+	       corot_r265_dsi + 0x08);
+
+	/* START edge */
+	sta = readl(corot_r265_dsi + 0x00);
+	writel(sta & ~1u, corot_r265_dsi + 0x00);
+	writel((sta & ~1u) | 1u, corot_r265_dsi + 0x00);
+
+	{
+		u32 prev = readl(corot_r265_dsi + 0x0c);
+		for (i = 0; i < 4000; i++) {
+			sta = readl(corot_r265_dsi + 0x0c);
+			if (sta & BIT(1)) {	/* CMD_DONE */
+				ok = 1;
+				break;
+			}
+			if ((prev & BIT(31)) && !(sta & BIT(31))) {
+				/* BUSY falling edge: transfer left the engine */
+				ok = 2;
+				break;
+			}
+			prev = sta;
+			udelay(10);
+		}
+	}
+	writel(sta, corot_r265_dsi + 0x0c);	/* W1C */
+	pr_err("COROT r268 send: len=%u done=%d sta=0x%08x\n", len, ok, sta);
+	return ok ? 0 : -ETIME;
+}
+EXPORT_SYMBOL_GPL(corot_r265_send_cmd);
+
 static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
 				     const struct mipi_dsi_msg *msg, u8 flag)
 {
@@ -9106,12 +9345,8 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 
 	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	dsi->regs = devm_ioremap_resource(dev, regs);
-	/*
-	 * COROT r103: the mappings the DSI interrupt handler needs, made here
-	 * because ioremap() is not legal in interrupt context.
-	 */
-	corot_irq_maps_init();
-	pr_err("COROT-MARKER r131-dualmap: DSI probe reached (image check)\n");
+	corot_ur_map_once();
+	pr_err("COROT-MARKER r98-pllforce: DSI probe reached (image check)\n");
 
 	pr_err("COROT-DSI[probe] INTSTA=0x%08x INTEN=0x%08x START=0x%08x\n",
 	       readl(dsi->regs + DSI_INTSTA), readl(dsi->regs + DSI_INTEN),
@@ -9215,6 +9450,7 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, dsi);
+	corot_r272_priv = dsi;	/* r272: for the CPU command sender */
 
 	ret = component_add(&pdev->dev, &mtk_dsi_component_ops);
 	if (ret != 0) {
