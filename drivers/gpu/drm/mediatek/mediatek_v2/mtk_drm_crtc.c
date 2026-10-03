@@ -5680,7 +5680,6 @@ static void corot_fps_delayed(struct work_struct *w)
 
 	pr_err("COROT-FPSR r273: stopping frame push, delivering 60 Hz table\n");
 	corot_r301_fbcheck();
-	corot_r312_ruler();	/* COROT r312: colour ruler on the panel */
 	corot_r307_xbar();	/* COROT r307: route the pixels through the DSC */
 	/* COROT r300: r299's blank removed -- it ran after the console test text
 	 * was printed and would erase it (and its word count was 4x short). */
@@ -5728,7 +5727,7 @@ static void corot_dsi_trigger_min(void)
 	 * (half the panel) into VACT_NL, so each transfer only covered the top
 	 * half.  Override it here -- immediately before START, so nothing can
 	 * overwrite it before the transfer runs. */
-	writel(2712, corot_dsi_map + 0x2c);
+// COROT r316 disabled: writel(2712, corot_dsi_map + 0x2c);
 	if ((r291_n++ % 300) == 0)
 		pr_err("COROT r291: forced VACT_NL=0x%08x (want 0x00000a98) size_con=0x%08x psctrl=0x%08x\n",
 		       readl(corot_dsi_map + 0x2c), readl(corot_dsi_map + 0x38),
@@ -5838,7 +5837,7 @@ static void corot_p48_phase(unsigned int n)
 
 		/* baseline: neither pacing bit, original rwt */
 		writel(c & ~((1u << 24) | (1u << 27)), corot_dsi_map + 0x10);
-		writel(0x00059c0b, corot_dsi_map + 0x410);
+		// COROT r316 disabled: writel(0x00059c0b ... + 0x410)
 	}
 
 	if (corot_ovl_map)
@@ -5972,7 +5971,7 @@ static void corot_ftrig_tick(struct timer_list *t)
 	if (corot_ovl_map)
 		writel(0x0a9804c4, corot_ovl_map + 0x20);
 	if (corot_dsi_map)
-		writel(0x00059c0b, corot_dsi_map + 0x410);
+		// COROT r316 disabled: writel(0x00059c0b ... + 0x410)
 
 	/* COROT r55: keep the bound registers cleared for the active phase */
 	if (corot_dsi_map) {
@@ -5998,12 +5997,12 @@ static void corot_ftrig_tick(struct timer_list *t)
 		 * dsi_us max = 7100 us = a 144 Hz frame, and 7.1 ms at ~197 lines/ms
 		 * is the 1398-line transfer we keep seeing.  Force the mode's 60 Hz
 		 * values (VSA 10, VBP 54, VFP 10; 10+54+2712+10 = vtotal 2786). */
-		writel(10, corot_dsi_map + 0x20);		/* VSA_NL */
-		writel(54, corot_dsi_map + 0x24);		/* VBP_NL */
-		writel(10, corot_dsi_map + 0x28);		/* VFP_NL */
-		writel(2712, corot_dsi_map + 0x2c);		/* VACT_NL */
-		writel(0x0a980197, corot_dsi_map + 0x38);	/* SIZE_CON: h=2712, w=1220 */
-		writel(0x00059c0b, corot_dsi_map + 0x410);	/* TX_BUF_RW_TIMES for 2712 */
+// COROT r316 disabled: writel(10, corot_dsi_map + 0x20);		(( VSA_NL ))
+// COROT r316 disabled: writel(54, corot_dsi_map + 0x24);		(( VBP_NL ))
+// COROT r316 disabled: writel(10, corot_dsi_map + 0x28);		(( VFP_NL ))
+// COROT r316 disabled: writel(2712, corot_dsi_map + 0x2c);		(( VACT_NL ))
+		// COROT r316 disabled: writel(0x0a980197 ... + 0x38)
+		// COROT r316 disabled: writel(0x00059c0b ... + 0x410)
 		if ((r295_n++ % 300) == 0)
 			pr_err("COROT r295: VACT_NL=0x%08x SIZE_CON=0x%08x rwt=0x%08x psctrl=0x%08x (want a98/0a980197/59c0b)\n",
 			       readl(corot_dsi_map + 0x2c), readl(corot_dsi_map + 0x38),
@@ -6083,6 +6082,14 @@ report:
 	 * then arrives. */
 	if (delay < COROT_R308_MIN_MS)
 		delay = COROT_R308_MIN_MS;
+	/* COROT r315: repaint the colour ruler from the per-frame tick (every 30th
+	 * frame), not from the one-shot fps_delayed() where the console immediately
+	 * painted over it. */
+	{
+		static unsigned int n;
+		if ((++n % 30u) == 1u)
+			corot_r312_ruler();
+	}
 	mod_timer(&corot_ftrig_timer, jiffies + msecs_to_jiffies(delay));
 }
 
@@ -6280,15 +6287,30 @@ static void corot_r312_ruler(void)
 	if (!fb)
 		return;
 
+	/* COROT r315: colour ruler -- 7 bands of 128 lines, a bright magenta line
+	 * exactly at 1398 (where every frame has stopped so far) and a white line
+	 * at the very bottom of the panel. */
 	for (y = 0; y < 2712u; y++) {
 		u32 c = band[(y / 128u) % 7u];
 
 		if (y == 1398u)
-			c = 0x00ff00ff;	/* bright magenta: where every frame stops */
+			c = 0x00ff00ff;
 		else if (y == 2711u)
-			c = 0x00ffffff;	/* white: the very bottom */
+			c = 0x00ffffff;
 		for (x = 0; x < 1220u; x++)
 			writel(c, fb + (y * 1220u + x) * 4u);
+	}
+
+	/* one-shot confirmation: where we wrote vs where the OVL reads */
+	{
+		static int done;
+		if (!done) {
+			done = 1;
+			pr_err("COROT r313: painted pa=0x%08x ovl_l0=0x%08x ovl_l0msb=0x%08x | readback[0]=0x%08x [mid]=0x%08x [last]=0x%08x\n",
+			       pa, readl(o + 0xf40), readl(o + 0xf44),
+			       readl(fb), readl(fb + (1220u * 1356u * 4u)),
+			       readl(fb + (1220u * 2711u * 4u) + 1220u * 4u - 4u));
+		}
 	}
 	iounmap(fb);
 }

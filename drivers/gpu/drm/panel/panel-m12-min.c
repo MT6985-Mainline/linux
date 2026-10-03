@@ -357,7 +357,7 @@ static const struct drm_panel_funcs m12_min_panel_funcs = {
  * bottom half of the panel was never written.  This bring-up bypasses the DSC
  * anyway, so describe the panel as single-pipe and let one pipe cover the full
  * frame. */
-#define M12_DSC_SLICE_MODE          0
+#define M12_DSC_SLICE_MODE          1	/* COROT r314: 2 x 610 = 1220 wide, with the driver's packet values */
 #define M12_DSC_RGB_SWAP            0
 #define M12_DSC_DSC_CFG             40
 #define M12_DSC_RCT_ON              1
