@@ -24,6 +24,8 @@
 #include <drm/drm_vblank.h>
 #include <linux/dma-mapping.h>
 #include <linux/timer.h> /* r273 */
+#include <linux/workqueue.h>	/* COROT r339 */
+#include <linux/init.h>		/* COROT r339: late_initcall */
 #include <linux/delay.h>
 #include <drm/drm_crtc.h>
 #include <linux/kmemleak.h>
@@ -1247,6 +1249,35 @@ bool mtk_crtc_is_dual_pipe(struct drm_crtc *crtc)
 		mtk_drm_get_lcm_ext_params(crtc);
 	struct mtk_drm_private *priv = crtc->dev->dev_private;
 
+	/* COROT r320: name the failing term.  MTK_PANEL_DSC_SINGLE_PORT is the
+	 * expected output_mode for this panel; slice_mode should be 1 to need two
+	 * pipes. */
+	/* COROT r332: this string exists in no earlier build.  Seeing it in
+	 * /cust/boot-log.txt is the only proof that the freshly flashed image
+	 * (and not the stale one) actually ran. */
+	/* COROT r334: this string exists in no earlier build.  Seeing it in
+	 * /cust/boot-log.txt is the only proof that the freshly flashed image
+	 * (and not the stale one) actually ran. */
+	pr_err("COROT r334 marker: mmsys_id=0x%x slice_mode=%d dual_pipe_forced_off=1 "
+	       "(one pipe, two DSI links: dsi0 master + dsi1 dual-dsi-slave)\n",
+	       priv->data->mmsys_id,
+	       (int)(panel_ext ? panel_ext->dsc_params.slice_mode : 0));
+	pr_err("COROT r332 dsi1+dualpath marker: slice_mode=1, DSI1 declared, "
+	       "mt6985_mtk_ddp_dual_main={OVL1_2L} -> DSI1 appended\n");
+	pr_err("COROT r332 dual path: len[0]=%u first_id=%d dsi1_comp=%d ovl1_2l_comp=%d\n",
+	       (priv && priv->data && priv->data->main_path_data) ?
+	       priv->data->main_path_data->dual_path_len[0] : 0,
+	       (priv && priv->data && priv->data->main_path_data &&
+		priv->data->main_path_data->dual_path[0]) ?
+	       (int)priv->data->main_path_data->dual_path[0][0] : -1,
+	       priv->ddp_comp[DDP_COMPONENT_DSI1] ? 1 : 0,
+	       priv->ddp_comp[DDP_COMPONENT_OVL1_2L] ? 1 : 0);
+	pr_err("COROT r320 dualpipe check: index=%d panel_ext=%d output_mode=%d slice_mode=%d helper_opt=%d\n",
+	       drm_crtc_index(crtc), panel_ext ? 1 : 0,
+	       panel_ext ? (int)panel_ext->output_mode : -1,
+	       panel_ext ? (int)panel_ext->dsc_params.slice_mode : -1,
+	       mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_PRIM_DUAL_PIPE));
+
 	if ((drm_crtc_index(crtc) == 0) &&
 		panel_ext &&
 		panel_ext->output_mode == MTK_PANEL_DUAL_PORT) {
@@ -1261,9 +1292,27 @@ bool mtk_crtc_is_dual_pipe(struct drm_crtc *crtc)
 	}
 
 
+	/* COROT r322: force dual pipe again.  The DSC is only ever fed with
+	 * slice_width = 610, so the panel's full 1220 width requires slice_mode = 1,
+	 * which needs two pipes.  r318 already did this and the device booted; the
+	 * is_dual_pipe=0 lines there were early COROT-STAGE prints, so the field is
+	 * now also reported from the 5 s tick, after the CRTC is prepared. */
+	/* COROT r334: on MT6985 the panel's two 610-wide DSC slices leave over the
+	 * TWO DSI LINKS of ONE DPU pipe (dsi0 = master, dsi1 =
+	 * `mediatek,dual-dsi-slave`), not over two pipes.  slice_mode = 1 must
+	 * therefore stop implying a second pipe: the term below is what r322 used
+	 * to make "slice_mode = 1" and "a live second link" mutually exclusive.
+	 * r332 deadlocked with it in place (pushed=11, dsi=0x80000004, frmdone
+	 * never set, every push timing out at 40 ms); r333 only survived by
+	 * forcing slice_mode back to 0 (pushed=1303 ur=1303, dsi_us avg
+	 * 395 -> 7063, 1356 OVL0_2L frame underflows).
+	 * To return to the vendor model (PRIM_DUAL_PIPE + a second pipe wired to
+	 * DSI1) delete this guard and stop declaring mediatek,dual-dsi-slave;
+	 * the rest of r332's dual-pipe prerequisite is left in place for that. */
+	if (priv->data->mmsys_id == MMSYS_MT6985)
+		return false;
+
 	if ((drm_crtc_index(crtc) == 0) &&
-		mtk_drm_helper_get_opt(priv->helper_opt,
-			    MTK_DRM_OPT_PRIM_DUAL_PIPE) &&
 		panel_ext &&
 		panel_ext->output_mode == MTK_PANEL_DSC_SINGLE_PORT &&
 		panel_ext->dsc_params.slice_mode == 1) {
@@ -2742,6 +2791,35 @@ unsigned int dual_pipe_comp_mapping(unsigned int mmsys_id, unsigned int comp_id)
 		break;
 	case MMSYS_MT6895:
 		ret = dual_comp_map_mt6895(comp_id);
+		break;
+
+	case MMSYS_MT6985:	/* COROT r332 map */
+		/* COROT r332: MT6985 was never added to this function, so the
+		 * default below returned 0 = DDP_COMPONENT_AAL0 = a slot this DTS
+		 * never populates, and the is_dual_pipe callers deref
+		 * priv->ddp_comp[0] unconditionally (mtk_drm_crtc.c:7086-7091,
+		 * reached from crtc_enable step 8 -> mtk_crtc_restore_plane_setting
+		 * -> mtk_crtc_dual_layer_config).  Corot's own pairing: the main
+		 * pipe OVL0_2L (0x14402000) with the second pipe OVL1_2L
+		 * (0x14403000, alias ovl4 since r332), DSI0 with DSI1.  Identity
+		 * for everything else, so the result can never be a NULL slot. */
+		switch (comp_id) {
+		case DDP_COMPONENT_OVL0_2L:
+			ret = DDP_COMPONENT_OVL1_2L;
+			break;
+		case DDP_COMPONENT_OVL1_2L:
+			ret = DDP_COMPONENT_OVL0_2L;
+			break;
+		case DDP_COMPONENT_DSI0:
+			ret = DDP_COMPONENT_DSI1;
+			break;
+		case DDP_COMPONENT_DSI1:
+			ret = DDP_COMPONENT_DSI0;
+			break;
+		default:
+			ret = comp_id;
+			break;
+		}
 		break;
 	case MMSYS_MT6885:
 		ret = dual_comp_map_mt6885(comp_id);
@@ -5632,7 +5710,8 @@ static void corot_phase_tick(void)
  * fills the WHOLE screen with its colour.
  */
 static void corot_r307_xbar(void);	/* COROT r307 */
-static void corot_r312_ruler(void);	/* COROT r312 */
+/* COROT r339: corot_r312_ruler() is gone; the painter now runs from its own
+ * delayed work, armed by late_initcall(corot_r339_paint_arm). */
 static void corot_r301_fbcheck(void);
 static void corot_r299_blank(void);	/* COROT r299 forward decl */
 static const u32 corot_p48_bg[6] = {
@@ -5879,14 +5958,22 @@ static void corot_p48_phase(unsigned int n)
 
 static void corot_p48_tick(void)
 {
-	static unsigned long t0;
-	static unsigned int n;
+	/* COROT r324: the phase sweep also drove the panel's refresh rate
+	 * (120/60/144/90/60/120) every COROT_P48_MS, so the panel spent most of its
+	 * time at 120/144 Hz regardless of the 60 Hz delivery.  At 144 Hz the DSI's
+	 * write window is ~7 ms, which is precisely the 1398-line frame we kept
+	 * measuring -- and why a 30 Hz trigger changed nothing: the limit is the
+	 * panel's window, not our pacing.
+	 *
+	 * Retire the sweep and pin the panel to our 60 Hz mode once. */
+	static bool done;
 
-	if (t0 && time_before(jiffies, t0 + msecs_to_jiffies(COROT_P48_MS)))
+	if (done)
 		return;
-	t0 = jiffies;
-	corot_p48_phase(n);
-	n = (n + 1) % COROT_P48_N;
+	done = true;
+	pr_err("COROT r324: p48 phase sweep retired; pinning the panel to 60 Hz\n");
+	corot_fps_want = 60;
+	schedule_work(&corot_fps_wq);
 }
 
 static void corot_ftrig_tick(struct timer_list *t)
@@ -5895,6 +5982,16 @@ static void corot_ftrig_tick(struct timer_list *t)
 	static unsigned long n_force, next_report, next_push;
 	static unsigned long n_dsc_aeof;
 	static unsigned int y_at_push;
+	/* COROT r335: "at_push" is a readback of the OVL's live cur_pos, not a
+	 * height we program -- track the frame window that truncates it. */
+	static unsigned long r335_prev_done_j, r335_period_us_max;
+	static unsigned int r335_y_min = 0x1fff, r335_y_max, r335_n;
+	/* COROT r340: a SECOND sampling point for the OVL's live ROI_Y.  r335 only
+	 * samples it at push time and always reads 1398, which cannot tell "the OVL
+	 * really stops at row 1398" from "we only ever look when it is at 1398".
+	 * Sampling it when the DSI reports the frame done decides that. */
+	static unsigned int r340_ydone, r340_ydone_min = 0x1fff, r340_ydone_max;
+	static unsigned long r340_ydone_n;
 	static int dumped;
 	unsigned int period = corot_periods[0];
 	unsigned int delay = period;
@@ -5930,6 +6027,36 @@ static void corot_ftrig_tick(struct timer_list *t)
 
 	if (corot_ovl_map)
 		y_at_push = (readl(corot_ovl_map + 0x244) >> 16) & 0x1fff;
+	/* COROT r335: measure the DSI frame-done period (the real panel frame
+	 * time) next to the y readback.  If that period is shorter than
+	 * (2712 - y) * line_time, the frame is cut by the panel window and no
+	 * DPU height register can fix it. */
+	if (corot_ovl_map) {
+		u32 r335_sta = corot_dsi_map ? readl(corot_dsi_map + 0x0c) : 0;
+		unsigned long r335_d;
+
+		if (r335_sta & COROT_DSI_FRMDONE) {
+			if (r335_prev_done_j) {
+				r335_d = jiffies_to_usecs(jiffies - r335_prev_done_j);
+				if (r335_d > r335_period_us_max && r335_d < 200000UL)
+					r335_period_us_max = r335_d;
+			}
+			r335_prev_done_j = jiffies;
+			/* COROT r340: where has the OVL got to by the time this frame
+			 * is done?  See the r340 note on the statics. */
+			r340_ydone = (readl(corot_ovl_map + 0x244) >> 16) & 0x1fff;
+			if (r340_ydone < r340_ydone_min)
+				r340_ydone_min = r340_ydone;
+			if (r340_ydone > r340_ydone_max)
+				r340_ydone_max = r340_ydone;
+			r340_ydone_n++;
+		}
+		if (y_at_push < r335_y_min)
+			r335_y_min = y_at_push;
+		if (y_at_push > r335_y_max)
+			r335_y_max = y_at_push;
+		r335_n++;
+	}
 	if (held > held_max)
 		held_max = held;
 	held = 0;
@@ -6049,6 +6176,24 @@ static void corot_ftrig_tick(struct timer_list *t)
 report:
 	if (time_after_eq(jiffies, next_report)) {
 		next_report = jiffies + msecs_to_jiffies(5000);
+		if (r335_n)
+			pr_err("COROT r335 window: ovlY min=%u max=%u of 2712 (=%u%%) pushes=%u dsi_frame_max_us=%lu ovl_needs_us=%lu | dsc_enc_w=0x%08x dsc_pic_h=0x%08x dsi_vact=0x%08x rwt=0x%08x ovl_roi=0x%08x | ovlY_done=%u..%u n=%lu\n",
+			       r335_y_min, r335_y_max, r335_y_max * 100u / 2712u, r335_n,
+			       r335_period_us_max,
+			       (unsigned long)r335_y_max * 2786u * 1000u / 2712u,
+			       corot_dsc_map ? readl(corot_dsc_map + 0x3c) : 0,
+			       corot_dsc_map ? readl(corot_dsc_map + 0x1c) : 0,
+			       corot_dsi_map ? readl(corot_dsi_map + 0x2c) : 0,
+			       corot_dsi_map ? readl(corot_dsi_map + 0x410) : 0,
+			       corot_ovl_map ? readl(corot_ovl_map + 0x20) : 0,
+			       r340_ydone_min, r340_ydone_max, r340_ydone_n);
+		r335_y_min = 0x1fff;
+		r335_y_max = 0;
+		r335_n = 0;
+		r335_period_us_max = 0;
+		r340_ydone_min = 0x1fff;
+		r340_ydone_max = 0;
+		r340_ydone_n = 0;
 		pr_err("COROT-FT phase=%u bg=0x%08x pushed=%lu ur=%lu inp=%lu frm=%lu busy=%lu force=%lu aeof=%lu | dsi_us n=%lu avg=%lu max=%lu to=%lu | ovl_us avg=%lu max=%lu to=%lu | ovlY at_push=%u in_frame=%u..%u | dsi=0x%08x dsc=0x%08x con10=0x%08x\n",
 		       corot_p48, corot_p48_bg[corot_p48],
 		       pushed, n_ur, n_inp, n_frm, n_busy, n_force, n_dsc_aeof,
@@ -6066,6 +6211,9 @@ report:
 		       corot_dsi_map ? readl(corot_dsi_map + 0x2c) : 0,
 		       corot_dsi_map ? readl(corot_dsi_map + 0x38) : 0,
 		       corot_dsi_map ? readl(corot_dsi_map + 0x1c) : 0);
+	if (corot_r309_crtc)
+		pr_err("COROT r322 late: is_dual_pipe=%d\n",
+		       corot_r309_crtc->is_dual_pipe);
 	if (corot_dsi_map)
 		pr_err("COROT r310 dsi timing: vsa=%u vbp=%u vfp=%u vact=%u (want 10/54/10/2712)\n",
 		       readl(corot_dsi_map + 0x20), readl(corot_dsi_map + 0x24),
@@ -6082,14 +6230,11 @@ report:
 	 * then arrives. */
 	if (delay < COROT_R308_MIN_MS)
 		delay = COROT_R308_MIN_MS;
-	/* COROT r315: repaint the colour ruler from the per-frame tick (every 30th
-	 * frame), not from the one-shot fps_delayed() where the console immediately
-	 * painted over it. */
-	{
-		static unsigned int n;
-		if ((++n % 30u) == 1u)
-			corot_r312_ruler();
-	}
+	/* COROT r339: the r315 call site is retired.  r338 put the one-shot painter
+	 * here (every 30th frame) and the round produced no paint line at all,
+	 * while this timer provably kept ticking.  The painter now runs from
+	 * corot_r339_paint_work, armed at late_initcall -- do NOT put per-frame or
+	 * per-timer work back into this function. */
 	mod_timer(&corot_ftrig_timer, jiffies + msecs_to_jiffies(delay));
 }
 
@@ -6267,53 +6412,143 @@ static void corot_r307_xbar(void)
 
 /* COROT r312: paint a colour ruler into the buffer the display scans, so the
  * panel itself reports how many lines the hardware really refreshes. */
-static void corot_r312_ruler(void)
+/*
+ * COROT r340: SELF-REPAINTING framebuffer instrument, on COROT r339's arm site.
+ *
+ * r339 proved this painter runs and printed the two addresses, but it painted
+ * exactly once at +20 s and the console covered it at once, so the round produced
+ * a photograph of console noise instead of a photograph of the pattern.  r340
+ * keeps the same delayed work and the same arm site and makes the work re-arm
+ * ITSELF every second, so ANY photo taken during the 120-240 s initramfs window
+ * is a photo of the pattern.
+ *
+ * WHY 1 Hz IS SAFE
+ *   One pass is 1220 * 2712 = 3,308,640 writel()s.  Through memremap(MEMREMAP_WB)
+ *   those are plain cached stores, so a pass costs 10-30 ms.  1 Hz is therefore a
+ *   <=3% duty cycle on ONE kworker of the shared system workqueue, and because
+ *   the work re-arms itself with a FULL HZ delay a slow pass postpones the next
+ *   pass instead of stacking work.  This is deliberately NOT the r336 design:
+ *   r336 hung the paint off the per-frame tick / display timer, i.e. softirq
+ *   context, where a 30 ms burst blocked the TE and frame-push path and wedged
+ *   the box.  Nothing in the display path may call this, and it must never be
+ *   moved onto a timer.
+ *
+ * WHY THE MAPPING IS TAKEN ONCE
+ *   memremap() of 13 MB sets up page tables and is the costly part; redoing it
+ *   every second would churn and could fail under memory pressure.  The mapping
+ *   is taken on the first pass and reused by every later pass.  The abort-and-log
+ *   safety valve is kept, and it is now also the loop terminator: if neither
+ *   memremap() nor ioremap() works, say so ONCE and stop rescheduling instead of
+ *   retrying forever.
+ *
+ * WHAT THE PATTERN LETS A PHOTOGRAPH MEASURE (no log needed)
+ *   quadrants  rows 0..1389 red | green at x=610, rows 1398..2711 blue | white
+ *   boundary   solid white bar, rows 1390..1400 -- it straddles 1398
+ *   below bar  cyan, rows 1401..1520: "did the boundary move?" at a glance
+ *   last row   yellow, row 2711
+ *   row grid   white line every 128 rows   -> counts rows up the panel
+ *   col grid   white line every 122 px (10 cells across 1220 px) and a black
+ *              line 61 px later, so the grid also reads inside the white quadrant
+ *   A per-line byte shortfall shows up as a diagonal shear; the column grid makes
+ *   its slope countable in px/row and its wrap period countable in rows.
+ */
+static void __iomem *corot_r340_fb;
+static int corot_r340_fb_state;	/* -1 = gave up, 0 = not mapped yet, 1 = mapped */
+static int corot_r340_fb_ioremap;
+static unsigned int corot_r340_pass;
+
+static int corot_r340_map_once(void)
 {
-	static const u32 band[7] = {
-		0x00ff0000, 0x0000ff00, 0x00ff8000, 0x00ffff00,
-		0x0000ffff, 0x000000ff, 0x00ff00ff
-	};
-	void __iomem *o, *fb;
-	u32 pa;
+	u32 pa = 0xfda1f000u;
+
+	if (corot_r340_fb_state)
+		return corot_r340_fb_state;
+
+	corot_r340_fb = memremap(pa, 1220u * 2712u * 4u, MEMREMAP_WB);
+	if (!corot_r340_fb) {
+		corot_r340_fb = ioremap(pa, 1220u * 2712u * 4u);
+		if (corot_r340_fb)
+			corot_r340_fb_ioremap = 1;
+	}
+	if (!corot_r340_fb) {
+		pr_err("COROT r340 paint: ABORT, neither memremap nor ioremap worked for 0xfda1f000 -- repaint loop stopped\n");
+		corot_r340_fb_state = -1;
+		return -1;
+	}
+	corot_r340_fb_state = 1;
+	pr_err("COROT r340 paint: mapping=%s taken once and reused by every repaint\n",
+	       corot_r340_fb_ioremap ? "ioremap" : "memremap-WB");
+	return 1;
+}
+
+static void corot_r340_paint_once(void)
+{
+	u32 pa_reg = corot_ovl_map ? readl(corot_ovl_map + 0xf40) : 0;
+	u32 pa_use = 0xfda1f000u;
 	unsigned int y, x;
 
-	if (!corot_ovl_map)
-		return;
-	o = corot_ovl_map;
-	pa = readl(o + 0xf40);
-	if (!pa)
-		return;
-	fb = ioremap(pa, 1220u * 2712u * 4u);
-	if (!fb)
-		return;
+	if (corot_r340_pass == 1u || (corot_r340_pass % 10u) == 0u)
+		pr_err("COROT r340 paint: ovl_l0_reg=0x%08x paint_pa=0x%08x %s%s\n",
+		       pa_reg, pa_use,
+		       (pa_reg == pa_use) ? "(equal)" : "(DIFFERENT)",
+		       corot_ovl_map ? "" : " [no OVL map: register readback unavailable]");
 
-	/* COROT r315: colour ruler -- 7 bands of 128 lines, a bright magenta line
-	 * exactly at 1398 (where every frame has stopped so far) and a white line
-	 * at the very bottom of the panel. */
 	for (y = 0; y < 2712u; y++) {
-		u32 c = band[(y / 128u) % 7u];
+		for (x = 0; x < 1220u; x++) {
+			u32 c;
 
-		if (y == 1398u)
-			c = 0x00ff00ff;
-		else if (y == 2711u)
-			c = 0x00ffffff;
-		for (x = 0; x < 1220u; x++)
-			writel(c, fb + (y * 1220u + x) * 4u);
-	}
+			if (y >= 1390u && y <= 1400u)
+				c = 0x00ffffffu;	/* white bar on the 1398 boundary */
+			else if (y >= 1401u && y <= 1520u)
+				c = 0x0000ffffu;	/* cyan: the region just below the bar */
+			else if (y == 2711u)
+				c = 0x00ffff00u;	/* yellow: the very last row */
+			else if (y < 1398u)
+				c = (x < 610u) ? 0x00ff0000u : 0x0000ff00u;
+			else
+				c = (x < 610u) ? 0x000000ffu : 0x00ffffffu;
 
-	/* one-shot confirmation: where we wrote vs where the OVL reads */
-	{
-		static int done;
-		if (!done) {
-			done = 1;
-			pr_err("COROT r313: painted pa=0x%08x ovl_l0=0x%08x ovl_l0msb=0x%08x | readback[0]=0x%08x [mid]=0x%08x [last]=0x%08x\n",
-			       pa, readl(o + 0xf40), readl(o + 0xf44),
-			       readl(fb), readl(fb + (1220u * 1356u * 4u)),
-			       readl(fb + (1220u * 2711u * 4u) + 1220u * 4u - 4u));
+			if ((y % 128u) == 0u)
+				c = 0x00ffffffu;	/* row grid: white every 128 rows */
+			else if ((x % 122u) == 0u)
+				c = 0x00ffffffu;	/* column grid: white every 122 px */
+			else if ((x % 122u) == 61u)
+				c = 0x00000000u;	/* half a cell later: black */
+
+			writel(c, corot_r340_fb + (y * 1220u + x) * 4u);
 		}
 	}
-	iounmap(fb);
 }
+
+static void corot_r340_paint_work(struct work_struct *w);
+static DECLARE_DELAYED_WORK(corot_r340_paint_dw, corot_r340_paint_work);
+
+static void corot_r340_paint_work(struct work_struct *w)
+{
+	if (corot_r340_fb_state < 0)
+		return;		/* the valve already spoke: the loop is stopped */
+	if (corot_r340_map_once() < 0)
+		return;		/* no mapping: do NOT reschedule and do NOT retry */
+
+	corot_r340_pass++;
+	corot_r340_paint_once();
+	pr_err("COROT r340 repaint: pass %u done (bar 1390-1400, cyan 1401-1520, white every 128 rows, white+black every 122 px, yellow row 2711), next pass in 1 s\n",
+	       corot_r340_pass);
+	schedule_delayed_work(&corot_r340_paint_dw, HZ);
+}
+
+/*
+ * COROT r340: the arm site, unchanged in kind from COROT r339's late_initcall --
+ * it runs from the kernel_init thread before user space exists, so the display
+ * stack cannot skip it, delay it or cancel it, and it says so immediately.
+ */
+static int __init corot_r340_paint_arm(void)
+{
+	pr_err("COROT r340 marker: painter armed, SELF-REPAINTING at 1 Hz from +20 s (workqueue only: no display callback, no timer) -- this string exists in no earlier build\n");
+	schedule_delayed_work(&corot_r340_paint_dw, 20u * HZ);
+	return 0;
+}
+late_initcall(corot_r340_paint_arm);
 
 static void corot_r299_blank(void)
 {

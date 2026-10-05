@@ -28,8 +28,16 @@
 	aliases {
 		mutex0 = &disp_mutex0;
 		dsi0 = &dsi0;
+		dsi1 = &dsi1;
 		dsc0 = &disp_dsc_wrap0;
 		ovl3 = &disp_ovl0_2l;
+		/* COROT r332: without this, disp_ovl1_2l@14403000 has no
+		 * 'ovl' alias, of_alias_get_id() fails and
+		 * mtk_ddp_comp_get_id() falls back to the first
+		 * MTK_DISP_OVL match table row = DDP_COMPONENT_OVL0,
+		 * leaving priv->ddp_comp[DDP_COMPONENT_OVL1_2L] NULL --
+		 * which is the component r332's dual path names. */
+		ovl4 = &disp_ovl1_2l;
 		rdma0 = &disp_rdma0;
 		pwm0 = &disp_pwm0;
 		tdshp0 = &disp_tdshp0;
@@ -581,6 +589,17 @@
 		clock-names = "vpp0";
 	};
 
+	/* COROT r327: the second pipe's OVL.  Without it, enabling dual pipe makes
+	 * the driver look up a component that does not exist and the device hangs at
+	 * the boot logo. */
+	disp_ovl1_2l: disp-ovl1@14403000 {
+		compatible = "mediatek,mt6985-disp-ovl";
+		reg = <0x0 0x14403000 0x0 0x1000>;
+		interrupts = <GIC_SPI 388 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ovlsys_clk CLK_OVL_OVL0_2L>;
+		clock-names = "vpp1";
+	};
+
 	disp_dsc_wrap0: disp-dsc-wrap0@1400c000 {
 		compatible = "mediatek,disp_dsc_wrap0",
 				"mediatek,mt6985-disp-dsc";
@@ -740,6 +759,13 @@
 	};
 
 	dispsys_config: dispsys-config@14000000 {
+		/* COROT r325: the vendor/Android DTS enables this option, and it is what
+		 * makes mtk_crtc_is_dual_pipe() true for a DSC single-port panel using
+		 * slice_mode = 1 -- i.e. the two pipes that give the DSC its two slices
+		 * and the panel its full 1220-pixel width.  Deliberately minimal: any
+		 * option not listed here reads back as 0. */
+		helper-name = "MTK_DRM_OPT_PRIM_DUAL_PIPE";
+		helper-value = <1>;
 		compatible = "mediatek,mt6985-disp";
 		reg = <0x0 0x14000000 0x0 0x1000>,
 		      <0x0 0x14200000 0x0 0x1000>,
@@ -1143,6 +1169,25 @@
 		status = "okay";
 	};
 
+	/* COROT r332: the second MIPI-TX D-PHY, the one that feeds
+	 * dsi1@1420d000.  Vendor reference: compatible
+	 * "mediatek,mipi_tx_config1", "mediatek,mt6985-mipi-tx", reg
+	 * 0x11e60000 0x1000, clocks <&clk26m>, #clock-cells <0>,
+	 * clock-output-names "mipi_tx1_pll".  Our driver only matches
+	 * "mediatek,mt6985-mipi-tx" (mtk_mipi_tx.c:4445) and only reads
+	 * clock-output-names plus the first clock (mtk_mipi_tx.c:3867-3881),
+	 * and our tree does not model the MT6985 CCF clocks, so this node
+	 * mirrors mipi_tx_config0 above instead of the vendor wording. */
+	mipi_tx_config1: mipi-tx@11e60000 {
+		compatible = "mediatek,mt6985-mipi-tx";
+		reg = <0x0 0x11e60000 0x0 0x1000>;
+		clocks = <&clk26m>;
+		clock-names = "mpll";
+		clock-output-names = "mipi_tx1_pll";
+		#phy-cells = <0>;
+		status = "okay";
+	};
+
 	dsi0: dsi@1400d000 {
 		compatible = "mediatek,mt6985-dsi";
 		reg = <0x0 0x1400d000 0x0 0x1000>;
@@ -1178,6 +1223,69 @@
 				reg = <0>;
 				dsi_out: endpoint {
 					remote-endpoint = <&panel_in>;
+				};
+			};
+
+			/* COROT r334: graph port index 1 is where the in-tree dual-DSI
+			 * model looks for the slave link:
+			 *   mtk_dsi.c:4872 of_graph_get_remote_node(dsi->dev->of_node, 1, 0)
+			 * Its remote-endpoint is dsi1_in below, i.e. the remote port's
+			 * parent node is dsi1@1420d000 itself, which is what
+			 * of_find_device_by_node()/platform_get_drvdata() then turn into
+			 * the `slave_dsi` pointer. */
+			port@1 {
+				reg = <1>;
+				dsi0_dsi1: endpoint {
+					remote-endpoint = <&dsi1_in>;
+				};
+			};
+		};
+	};
+
+	/* COROT r332/r334: the panel's SECOND MIPI-DSI link (dsi1@1420d000).
+	 * r334 turned this from a second independent panel host into the slave
+	 * link of dsi0 -- see apply_r334_dsi1_slave.py's docstring. */
+	dsi1: dsi@1420d000 {
+		compatible = "mediatek,mt6985-dsi";
+		reg = <0x0 0x1420d000 0x0 0x1000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 412 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_dsi_engine>, <&clk_dsi_digital>, <&clk_dsi_hs>;
+		clock-names = "engine", "digital", "hs";
+		phys = <&mipi_tx_config1>;
+		phy-names = "dphy";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		gce-subsys = <&gce 0x14000000 SUBSYS_1400XXXX>;
+		status = "okay";
+
+		/* COROT r334: the in-tree two-link model.  mtk_dsi.c:9275
+		 * `dsi->is_slave = of_property_read_bool(dev->of_node,
+		 * "mediatek,dual-dsi-slave")` and mtk_dsi.c:8944 `if (dsi->is_slave)
+		 * return 0;` in mtk_dsi_bind().  Consequences: dsi1 creates no
+		 * encoder, no connector and no priv->ddp_comp[DDP_COMPONENT_DSI1],
+		 * and its probe skips the panel lookup at mtk_dsi.c:9291 entirely --
+		 * which is why the panel@0 node above is gone and why this host has
+		 * no mipi_dsi_device of its own.  It is still fully driven through
+		 * the master: mtk_dsi_ddp_prepare -> mtk_dsi_poweron(slave)
+		 * (mtk_dsi.c:4324), mtk_output_dsi_enable ->
+		 * mtk_preconfig_dsi_enable(slave) (:2931) -> mtk_dsi_dual_enable
+		 * (:3048) -> mtk_dsi_set_mode/mtk_dsi_clk_hs_mode (:3066-3067),
+		 * mtk_dsi_phy_timconfig(slave) (:4773) and
+		 * mtk_mipi_tx_pll_rate_switch_gce(slave->phy) (:4831). */
+		mediatek,dual-dsi-slave;
+
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			/* COROT r334: dsi1's own port@0 is now the slave side of the
+			 * dsi0 -> dsi1 graph link.  It is deliberately NOT `port@1`:
+			 * dsi_find_slave() reads port index 1 of the MASTER only. */
+			port@0 {
+				reg = <0>;
+				dsi1_in: endpoint {
+					remote-endpoint = <&dsi0_dsi1>;
 				};
 			};
 		};

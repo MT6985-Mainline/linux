@@ -3268,9 +3268,33 @@ static const enum mtk_ddp_comp_id mt6985_mtk_ddp_main[] = {
 	DDP_COMPONENT_PWM0,
 };
 
+/*
+ * COROT r332: the second pipe of crtc0.
+ *
+ * One element, and no DSI1: mtk_ddp_connect_dual_pipe_path()
+ * (mtk_drm_ddp.c:11747-11754) connects the LAST element of this array to
+ * DDP_COMPONENT_DSI1 itself, which is the vendor convention too
+ * (mt6895_mtk_ddp_dual_main, mtk_drm_drv.c:1869-1888, has no DSI in it).
+ * This is also the array mtk_drm_crtc_find_ovl_comp_id() reads to find the
+ * second pipe's OVL (mtk_drm_crtc.c:10133-10135, :10190-10192).
+ * PWM1 is deliberately absent: for MTK_DISP_PWM prepare_dual_pipe()
+ * fabricates a register-less dummy comp (mtk_drm_crtc.c:1346-1353),
+ * mtk_ddp_add_comp_to_path() has no MMSYS_MT6985 case at all
+ * (mtk_drm_ddp.c:9918-10136) and our DTS has no pwm1 node, so it would buy
+ * no routing and one more mutex participant.
+ */
+static const enum mtk_ddp_comp_id mt6985_mtk_ddp_dual_main[] = {
+	DDP_COMPONENT_OVL1_2L,
+};
+
 static const struct mtk_crtc_path_data mt6985_mtk_main_path_data = {
 	.path[DDP_MAJOR][0] = mt6985_mtk_ddp_main,
 	.path_len[DDP_MAJOR][0] = ARRAY_SIZE(mt6985_mtk_ddp_main),
+	/* COROT r332: the second pipe of this crtc.  mtk_drm_crtc.h:320-340
+	 * only ever iterates __i < DDP_SECOND_PATH (=1), so index 0 is the
+	 * whole mechanism. */
+	.dual_path[0] = mt6985_mtk_ddp_dual_main,
+	.dual_path_len[0] = ARRAY_SIZE(mt6985_mtk_ddp_dual_main),
 };
 
 static const struct mtk_mmsys_driver_data mt6985_mmsys_driver_data = {

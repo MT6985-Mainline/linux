@@ -1628,6 +1628,22 @@ static void mtk_dsi_ps_control_vact(struct mtk_dsi *dsi)
 #else
 	val = (val & (~0x7fff)) + 1220;
 	writel(val, dsi->regs + DSI_PSCTRL);
+	/*
+	 * COROT r340: 407 is CORRECT and is deliberately left alone.  It is the
+	 * vendor's own arithmetic (linux-corot-t-oss/.../mtk_dsi.c:1590-1592):
+	 * size_low = ceil(chunk_size * (slice_mode + 1) / dsi_buf_bpp)
+	 *          = ceil(610 * 2 / 3) = ceil(1220/3) = 407, in 3-byte units, so the
+	 * line is 407 * 3 = 1221 bytes.  That is exactly what the DSC encoder emits:
+	 * mtk_disp_dsc.c:409-410 computes pad_num = 1221 - 1220 = 1 and writes it to
+	 * DISP_REG_DSC_PAD (:453), padding the WHOLE line rather than each slice, and
+	 * the encoder's own PIC_W group count (:429) is (1220+2)/3 = 407.  LK's
+	 * handoff state has the same pair (mtk_drm_crtc.c, corot_r265_lk_state:
+	 * 0x01c -> 0x2c0504c4, 0x038 -> 0x0a980197).  408 would be the per-slice
+	 * padding of the #ifndef branch and would NOT match this encoder.
+	 * Live evidence: "COROT r307: PSCTRL=0x2c0504c4 SIZE_CON=0x0a980197".
+	 * The residual PSCTRL(1220) vs SIZE_CON(1221) byte is the vendor's own pair
+	 * and can only affect DSI_TX_BUF_RW_TIMES, never the per-line payload.
+	 */
 	size = (size & (~0x7fff)) + 407;
 	writel(size, dsi->regs + DSI_SIZE_CON);
 	/* dump 0x1C 0x38 */
@@ -4321,8 +4337,21 @@ static void mtk_dsi_ddp_prepare(struct mtk_ddp_comp *comp)
 
 	mtk_dsi_poweron(dsi);
 
-	if (dsi->slave_dsi)
+	if (dsi->slave_dsi) {
+		/* COROT r334: nothing in this tree ever gives a slave DSI a CRTC owner.
+		 * A slave is not in the main path, so mtk_crtc_attach_ddp_comp() never
+		 * reaches it, yet mtk_dsi_poweron() dereferences
+		 * dsi->ddp_comp.mtk_crtc->base.dev->dev_private on its first line
+		 * (mtk_dsi.c:1219) and mtk_dsi_clk_hs_mode() does the same
+		 * (mtk_dsi.c:1295).  Adopt the master's CRTC here: this is the one
+		 * point where it is known and before anything powers the slave on. */
+		dsi->slave_dsi->ddp_comp.mtk_crtc = comp->mtk_crtc;
+		pr_err("COROT r334 slave poweron: owner=%p slave_comp_id=%d "
+		       "slave_intsta=0x%08x\n",
+		       comp->mtk_crtc, dsi->slave_dsi->ddp_comp.id,
+		       readl(dsi->slave_dsi->regs + DSI_INTSTA));
 		mtk_dsi_poweron(dsi->slave_dsi);
+	}
 
 	/* Workaround: CMDQ first-enable should clear DSI_INTSTA, but mainline CMDQ
 	 * packets are failing before that write. Clear it directly here so the
@@ -4887,6 +4916,17 @@ static void mtk_dsi_config_slave(struct mtk_dsi *dsi, struct mtk_dsi *slave)
 {
 	/* introduce controllers to each other */
 	dsi->slave_dsi = slave;
+
+	/* COROT r334: the graph link at graph port index 1 resolved and the slave's
+	 * platform device already has its drvdata, so the two controllers are now
+	 * introduced to each other.  This is the strongest driver-level proof
+	 * that the second link is bound -- it can only run when
+	 * dsi_find_slave() (mtk_dsi.c:4860) found a probed device at
+	 * of_graph_get_remote_node(dsi->dev->of_node, 1, 0). */
+	pr_err("COROT r334 slave link bound: master=%pOF slave=%pOF "
+	       "slave_comp_id=%d lanes=%d fmt=%d flags=0x%x\n",
+	       dsi->dev->of_node, slave->dev->of_node, slave->ddp_comp.id,
+	       dsi->lanes, dsi->format, dsi->mode_flags);
 
 	/* migrate settings for already attached displays */
 	dsi->slave_dsi->lanes = dsi->lanes;

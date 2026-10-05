@@ -560,6 +560,28 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 				readl(baddr + DISP_REG_DSC_BUF_SIZE),
 				readl(baddr + DISP_REG_DSC_PPS0),
 				readl(baddr + DISP_REG_DSC_PPS1));
+
+			/*
+			 * COROT r340: MEASURE which range-parameter table the encoder holds.
+			 * Nothing has ever read these back after our own write -- every
+			 * DSC-FULL dump in the r331..r339 logs is LK's stale value, printed
+			 * before the CMDQ packet lands -- so "the encoder's bits-per-group
+			 * table equals the DDIC decoder's" was never verified.  These four
+			 * words decide it, and LK leaves
+			 * 0xd9c7e1a7 0xd209d9e9 0xd22bd229 0x0000d271 here (which is also
+			 * what the vendor's CONFIG_MI_DISP_DSC2712=y table programs).
+			 */
+			pr_err("COROT r340 pps: sel=0x%08x PPS12=0x%08x PPS13=0x%08x PPS14=0x%08x PPS15=0x%08x\n",
+			       dsc_params->dsc_config_panel_name,
+			       readl(baddr + DISP_REG_DSC_PPS12),
+			       readl(baddr + DISP_REG_DSC_PPS13),
+			       readl(baddr + DISP_REG_DSC_PPS14),
+			       readl(baddr + DISP_REG_DSC_PPS15));
+			pr_err("COROT r340 pps: PPS16=0x%08x PPS17=0x%08x PPS18=0x%08x PPS19=0x%08x  (LK and the vendor DSC2712 table: d9c7e1a7 d209d9e9 d22bd229 0000d271)\n",
+			       readl(baddr + DISP_REG_DSC_PPS16),
+			       readl(baddr + DISP_REG_DSC_PPS17),
+			       readl(baddr + DISP_REG_DSC_PPS18),
+			       readl(baddr + DISP_REG_DSC_PPS19));
 		}
 
 		reg_val = ((dsc_params->flatness_minqp == 0) ?

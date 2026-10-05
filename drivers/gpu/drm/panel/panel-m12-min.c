@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>	/* COROT r339: the fcon readback work */
 
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_panel.h>
@@ -146,6 +147,157 @@ static const struct m12_cmd m12_fps_144[] = {
 };
 
 static struct mipi_dsi_device *g_m12_dsi;
+/*
+ * COROT r339: vendor gir_on_reload (panel-m12-42-02-0a-dsc-cmd.h:222-233),
+ * VERBATIM, 7 commands.  The vendor sends this BEFORE the 60 Hz table at init
+ * (:538) -- it is the GIR reload trigger, so it is meaningless after the GIR-ON
+ * write.  Entry [1] is the vendor's "//need update" placeholder {0xB4,{0x17}};
+ * the vendor falls back to 0x13 when the panel build id is unknown (:530-535).
+ */
+static const struct m12_cmd corot_r339_gir_on_reload[] = {
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x04),	/* Page4 */
+	M12C(0xb4,0x17),			/* vendor "need update" (fallback 0x13) */
+	M12C(0x6f,0x15),
+	M12C(0xb4,0x1f,0x00,0x00,0x0d,0x63),
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00),	/* Page0 */
+	M12C(0x6f,0x09),
+	M12C(0xc0,0x00,0x40,0x00),
+};
+
+/*
+ * COROT r339: vendor mode_60hz_setting_gir_on (header:533-551), VERBATIM, 8
+ * commands.  Byte-for-byte the same DCS stream as m12_fps_60[] above (r51 +
+ * r288) -- the key writes are 0x2F(FCON)=0x08 (60 Hz) and 0xB3(EM duty)=0x14.
+ */
+static const struct m12_cmd corot_r339_mode_60hz_gir_on[] = {
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x00),	/* Page0 */
+	M12C(0x6f,0x44),			/* EM duty page */
+	M12C(0xb3,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14,0x00,0x14),
+	M12C(0x2f,0x08),			/* FCON5 (HFR5) = 60 Hz */
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x08),	/* Page8 */
+	M12C(0x6f,0x07),
+	M12C(0xb9,0x00,0x00,0x00,0x00),	/* GIR ON readdate 1~4 (vendor: need update) */
+	M12C(0x5f,0x00),			/* GIR ON */
+};
+
+/*
+ * COROT r339: vendor gir_on_gamma_update (header:213-220), VERBATIM, 4 commands.
+ * The vendor pushes this immediately after the 60 Hz table at init (:575).
+ */
+static const struct m12_cmd corot_r339_gir_on_gamma_update[] = {
+	M12C(0xf0,0x55,0xaa,0x52,0x08,0x02),	/* Page2 */
+	M12C(0xcc,0x30),			/* GAMMA UPDATE */
+	M12C(0xce,0x01),
+	M12C(0xcc,0x00),
+};
+
+static void corot_r339_fcon_work(struct work_struct *w);
+static DECLARE_DELAYED_WORK(corot_r339_fcon_dw, corot_r339_fcon_work);
+
+/*
+ * COROT r339: the vendor's 60 Hz INIT sequence, once, in the vendor's order.
+ *
+ * Call site: corot_m12_apply_fps_tag(), 60 Hz case, immediately after the
+ * r51/r288 table and inside the same dsi_en window -- so it uses whatever
+ * mechanism is live (r265 raw sender during r273's "stopping frame push,
+ * delivering 60 Hz table" window, the host DCS path otherwise).
+ *
+ * The marker prints the number of commands ACTUALLY sent, which is the only
+ * honest measure of whether the sequence reached the panel.
+ */
+static void corot_r339_send_vendor_fps60_once(void)
+{
+	static bool done;
+	const struct m12_cmd *tbls[3];
+	unsigned int nrs[3], t, i, sent = 0, want = 0, ok = 0, bad = 0;
+	u8 first_bad = 0;
+	int first_ret = 0;
+
+	if (done)
+		return;
+	done = true;
+
+	if (!g_m12_dsi) {
+		pr_err("COROT r339 fps60: ABORT, no dsi (m12_min_probe has not run)\\n");
+		return;
+	}
+
+	tbls[0] = corot_r339_gir_on_reload;
+	nrs[0] = sizeof(corot_r339_gir_on_reload) / sizeof(corot_r339_gir_on_reload[0]);
+	tbls[1] = corot_r339_mode_60hz_gir_on;
+	nrs[1] = sizeof(corot_r339_mode_60hz_gir_on) / sizeof(corot_r339_mode_60hz_gir_on[0]);
+	tbls[2] = corot_r339_gir_on_gamma_update;
+	nrs[2] = sizeof(corot_r339_gir_on_gamma_update) / sizeof(corot_r339_gir_on_gamma_update[0]);
+
+	pr_err("COROT r339 fps60: sending vendor init sequence (gir_on_reload=%u + mode_60hz_setting_gir_on=%u + gir_on_gamma_update=%u = %u cmds, gir_status=1 dynamic_fps=60)\
+",
+	       nrs[0], nrs[1], nrs[2], nrs[0] + nrs[1] + nrs[2]);
+
+	for (t = 0; t < 3; t++) {
+		for (i = 0; i < nrs[t]; i++) {
+			int ret = m12_write_cmd(g_m12_dsi, &tbls[t][i]);
+
+			want++;
+			if (ret < 0) {
+				bad++;
+				if (!first_bad) {
+					first_bad = tbls[t][i].cmd;
+					first_ret = ret;
+				}
+			} else {
+				ok++;
+				sent++;
+			}
+		}
+	}
+
+	pr_err("COROT r339 fps60: sent %u/%u cmds ok=%u fail=%u firstfail=0x%02x/%d (vendor order: reload, mode60, gamma)\
+",
+	       sent, want, ok, bad, first_bad, first_ret);
+	/* COROT r339: only a delivery that got at least one command through counts
+	 * as done.  If the window was wrong, nothing was acknowledged -- re-arm the
+	 * one-shot so the next 60 Hz call retries instead of losing the sequence. */
+	if (!ok) {
+		pr_err("COROT r339 fps60: nothing acknowledged, one-shot re-armed\
+");
+		done = false;
+	}
+
+	/* COROT r339: read 0x2F back 25 s later, from process context, long after
+	 * r273's raw-mode window closed (r266 skips the readback while it is open).
+	 * Scheduled at +25 s so it cannot interfere with the +20 s painter. */
+	schedule_delayed_work(&corot_r339_fcon_dw, 25u * HZ);
+}
+
+/*
+ * COROT r339: the measurement.  DCS 0x2F (FCON5) is the register the 60 Hz table
+ * writes 0x08 into.  This runs in a workqueue, i.e. it may sleep and it cannot
+ * be starved by the frame-push timer; if the DCS read path stalls, it stalls
+ * one kworker, not the display.
+ */
+static void corot_r339_fcon_work(struct work_struct *w)
+{
+	static u8 rb[2] = { 0, 0 };
+	struct m12_cmd pg0 = {
+		.cmd = 0xf0,
+		.len = 5,
+		.data = { 0x55, 0xaa, 0x52, 0x08, 0x00 },
+	};
+	int ret;
+
+	if (!g_m12_dsi) {
+		pr_err("COROT r339 fcon: no dsi\\n");
+		return;
+	}
+	pr_err("COROT r339 fcon: reading DCS 0x2f (raw mode is long over)\\n");
+	m12_write_cmd(g_m12_dsi, &pg0);
+	ret = mipi_dsi_dcs_read(g_m12_dsi, 0x2f, rb, 1);
+	pr_err("COROT r339 fcon: FCON(0x2f)=0x%02x ret=%d want=0x08 => %s\
+",
+	       rb[0], ret,
+	       (ret >= 0 && rb[0] == 0x08) ? "DDIC IS AT 60 Hz"
+					   : "DDIC IS NOT AT 60 Hz (0x2f did not take)");
+}
 
 /*
  * COROT r87: the FCON write has to be observable.
@@ -235,6 +387,11 @@ int corot_m12_apply_fps_tag(unsigned int fps, const char *tag)
 	}
 	pr_err("COROT-FPSR r87 result[%s]: cmds=%u ok=%u fail=%u firstfail=0x%02x/%d\n",
 	       tag, nr, ok, bad, first_bad < 0 ? 0 : first_bad, first_ret);
+
+	/* COROT r339: the vendor's own 60 Hz init sequence, in the
+	 * vendor's order, sent once.  See apply_r339_fps60.py. */
+	if (fps == 60)
+		corot_r339_send_vendor_fps60_once();
 
 	/* the table ends on page 8, so re-select page 0 before reading FCON */
 	{
@@ -357,7 +514,7 @@ static const struct drm_panel_funcs m12_min_panel_funcs = {
  * bottom half of the panel was never written.  This bring-up bypasses the DSC
  * anyway, so describe the panel as single-pipe and let one pipe cover the full
  * frame. */
-#define M12_DSC_SLICE_MODE          1	/* COROT r314: 2 x 610 = 1220 wide, with the driver's packet values */
+#define M12_DSC_SLICE_MODE          1 /* COROT r335: vendor DSC_SLICE_MODE is 1; 0 gives DSC_ENC_WIDTH=610<<16|610, half this panel's width */
 #define M12_DSC_RGB_SWAP            0
 #define M12_DSC_DSC_CFG             40
 #define M12_DSC_RCT_ON              1
@@ -365,9 +522,9 @@ static const struct drm_panel_funcs m12_min_panel_funcs = {
 #define M12_DSC_LINE_BUF_DEPTH      11
 #define M12_DSC_BP_ENABLE           1
 #define M12_DSC_BIT_PER_PIXEL       128
-#define M12_DSC_SLICE_HEIGHT        12
-#define M12_DSC_SLICE_WIDTH         610	/* COROT r306: back to the vendor value */
-#define M12_DSC_CHUNK_SIZE          610	/* COROT r306: back to the vendor value */
+#define M12_DSC_SLICE_HEIGHT        12	/* COROT r322: vendor value */
+#define M12_DSC_SLICE_WIDTH         610	/* COROT r322: vendor value */	/* COROT r306: back to the vendor value */
+#define M12_DSC_CHUNK_SIZE          610	/* COROT r322: vendor value */	/* COROT r306: back to the vendor value */
 #define M12_DSC_XMIT_DELAY          512
 #define M12_DSC_DEC_DELAY           562
 #define M12_DSC_SCALE_VALUE         32
