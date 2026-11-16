@@ -161,3 +161,40 @@ ccflags-$(CONFIG_DRM_PANEL_L16_36_02_0B_DSC_VDO) += \
 	-I$(srctree)/drivers/misc/mediatek/include/mt-plat/ \
 	-I$(srctree)/drivers/gpu/drm/
 obj-$(CONFIG_DRM_PANEL_M12_MIN) += panel-m12-min.o
+
+obj-$(CONFIG_DRM_PANEL_COROT_M12) += panel-m12-42-02-0a-dsc-cmd.o panel-m12-36-02-0b-dsc-cmd.o
+obj-$(CONFIG_DRM_PANEL_COROT_M12_SECONDARY) += panel-m12-42-02-0a-dsc-cmd-2nd.o panel-m12-36-02-0b-dsc-cmd-2nd.o
+ccflags-y += -I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/mi_disp/
+
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/cmdq/mailbox/
+
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/mmp/
+
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/
+
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/mt-plat/
+
+# Complete corot panels are built independently of the vendor panel menu.
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/ \
+	-I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/mi_disp/ \
+	-I$(srctree)/drivers/misc/mediatek/mmp/ \
+	-I$(srctree)/drivers/misc/mediatek/cmdq/mailbox/ \
+	-I$(srctree)/drivers/misc/mediatek/include/ \
+	-I$(srctree)/drivers/misc/mediatek/include/mt-plat/
+
+# corot full-panel dependency closure
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/mi_disp/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/gpu/drm/mediatek/mml/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/gpu/drm/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/mmp/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/cmdq/mailbox/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/iommu/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/vcp/include/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/mtk-interconnect/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/slbc/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/clkbuf/v1/inc/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/include/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/include/mt-plat/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -I$(srctree)/drivers/misc/mediatek/tinysys_scmi/
+ccflags-$(CONFIG_DRM_PANEL_COROT_M12) += -ferror-limit=0
