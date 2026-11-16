@@ -15,6 +15,10 @@
 #define EREQ_DONE		3 /* already requested */
 #define EREQ_MASKED		4 /* req madk bit set */
 #define EDISABLED		5 /* req madk bit set */
+#define EID_WRONG		6 /* wrong id */
+#define EREF_NOT_ZERO		7 /* ref not zero */
+#define EREQ_TIMEOUT		8 /* req timeout */
+#define EREQ_WAIT_FAIL		9 /* req wait fail */
 
 /* call back return value */
 #define CB_DONE			0 /* no need to use*/
@@ -46,10 +50,19 @@ enum slbc_uid {
 	UID_MML,
 	UID_DSC_IDLE,
 	UID_AINR,
-	UID_TEST_BUFFER,
+	UID_TEST_BUFFER, /* 0x10 */
 	UID_TEST_CACHE,
 	UID_TEST_ACP,
 	UID_DISP,
+	UID_AOV_DC,
+	UID_AOV_APU,
+	UID_AISR_APU,
+	UID_AISR_MML,
+	UID_SH_P1,
+	UID_SMT,
+	UID_APU,
+	UID_AOD,
+	UID_BIF,
 	UID_MAX,
 };
 
@@ -97,9 +110,12 @@ struct slbc_data {
 	ssize_t size;
 	unsigned int flag;
 	int ret;
+	unsigned int timeout;
+	void *user_cb_data;
 	/* below used by slbc driver */
 	void __iomem *paddr;
 	void __iomem *vaddr;
+	void __iomem *emi_paddr;
 	unsigned int sid;
 	unsigned int slot_used;
 	void *config;
@@ -124,53 +140,68 @@ struct slbc_ops {
 	struct list_head node;
 	struct slbc_data *data;
 	int (*activate)(struct slbc_data *data);
-	void (*deactivate)(struct slbc_data *data);
+	int (*deactivate)(struct slbc_data *data);
 };
 
-extern int slbc_enable;
-extern char *slbc_uid_str[UID_MAX];
+extern unsigned int slbc_enable;
+extern char *slbc_uid_str[UID_MAX + 1];
 extern int popcount(unsigned int x);
 
 #if IS_ENABLED(CONFIG_MTK_SLBC)
+extern int slbc_status(struct slbc_data *d);
 extern int slbc_request(struct slbc_data *d);
 extern int slbc_release(struct slbc_data *d);
 extern int slbc_power_on(struct slbc_data *d);
 extern int slbc_power_off(struct slbc_data *d);
 extern int slbc_secure_on(struct slbc_data *d);
 extern int slbc_secure_off(struct slbc_data *d);
+extern int slbc_register_activate_ops(struct slbc_ops *ops);
+extern int slbc_activate_status(struct slbc_data *d);
 extern void slbc_update_mm_bw(unsigned int bw);
 extern void slbc_update_mic_num(unsigned int num);
 extern void slbc_update_inner(unsigned int inner);
 extern void slbc_update_outer(unsigned int outer);
 #else
-__attribute__ ((weak)) int slbc_request(struct slbc_data *d)
+__weak int slbc_status(struct slbc_data *d)
 {
 	return -EDISABLED;
 };
-__attribute__ ((weak)) int slbc_release(struct slbc_data *d)
+__weak int slbc_request(struct slbc_data *d)
 {
 	return -EDISABLED;
 };
-__attribute__ ((weak)) int slbc_power_on(struct slbc_data *d)
+__weak int slbc_release(struct slbc_data *d)
 {
 	return -EDISABLED;
 };
-__attribute__ ((weak)) int slbc_power_off(struct slbc_data *d)
+__weak int slbc_power_on(struct slbc_data *d)
 {
 	return -EDISABLED;
 };
-__attribute__ ((weak)) int slbc_secure_on(struct slbc_data *d)
+__weak int slbc_power_off(struct slbc_data *d)
 {
 	return -EDISABLED;
 };
-__attribute__ ((weak)) int slbc_secure_off(struct slbc_data *d)
+__weak int slbc_secure_on(struct slbc_data *d)
 {
 	return -EDISABLED;
 };
-__attribute__ ((weak)) void slbc_update_mm_bw(unsigned int bw) {}
-__attribute__ ((weak)) void slbc_update_mic_num(unsigned int num) {}
-__attribute__ ((weak)) void slbc_update_inner(unsigned int inner) {}
-__attribute__ ((weak)) void slbc_update_outer(unsigned int outer) {}
+__weak int slbc_secure_off(struct slbc_data *d)
+{
+	return -EDISABLED;
+};
+__weak int slbc_register_activate_ops(struct slbc_ops *ops)
+{
+	return -EDISABLED;
+};
+__weak int slbc_activate_status(struct slbc_data *d)
+{
+	return -EDISABLED;
+};
+__weak void slbc_update_mm_bw(unsigned int bw) {}
+__weak void slbc_update_mic_num(unsigned int num) {}
+__weak void slbc_update_inner(unsigned int inner) {}
+__weak void slbc_update_outer(unsigned int outer) {}
 #endif /* CONFIG_MTK_SLBC */
 
 #endif /* _SLBC_OPS_H_ */
