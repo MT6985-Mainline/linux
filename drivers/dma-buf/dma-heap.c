@@ -55,6 +55,30 @@ MODULE_PARM_DESC(mem_accounting,
 		 "Enable cgroup-based memory accounting for dma-buf heap allocations (default=false).");
 EXPORT_SYMBOL_NS_GPL(mem_accounting, "DMA_BUF_HEAP");
 
+struct dma_buf *dma_heap_buffer_alloc_by_name(const char *name, unsigned long len,
+                                             u32 fd_flags, u64 heap_flags)
+{
+    struct dma_heap *heap, *found = NULL;
+    unsigned long aligned = PAGE_ALIGN(len);
+
+    if (!name || !len || aligned < len ||
+        (fd_flags & ~DMA_HEAP_VALID_FD_FLAGS) ||
+        (heap_flags & ~DMA_HEAP_VALID_HEAP_FLAGS))
+        return ERR_PTR(-EINVAL);
+    mutex_lock(&heap_list_lock);
+    list_for_each_entry(heap, &heap_list, list) {
+        if (!strcmp(heap->name, name)) {
+            found = heap;
+            break;
+        }
+    }
+    mutex_unlock(&heap_list_lock);
+    if (!found)
+        return ERR_PTR(-ENODEV);
+    return found->ops->allocate(found, aligned, fd_flags, heap_flags);
+}
+EXPORT_SYMBOL_NS_GPL(dma_heap_buffer_alloc_by_name, "DMA_BUF_HEAP");
+
 static int dma_heap_open(struct inode *inode, struct file *file)
 {
 	struct dma_heap *heap;

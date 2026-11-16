@@ -151,6 +151,7 @@ struct cmdq_append {
 };
 
 struct cmdq_pkt {
+	bool no_pool;
 	struct list_head	buf;
 	size_t			avail_buf_size; /* available buf size */
 	size_t			cmd_buf_size; /* command occupied size */

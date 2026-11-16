@@ -37,6 +37,11 @@ struct cmdq_sec_mtee_context {
 	KREE_SHAREDMEM_PARAM wsm_ex2_param;
 	KREE_SHAREDMEM_HANDLE mem_handle;
 	KREE_SHAREDMEM_PARAM mem_param;
+	void *wsm_buffers[3];
+	bool wsm_registered[3];
+	bool session_open;
+	bool wsm_session_open;
+	bool cookie_registered;
 #if 0
 	/* Universally Unique Identifier of secure tl/dr */
 	struct TEEC_UUID uuid;

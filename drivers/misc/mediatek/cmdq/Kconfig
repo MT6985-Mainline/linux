@@ -7,3 +7,11 @@ config MTK_CMDQ_MBOX_EXT
 	  and aee db. Enable performance tools which add instruction
 	  inside packet and profiling. Also enable secure path with
 	  new sec controller which decuple with v3 driver.
+
+config MTK_CMDQ_SECURE
+	bool "MediaTek secure CMDQ mailbox"
+	depends on MTK_CMDQ_MBOX_EXT=y && MTK_GZ_TZ_SYSTEM=y
+	help
+	  Build the secure CMDQ mailbox and packet metadata helpers using the
+	  original MediaTek MTEE/KREE secure task submission, cancellation and
+	  shared execution-cookie protocol.

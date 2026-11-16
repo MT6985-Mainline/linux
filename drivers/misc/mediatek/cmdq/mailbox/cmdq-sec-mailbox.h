@@ -9,6 +9,11 @@
 #define CMDQ_INVALID_THREAD		(-1)
 #define CMDQ_SEC_IRQ_THREAD		(15)
 
+/* MT6985 CPR slots reserved for secure per-thread completion cookies. */
+#define CMDQ_CPR_THREAD_COOKIE(idx)	(0x8130 + (idx))
+
+void cmdq_dump_summary(struct cmdq_client *client, struct cmdq_pkt *pkt);
+
 /* Thread that are high-priority (display threads) */
 #define CMDQ_MAX_SECURE_THREAD_COUNT	(5)
 #define CMDQ_MIN_SECURE_THREAD_ID	(8)

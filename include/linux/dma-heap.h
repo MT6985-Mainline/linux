@@ -40,6 +40,9 @@ struct dma_heap_export_info {
 	void *priv;
 };
 
+struct dma_buf *dma_heap_buffer_alloc_by_name(const char *name, unsigned long len,
+					     u32 fd_flags, u64 heap_flags);
+
 void *dma_heap_get_drvdata(struct dma_heap *heap);
 
 const char *dma_heap_get_name(struct dma_heap *heap);

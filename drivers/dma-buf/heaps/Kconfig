@@ -20,3 +20,12 @@ config DMABUF_HEAPS_CMA
 	  Choose this option to enable dma-buf CMA heap. This heap is backed
 	  by the Contiguous Memory Allocator (CMA). If your system has these
 	  regions, you should say Y here.
+
+config DMABUF_HEAPS_MTK_SECURE
+	bool "MediaTek secure DMA-BUF heaps"
+	depends on DMABUF_HEAPS && MTK_TRUSTED_MEMORY_SUBSYSTEM=y
+	depends on MTK_IOMMU_MT6985=y || MTK_IOMMU_MT6895=y
+	help
+	  Export MediaTek secure region and page heaps backed by the trusted
+	  memory subsystem. Secure handles remain 64-bit and buffer ownership
+	  is identified by the real secure DMA-BUF exporter operations.

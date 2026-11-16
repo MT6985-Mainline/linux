@@ -775,11 +775,11 @@ struct cmdq_pkt_buffer *cmdq_pkt_alloc_buf(struct cmdq_pkt *pkt)
 	}
 
 	/* try dma pool if available */
-	if (pkt->cur_pool.pool)
+	if (pkt->cur_pool.pool && !pkt->no_pool)
 		buf->va_base = cmdq_mbox_pool_alloc_impl(pkt->cur_pool.pool,
 			use_iommu ? &buf->iova_base : &buf->pa_base,
 			pkt->cur_pool.cnt, *pkt->cur_pool.limit);
-	else if (cl) {
+	else if (cl && !pkt->no_pool) {
 		struct client_priv *priv = (struct client_priv *)cl->cl_priv;
 
 		buf->va_base = cmdq_mbox_pool_alloc(cl,
@@ -957,7 +957,7 @@ void cmdq_pkt_destroy(struct cmdq_pkt *pkt)
 #if IS_ENABLED(CONFIG_MTK_CMDQ_MBOX_EXT)
 #ifdef CMDQ_SECURE_SUPPORT
 	if (pkt->sec_data)
-		cmdq_sec_helper->sec_pkt_free_data_fp(pkt);
+		cmdq_sec_pkt_free_data(pkt);
 #endif
 #endif
 	kfree(pkt);
@@ -2171,6 +2171,8 @@ s32 cmdq_pkt_finalize(struct cmdq_pkt *pkt)
 
 #ifdef CMDQ_SECURE_SUPPORT
 	if (pkt->sec_data) {
+		if (!cmdq_sec_helper)
+			return -ENODEV;
 		err = cmdq_sec_helper->sec_insert_backup_cookie_fp(pkt);
 		if (err)
 			return err;

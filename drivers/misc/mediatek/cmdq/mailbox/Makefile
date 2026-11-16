@@ -12,3 +12,11 @@ obj-$(CONFIG_MTK_CMDQ_MBOX_EXT) += mtk-cmdq-drv-ext.o
 mtk-cmdq-drv-ext-y := mtk-cmdq-mailbox-ext.o mtk-cmdq-helper-ext.o cmdq-util.o
 
 obj-$(CONFIG_MTK_CMDQ_MBOX_EXT) += cmdq-platform-mt6985.o
+
+ifeq ($(CONFIG_MTK_CMDQ_SECURE),y)
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/geniezone/public
+ccflags-y += -DCMDQ_SECURE_SUPPORT -DCMDQ_SECURE_MTEE_SUPPORT
+ccflags-y += -DCMDQ_SECURE_CPR_SUPPORT
+obj-y += cmdq-sec-drv.o
+cmdq-sec-drv-y := cmdq_sec_mtee.o cmdq-sec-mailbox.o cmdq-sec-helper.o
+endif
