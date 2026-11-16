@@ -37,6 +37,15 @@ config MTK_DVFSRC
 	  software, and performing bandwidth scaling to provide the
 	  best achievable performance-per-watt.
 
+config MTK_MMDVFS
+	tristate "MediaTek multimedia DVFS V2"
+	depends on ARCH_MEDIATEK && OF && COMMON_CLK && REGULATOR_MTK_DVFSRC
+	select PM_OPP
+	help
+	  Scale the multimedia clock muxes from regulator voltage notifications
+	  using the board OPP and clock-parent tables. This is the host V2 backend;
+	  VCP firmware DVFS V3 is a separate interface.
+
 config MTK_INFRACFG
 	bool "MediaTek INFRACFG Support"
 	select REGMAP
