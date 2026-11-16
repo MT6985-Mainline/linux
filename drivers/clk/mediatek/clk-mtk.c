@@ -691,14 +691,21 @@ struct regmap *mtk_clk_get_hwv_regmap(struct device_node *node)
 {
 	struct device_node *hwv_node;
 	struct regmap *regmap_hwv;
+	const char *property;
 
-	hwv_node = of_parse_phandle(node, "mediatek,hardware-voter", 0);
-	if (!hwv_node)
+	/* MT6985 stock clock and SCPSYS providers use this binding. */
+	if (of_find_property(node, "hw-voter-regmap", NULL))
+		property = "hw-voter-regmap";
+	else if (of_find_property(node, "mediatek,hardware-voter", NULL))
+		property = "mediatek,hardware-voter";
+	else
 		return NULL;
-
-	regmap_hwv = device_node_to_regmap(hwv_node);
+	hwv_node = of_parse_phandle(node, property, 0);
+	if (!hwv_node)
+		return ERR_PTR(-EINVAL);
+	/* Generic syscons can be mapped on demand; custom providers can defer. */
+	regmap_hwv = syscon_node_to_regmap(hwv_node);
 	of_node_put(hwv_node);
-
 	return regmap_hwv;
 }
 EXPORT_SYMBOL_GPL(mtk_clk_get_hwv_regmap);

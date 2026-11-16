@@ -458,7 +458,6 @@ static int mminfra_debug_probe(struct platform_device *pdev)
 
 	dbg->mminfra_base = ioremap(MMINFRA_BASE, 0x8f4);
 
-	cmdq_get_mminfra_cb(is_mminfra_power_on);
 	cmdq_get_mminfra_gce_cg_cb(is_gce_cg_on);
 
 	if (mminfra_bkrs == 1) {
@@ -485,6 +484,9 @@ static int mminfra_debug_probe(struct platform_device *pdev)
 			mminfra_clk_set(true);
 			pr_notice("%s: init-clk-on enable clk\n", __func__);
 		}
+		/* Only backup/restore maintains the counter used by this predicate. */
+		if (!ret)
+			cmdq_get_mminfra_cb(is_mminfra_power_on);
 	}
 	return ret;
 }

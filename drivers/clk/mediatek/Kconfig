@@ -1081,6 +1081,37 @@ config COMMON_CLK_MT6985
 	help
 	  This driver supports the basic MediaTek MT6985 clocks.
 
+config COMMON_CLK_MT6985_CAM
+	tristate "Clock driver for MediaTek MT6985 camera systems"
+	depends on COMMON_CLK_MT6985
+	default COMMON_CLK_MT6985
+	help
+	  Enable clock gates for the MT6985 camera main, MRAW, RAW and YUV
+	  systems, including their hardware voter gates.
+
+config COMMON_CLK_MT6985_CCU
+	tristate "Clock driver for MediaTek MT6985 CCU"
+	depends on COMMON_CLK_MT6985
+	default COMMON_CLK_MT6985
+	help
+	  Enable clock gates for the MT6985 camera control unit.
+
+config COMMON_CLK_MT6985_IMG
+	tristate "Clock driver for MediaTek MT6985 imaging systems"
+	depends on COMMON_CLK_MT6985
+	default COMMON_CLK_MT6985
+	help
+	  Enable clock gates for MT6985 IMG, IPE, DIP, TRAW and WPE systems,
+	  including their hardware voter gates.
+
+config COMMON_CLK_MT6985_VCODEC
+	tristate "Clock driver for MediaTek MT6985 video codecs"
+	depends on COMMON_CLK_MT6985
+	default COMMON_CLK_MT6985
+	help
+	  Enable clock gates for both MT6985 video decoders and all three
+	  video encoders, including the decoder hardware voter gates.
+
 config COMMON_CLK_MT6985_MMSYS
 	tristate "Clock driver for MediaTek MT6985 mmsys"
 	depends on COMMON_CLK_MT6985

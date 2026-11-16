@@ -5,6 +5,7 @@
  */
 
 #include <linux/clk-provider.h>
+#include <linux/delay.h>
 #include <linux/dev_printk.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
@@ -15,6 +16,12 @@
 
 #include "clk-mtk.h"
 #include "clk-gate.h"
+
+/* MT6985 gate voter handshake bounds from the stock driver. */
+#define MTK_GATE_HWV_PREPARE_CNT	200
+#define MTK_GATE_HWV_PREPARE_US	1
+#define MTK_GATE_HWV_DONE_CNT	500
+#define MTK_GATE_HWV_DONE_US	1
 
 struct mtk_clk_gate {
 	struct clk_hw	hw;
@@ -102,30 +109,96 @@ static void mtk_cg_disable_inv(struct clk_hw *hw)
 	mtk_cg_clr_bit(hw);
 }
 
-static int mtk_cg_hwv_set_en(struct clk_hw *hw, bool enable)
+static int mtk_cg_hwv_set_en(struct clk_hw *hw, bool enable, bool inverted)
 {
 	struct mtk_clk_gate *cg = to_mtk_clk_gate(hw);
-	u32 val;
+	u32 mask = BIT(cg->gate->shift);
+	u32 vote = 0, done = 0, gate = 0;
+	bool is_done = false;
+	int i, ret;
 
-	regmap_write(cg->regmap_hwv,
-		     enable ? cg->gate->hwv_regs->set_ofs :
-			      cg->gate->hwv_regs->clr_ofs,
-		     BIT(cg->gate->shift));
+	if (!enable) {
+		/* Clear the HWV bus idle indication before the clear vote. */
+		ret = regmap_read(cg->regmap_hwv, cg->gate->hwv_regs->clr_ofs,
+				  &vote);
+		if (ret)
+			goto err_io;
+	}
 
-	return regmap_read_poll_timeout_atomic(cg->regmap_hwv,
-					       cg->gate->hwv_regs->sta_ofs, val,
-					       val & BIT(cg->gate->shift), 0,
-					       MTK_WAIT_HWV_DONE_US);
+	ret = regmap_write(cg->regmap_hwv,
+			   enable ? cg->gate->hwv_regs->set_ofs :
+				    cg->gate->hwv_regs->clr_ofs, mask);
+	if (ret)
+		goto err_io;
+
+	/* Confirm that this AP's vote has actually reached the voter. */
+	for (i = 0; i <= MTK_GATE_HWV_PREPARE_CNT; i++) {
+		ret = regmap_read(cg->regmap_hwv, cg->gate->hwv_regs->set_ofs,
+				  &vote);
+		if (ret)
+			goto err_io;
+		if (!!(vote & mask) == enable)
+			break;
+		if (i < MTK_GATE_HWV_PREPARE_CNT)
+			udelay(MTK_GATE_HWV_PREPARE_US);
+	}
+	if (i > MTK_GATE_HWV_PREPARE_CNT) {
+		pr_err("%s: HWV %s vote timeout, vote %#x, mask %#x\n",
+		       clk_hw_get_name(hw), enable ? "set" : "clear", vote, mask);
+		return -ETIMEDOUT;
+	}
+
+	/*
+	 * Keep a seen done indication while waiting for the real CG state.
+	 * Other voters may keep a disabled clock running, so clear votes
+	 * require local vote completion only.
+	 */
+	for (i = 0; i <= MTK_GATE_HWV_DONE_CNT; i++) {
+		if (!is_done) {
+			ret = regmap_read(cg->regmap_hwv,
+					  cg->gate->hwv_regs->sta_ofs, &done);
+			if (ret)
+				goto err_io;
+			is_done = !!(done & mask);
+		}
+		if (is_done) {
+			if (!enable)
+				return 0;
+			ret = regmap_read(cg->regmap, cg->gate->regs->sta_ofs,
+					  &gate);
+			if (ret)
+				goto err_io;
+			if (!!(gate & mask) == inverted)
+				return 0;
+		}
+		if (i < MTK_GATE_HWV_DONE_CNT)
+			udelay(MTK_GATE_HWV_DONE_US);
+	}
+
+	pr_err("%s: HWV %s done timeout, done %#x, CG %#x, mask %#x\n",
+	       clk_hw_get_name(hw), enable ? "enable" : "disable",
+	       done, gate, mask);
+	return -ETIMEDOUT;
+
+err_io:
+	pr_err("%s: HWV %s I/O failed: %d\n",
+	       clk_hw_get_name(hw), enable ? "enable" : "disable", ret);
+	return ret;
 }
 
 static int mtk_cg_hwv_enable(struct clk_hw *hw)
 {
-	return mtk_cg_hwv_set_en(hw, true);
+	return mtk_cg_hwv_set_en(hw, true, false);
+}
+
+static int mtk_cg_hwv_enable_inv(struct clk_hw *hw)
+{
+	return mtk_cg_hwv_set_en(hw, true, true);
 }
 
 static void mtk_cg_hwv_disable(struct clk_hw *hw)
 {
-	mtk_cg_hwv_set_en(hw, false);
+	mtk_cg_hwv_set_en(hw, false, false);
 }
 
 static int mtk_cg_enable_no_setclr(struct clk_hw *hw)
@@ -195,7 +268,7 @@ EXPORT_SYMBOL_GPL(mtk_clk_gate_hwv_ops_setclr);
 
 const struct clk_ops mtk_clk_gate_hwv_ops_setclr_inv = {
 	.is_enabled	= mtk_cg_bit_is_set,
-	.enable		= mtk_cg_hwv_enable,
+	.enable		= mtk_cg_hwv_enable_inv,
 	.disable	= mtk_cg_hwv_disable,
 };
 EXPORT_SYMBOL_GPL(mtk_clk_gate_hwv_ops_setclr_inv);
@@ -232,10 +305,12 @@ static struct clk_hw *mtk_clk_register_gate(struct device *dev,
 	init.parent_names = gate->parent_name ? &gate->parent_name : NULL;
 	init.num_parents = gate->parent_name ? 1 : 0;
 	init.ops = gate->ops;
-	if (mtk_cg_uses_hwv(init.ops) && !regmap_hwv)
+	if (mtk_cg_uses_hwv(init.ops) && !regmap_hwv) {
+		kfree(cg);
 		return dev_err_ptr_probe(
 			dev, -ENXIO,
 			"regmap not found for hardware voter clocks\n");
+	}
 
 	cg->regmap = regmap;
 	cg->regmap_hwv = regmap_hwv;

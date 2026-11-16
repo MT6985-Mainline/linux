@@ -576,6 +576,8 @@ struct clk_hw *mtk_clk_register_pll(struct device *dev,
 	struct regmap *hwv_regmap;
 
 	hwv_regmap = mtk_clk_get_hwv_regmap(dev->of_node);
+	if (IS_ERR(hwv_regmap))
+		return ERR_CAST(hwv_regmap);
 	if ((data->flags & CLK_USE_HW_VOTER) && !hwv_regmap)
 		return ERR_PTR(-ENXIO);
 

@@ -345,10 +345,12 @@ static struct clk_hw *mtk_clk_register_mux(struct device *dev,
 	init.parent_names = mux->parent_names;
 	init.num_parents = mux->num_parents;
 	init.ops = mux->ops;
-	if (mtk_clk_mux_uses_hwv(init.ops) && !regmap_hwv)
+	if (mtk_clk_mux_uses_hwv(init.ops) && !regmap_hwv) {
+		kfree(clk_mux);
 		return dev_err_ptr_probe(
 			dev, -ENXIO,
 			"regmap not found for hardware voter clocks\n");
+	}
 
 	clk_mux->regmap = regmap;
 	clk_mux->regmap_hwv = regmap_hwv;

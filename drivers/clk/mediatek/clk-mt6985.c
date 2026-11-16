@@ -3280,7 +3280,7 @@ static int clk_mt6985_pll_registration(enum subsys_id id,
 
 	if (id >= PLL_SYS_NUM) {
 		pr_notice("%s init invalid id(%d)\n", __func__, id);
-		return 0;
+		return -EINVAL;
 	}
 
 	base = devm_ioremap_resource(&pdev->dev, res);
@@ -3290,15 +3290,17 @@ static int clk_mt6985_pll_registration(enum subsys_id id,
 	}
 
 	clk_data = mtk_alloc_clk_data(num_plls);
+	if (!clk_data)
+		return -ENOMEM;
 
 	r = mtk_clk_register_plls(&pdev->dev, plls, num_plls,
 			clk_data);
+	if (r)
+		goto free_data;
 
 	r = of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
-
 	if (r)
-		pr_err("%s(): could not register clock provider: %d\n",
-			__func__, r);
+		goto unregister_plls;
 
 	plls_data[id] = plls;
 	plls_base[id] = base;
@@ -3307,7 +3309,14 @@ static int clk_mt6985_pll_registration(enum subsys_id id,
 	pr_notice("%s init end\n", __func__);
 #endif
 
-	return r;
+	return 0;
+
+unregister_plls:
+	mtk_clk_unregister_plls(plls, num_plls, clk_data);
+free_data:
+	mtk_free_clk_data(clk_data);
+	return dev_err_probe(&pdev->dev, r,
+			     "Could not register PLL clock provider\n");
 }
 
 static int clk_mt6985_apmixed_probe(struct platform_device *pdev)
@@ -3378,27 +3387,45 @@ static int clk_mt6985_top_probe(struct platform_device *pdev)
 	}
 
 	clk_data = mtk_alloc_clk_data(CLK_TOP_NR_CLK);
+	if (!clk_data)
+		return -ENOMEM;
 
-	mtk_clk_register_factors(top_divs, ARRAY_SIZE(top_divs),
+	r = mtk_clk_register_factors(top_divs, ARRAY_SIZE(top_divs),
 			clk_data);
+	if (r)
+		goto free_data;
 
-	mtk_clk_register_muxes(&pdev->dev, top_muxes, ARRAY_SIZE(top_muxes), node,
+	r = mtk_clk_register_muxes(&pdev->dev, top_muxes, ARRAY_SIZE(top_muxes), node,
 			&mt6985_clk_lock, clk_data);
+	if (r)
+		goto unregister_factors;
 
-	mtk_clk_register_composites(&pdev->dev, top_composites, ARRAY_SIZE(top_composites),
+	r = mtk_clk_register_composites(&pdev->dev, top_composites, ARRAY_SIZE(top_composites),
 			base, &mt6985_clk_lock, clk_data);
+	if (r)
+		goto unregister_muxes;
 
 	r = of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
-
 	if (r)
-		pr_err("%s(): could not register clock provider: %d\n",
-			__func__, r);
+		goto unregister_composites;
 
 #if MT_CCF_BRINGUP
 	pr_notice("%s init end\n", __func__);
 #endif
 
-	return r;
+	return 0;
+
+unregister_composites:
+	mtk_clk_unregister_composites(top_composites, ARRAY_SIZE(top_composites),
+				      clk_data);
+unregister_muxes:
+	mtk_clk_unregister_muxes(top_muxes, ARRAY_SIZE(top_muxes), clk_data);
+unregister_factors:
+	mtk_clk_unregister_factors(top_divs, ARRAY_SIZE(top_divs), clk_data);
+free_data:
+	mtk_free_clk_data(clk_data);
+	return dev_err_probe(&pdev->dev, r,
+			     "Could not register top clock provider\n");
 }
 
 static int clk_mt6985_vlp_ck_probe(struct platform_device *pdev)
@@ -3421,21 +3448,30 @@ static int clk_mt6985_vlp_ck_probe(struct platform_device *pdev)
 	}
 
 	clk_data = mtk_alloc_clk_data(CLK_VLP_CK_NR_CLK);
+	if (!clk_data)
+		return -ENOMEM;
 
-	mtk_clk_register_muxes(&pdev->dev, vlp_ck_muxes, ARRAY_SIZE(vlp_ck_muxes), node,
+	r = mtk_clk_register_muxes(&pdev->dev, vlp_ck_muxes, ARRAY_SIZE(vlp_ck_muxes), node,
 			&mt6985_clk_lock, clk_data);
+	if (r)
+		goto free_data;
 
 	r = of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
-
 	if (r)
-		pr_err("%s(): could not register clock provider: %d\n",
-			__func__, r);
+		goto unregister_muxes;
 
 #if MT_CCF_BRINGUP
 	pr_notice("%s init end\n", __func__);
 #endif
 
-	return r;
+	return 0;
+
+unregister_muxes:
+	mtk_clk_unregister_muxes(vlp_ck_muxes, ARRAY_SIZE(vlp_ck_muxes), clk_data);
+free_data:
+	mtk_free_clk_data(clk_data);
+	return dev_err_probe(&pdev->dev, r,
+			     "Could not register VLP clock provider\n");
 }
 
 /* for suspend LDVT only */
