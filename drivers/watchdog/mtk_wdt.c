@@ -68,6 +68,16 @@
 
 static bool nowayout = WATCHDOG_NOWAYOUT;
 static unsigned int timeout;
+static bool corot_capture_test;
+
+#ifndef MODULE
+static int __init mtk_wdt_corot_test_setup(char *tag)
+{
+	corot_capture_test = tag && *tag;
+	return 1;
+}
+__setup("corot_test=", mtk_wdt_corot_test_setup);
+#endif
 
 struct mtk_wdt_dev {
 	struct watchdog_device wdt_dev;
@@ -442,6 +452,13 @@ static int mtk_wdt_probe(struct platform_device *pdev)
 
 	mtk_wdt_init(&mtk_wdt->wdt_dev);
 
+	/* Normalize inherited IRQ/dual mode for this bounded corot capture. */
+	if (corot_capture_test && of_machine_is_compatible("xiaomi,corot") &&
+	    watchdog_hw_running(&mtk_wdt->wdt_dev)) {
+		err = mtk_wdt_start(&mtk_wdt->wdt_dev);
+		if (err)
+			return err;
+	}
 	watchdog_stop_on_reboot(&mtk_wdt->wdt_dev);
 	err = devm_watchdog_register_device(dev, &mtk_wdt->wdt_dev);
 	if (unlikely(err))

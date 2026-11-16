@@ -24,6 +24,7 @@
 #include <linux/usb/gadget.h>
 #include <linux/usb/otg.h>
 #include <linux/usb/role.h>
+#include <linux/workqueue.h>
 
 struct mtu3;
 struct mtu3_ep;
@@ -273,6 +274,9 @@ struct ssusb_mtk {
 	struct regmap *uwk;
 	u32 uwk_reg_base;
 	u32 uwk_vers;
+	/* The two corot controllers must never share an active timer. */
+	struct delayed_work corot_usb_dw;
+	unsigned int corot_usb_dumps;
 };
 
 /**

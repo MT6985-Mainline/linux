@@ -368,17 +368,20 @@ out:
  * derived from the PHY, and SSUSB_U2_CTRL(0) carries the VBUSVALID / OTG_SEL
  * / PDN / DIS bits the port is configured with.
  */
-static struct ssusb_mtk *corot_usb;
-static struct delayed_work corot_usb_dw;
-static int corot_usb_dumps;
-
 static void corot_usb_dump_work(struct work_struct *work)
 {
-	struct ssusb_mtk *ssusb = corot_usb;
+	struct ssusb_mtk *ssusb = container_of(to_delayed_work(work),
+					      struct ssusb_mtk, corot_usb_dw);
 	u32 pm, dc, misc, u2ctl, pw1, pw2;
+	int active;
 
-	if (!ssusb || !ssusb->mac_base || !ssusb->ippc_base)
+	if (!ssusb->mac_base || !ssusb->ippc_base)
 		return;
+
+	/* Hold a runtime reference before reading either powered MMIO block. */
+	active = pm_runtime_get_if_active(ssusb->dev);
+	if (active <= 0)
+		goto next;
 
 	pm = mtu3_readl(ssusb->mac_base, U3D_POWER_MANAGEMENT);
 	dc = mtu3_readl(ssusb->mac_base, U3D_DEVICE_CONTROL);
@@ -387,18 +390,31 @@ static void corot_usb_dump_work(struct work_struct *work)
 	pw1 = mtu3_readl(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL1);
 	pw2 = mtu3_readl(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL2);
 
-	pr_err("COROT-USBREG[%d] pm=0x%08x soft_conn=%u hs_en=%u dc=0x%08x session=%u misc=0x%08x vbus_frc=%u vbus_on=%u u2ctl0=0x%08x vbusvalid=%u otg_sel=%u host=%u pdn=%u dis=%u pw_ctrl1=0x%08x pw_ctrl2=0x%08x\n",
-		corot_usb_dumps, pm,
-		!!(pm & SOFT_CONN), !!(pm & HS_ENABLE),
-		dc, !!(dc & DC_SESSION),
-		misc, !!(misc & VBUS_FRC_EN), !!(misc & VBUS_ON),
-		u2ctl, !!(u2ctl & SSUSB_U2_PORT_VBUSVALID),
-		!!(u2ctl & SSUSB_U2_PORT_OTG_SEL), !!(u2ctl & SSUSB_U2_PORT_HOST),
-		!!(u2ctl & SSUSB_U2_PORT_PDN), !!(u2ctl & SSUSB_U2_PORT_DIS),
-		pw1, pw2);
+	dev_info(ssusb->dev,
+		 "COROT-USBREG[%u] pm=%#x soft_conn=%u hs_en=%u "
+		 "dc=%#x session=%u misc=%#x vbus_frc=%u vbus_on=%u "
+		 "u2ctl0=%#x vbusvalid=%u otg_sel=%u host=%u pdn=%u dis=%u "
+		 "pw_ctrl1=%#x pw_ctrl2=%#x\\n",
+		 ssusb->corot_usb_dumps, pm,
+		 !!(pm & SOFT_CONN), !!(pm & HS_ENABLE),
+		 dc, !!(dc & DC_SESSION),
+		 misc, !!(misc & VBUS_FRC_EN), !!(misc & VBUS_ON),
+		 u2ctl, !!(u2ctl & SSUSB_U2_PORT_VBUSVALID),
+		 !!(u2ctl & SSUSB_U2_PORT_OTG_SEL), !!(u2ctl & SSUSB_U2_PORT_HOST),
+		 !!(u2ctl & SSUSB_U2_PORT_PDN), !!(u2ctl & SSUSB_U2_PORT_DIS),
+		 pw1, pw2);
+	pm_runtime_put(ssusb->dev);
 
-	if (++corot_usb_dumps < 8)
-		schedule_delayed_work(&corot_usb_dw, msecs_to_jiffies(4000));
+next:
+	if (++ssusb->corot_usb_dumps < 8)
+		schedule_delayed_work(&ssusb->corot_usb_dw, msecs_to_jiffies(4000));
+}
+
+static void corot_usb_cancel_work(void *data)
+{
+	struct ssusb_mtk *ssusb = data;
+
+	cancel_delayed_work_sync(&ssusb->corot_usb_dw);
 }
 
 static int mtu3_probe(struct platform_device *pdev)
@@ -421,6 +437,11 @@ static int mtu3_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, ssusb);
 	ssusb->dev = dev;
+
+	INIT_DELAYED_WORK(&ssusb->corot_usb_dw, corot_usb_dump_work);
+	ret = devm_add_action_or_reset(dev, corot_usb_cancel_work, ssusb);
+	if (ret)
+		return ret;
 
 	ret = get_ssusb_rscs(pdev, ssusb);
 	if (ret)
@@ -511,21 +532,10 @@ static int mtu3_probe(struct platform_device *pdev)
 	pm_runtime_put_autosuspend(dev);
 	pm_runtime_forbid(dev);
 
-	/*
-	 * COROT r64: the USB register dump is deliberately NOT scheduled any
-	 * more.  It fires every 4 s starting 5 s after probe, and reading a
-	 * runtime-suspended MTU3 block stalls the interconnect - that is the
-	 * hard hang (and watchdog reset) seen 9.4 s into most boots.  The dump
-	 * belonged to the USB bring-up work, not to the display, so it goes.
-	 */
-	corot_usb = ssusb;
-	/* COROT r293: the diagnostic existed but was never scheduled, so we never
-	 * saw why the host does not enumerate the gadget.  Run it. */
-	corot_usb = ssusb;
-	INIT_DELAYED_WORK(&corot_usb_dw, corot_usb_dump_work);
-	corot_usb_dumps = 0;
-	schedule_delayed_work(&corot_usb_dw, msecs_to_jiffies(2000));
-	pr_err("COROT r293: USB attach diagnostic armed\n");
+	if (of_machine_is_compatible("xiaomi,corot")) {
+		schedule_delayed_work(&ssusb->corot_usb_dw, msecs_to_jiffies(2000));
+		dev_info(dev, "COROT: per-controller USB diagnostic armed\n");
+	}
 
 	return 0;
 
@@ -546,6 +556,8 @@ comm_init_err:
 static void mtu3_remove(struct platform_device *pdev)
 {
 	struct ssusb_mtk *ssusb = platform_get_drvdata(pdev);
+
+	corot_usb_cancel_work(ssusb);
 
 	pm_runtime_get_sync(&pdev->dev);
 
@@ -578,6 +590,11 @@ static void mtu3_remove(struct platform_device *pdev)
 	pm_runtime_disable(&pdev->dev);
 	pm_runtime_put_noidle(&pdev->dev);
 	pm_runtime_set_suspended(&pdev->dev);
+}
+
+static void mtu3_shutdown(struct platform_device *pdev)
+{
+	corot_usb_cancel_work(platform_get_drvdata(pdev));
 }
 
 static int resume_ip_and_ports(struct ssusb_mtk *ssusb, pm_message_t msg)
@@ -672,12 +689,20 @@ clks_err:
 
 static int __maybe_unused mtu3_suspend(struct device *dev)
 {
+	corot_usb_cancel_work(dev_get_drvdata(dev));
 	return mtu3_suspend_common(dev, PMSG_SUSPEND);
 }
 
 static int __maybe_unused mtu3_resume(struct device *dev)
 {
-	return mtu3_resume_common(dev, PMSG_SUSPEND);
+	struct ssusb_mtk *ssusb = dev_get_drvdata(dev);
+	int ret;
+
+	ret = mtu3_resume_common(dev, PMSG_SUSPEND);
+	if (!ret && of_machine_is_compatible("xiaomi,corot") &&
+	    ssusb->corot_usb_dumps < 8)
+		schedule_delayed_work(&ssusb->corot_usb_dw, msecs_to_jiffies(2000));
+	return ret;
 }
 
 static int __maybe_unused mtu3_runtime_suspend(struct device *dev)
@@ -714,6 +739,7 @@ MODULE_DEVICE_TABLE(of, mtu3_of_match);
 static struct platform_driver mtu3_driver = {
 	.probe = mtu3_probe,
 	.remove = mtu3_remove,
+	.shutdown = mtu3_shutdown,
 	.driver = {
 		.name = MTU3_DRIVER_NAME,
 		.pm = DEV_PM_OPS,
