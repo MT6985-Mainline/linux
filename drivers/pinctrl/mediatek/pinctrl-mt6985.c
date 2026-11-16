@@ -1398,7 +1398,7 @@ static const struct mtk_pin_field_calc mt6985_pin_rsel_range[] = {
 	PIN_FIELD_BASE(186, 186, 5, 0x00a0, 0x10, 12, 3),
 };
 
-static const unsigned int mt6985_pull_type[] = {
+static const unsigned int mt6985_pull_type[254] = {
 	1 /* 0 */, 1 /* 1 */, 1 /* 2 */, 1 /* 3 */, 1 /* 4 */,
 	1 /* 5 */, 1 /* 6 */, 1 /* 7 */, 1 /* 8 */, 1 /* 9 */,
 	1 /* 10 */, 1 /* 11 */, 1 /* 12 */, 1 /* 13 */, 1 /* 14 */,
@@ -1473,16 +1473,11 @@ static const char * const mt6985_pinctrl_register_base_names[] = {
 	"iocfg_brr", "iocfg_lb", "iocfg_tr", "iocfg_tm", "iocfg_tl", "iocfg_lt",
 };
 
-/*
- * MT6985 EINT: single instance, eint index == gpio number for GPIO0..241
- * (MTK_EINT_FUNCTION(0, N) in the pin table). The 12 virtual EINT-only
- * sources 242..253 of the stock 5.15 table are dropped: the 7.2 paris core
- * has no eint-only pin descriptors.
- */
+/* Four real banks, sparse routing and twelve EINT-only sources. */
 static const struct mtk_eint_hw mt6985_eint_hw = {
 	.port_mask = 0xf,
 	.ports     = 8,
-	.ap_num    = 242,
+	.ap_num    = 254,
 	.db_cnt    = 32,
 	.db_time   = debounce_time_mt6878,
 };

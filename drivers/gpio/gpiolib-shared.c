@@ -446,7 +446,7 @@ static bool gpio_shared_dev_is_reset_gpio(struct device *consumer,
 int gpio_shared_add_proxy_lookup(struct device *consumer, struct fwnode_handle *fwnode,
 				 const char *con_id, unsigned long lflags)
 {
-	const char *dev_id = dev_name(consumer);
+	const char *dev_id = consumer ? dev_name(consumer) : NULL;
 	struct gpiod_lookup_table *lookup;
 	struct gpio_shared_entry *entry;
 	struct gpio_shared_ref *ref;
@@ -455,7 +455,8 @@ int gpio_shared_add_proxy_lookup(struct device *consumer, struct fwnode_handle *
 		list_for_each_entry(ref, &entry->refs, list) {
 			guard(mutex)(&ref->lock);
 
-			if (!ref->fwnode && device_is_compatible(consumer, "reset-gpio")) {
+			if (!ref->fwnode && consumer &&
+			    device_is_compatible(consumer, "reset-gpio")) {
 				if (!gpio_shared_dev_is_reset_gpio(consumer, entry, ref))
 					continue;
 			} else if (fwnode != ref->fwnode) {
@@ -469,6 +470,11 @@ int gpio_shared_add_proxy_lookup(struct device *consumer, struct fwnode_handle *
 			/* We've already done that on a previous request. */
 			if (ref->lookup)
 				return 0;
+
+			/* A consumer may be recreated while its firmware node persists. */
+			char *dev_id_cpy __free(kfree) = kstrdup(dev_id, GFP_KERNEL);
+			if (dev_id && !dev_id_cpy)
+				return -ENOMEM;
 
 			char *key __free(kfree) =
 				kasprintf(GFP_KERNEL,
@@ -484,7 +490,7 @@ int gpio_shared_add_proxy_lookup(struct device *consumer, struct fwnode_handle *
 			pr_debug("Adding machine lookup entry for a shared GPIO for consumer %s, with key '%s' and con_id '%s'\n",
 				 dev_id, key, ref->con_id ?: "none");
 
-			lookup->dev_id = dev_id;
+			lookup->dev_id = no_free_ptr(dev_id_cpy);
 			lookup->table[0] = GPIO_LOOKUP(no_free_ptr(key), 0,
 						       ref->con_id, lflags);
 
@@ -607,6 +613,7 @@ void gpio_device_teardown_shared(struct gpio_device *gdev)
 		list_for_each_entry(ref, &entry->refs, list) {
 			if (ref->lookup) {
 				gpiod_remove_lookup_table(ref->lookup);
+				kfree(ref->lookup->dev_id);
 				kfree(ref->lookup->table[0].key);
 				kfree(ref->lookup);
 				ref->lookup = NULL;

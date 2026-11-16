@@ -17,6 +17,10 @@
 #endif
 
 
+/* The current core identifies EINT-only pins by a null mux-name entry. */
+#define MTK_PIN_EINT(_number, _eint) MTK_PIN_NODRV(_number, "GPIO" #_number, \
+    MTK_EINT_FUNCTION(0, _eint), MTK_FUNCTION(0, NULL))
+
 static const struct mtk_pin_desc mtk_pins_mt6985[] = {
 	MTK_PIN_NODRV(
 		0, "GPIO0",
@@ -2280,6 +2284,18 @@ static const struct mtk_pin_desc mtk_pins_mt6985[] = {
 		MTK_FUNCTION(1, "DSI2_TE"),
 		MTK_FUNCTION(4, "I2S8_MCK")
 	),
+	MTK_PIN_EINT(242, 242),
+	MTK_PIN_EINT(243, 243),
+	MTK_PIN_EINT(244, 244),
+	MTK_PIN_EINT(245, 245),
+	MTK_PIN_EINT(246, 246),
+	MTK_PIN_EINT(247, 247),
+	MTK_PIN_EINT(248, 248),
+	MTK_PIN_EINT(249, 249),
+	MTK_PIN_EINT(250, 250),
+	MTK_PIN_EINT(251, 251),
+	MTK_PIN_EINT(252, 252),
+	MTK_PIN_EINT(253, 253),
 };
 
 #endif /* __PINCTRL_MTK_MT6985_H */

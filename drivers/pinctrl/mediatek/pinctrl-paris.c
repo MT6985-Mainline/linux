@@ -11,6 +11,7 @@
 
 #include <linux/gpio/driver.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/seq_file.h>
 
 #include <linux/pinctrl/consumer.h>
@@ -100,17 +101,52 @@ static int mtk_drv_uA_to_adv(int val)
 	return -EINVAL;
 }
 
+static void mtk_corot_display_pin_state(struct mtk_pinctrl *hw,
+				  const struct mtk_pin_desc *desc,
+				  const char *operation, int status)
+{
+	int mode = -1, direction = -1, output = -1, input = -1;
+
+	if (!of_machine_is_compatible("xiaomi,corot"))
+		return;
+	switch (desc->number) {
+	case 19:
+	case 39:
+	case 40:
+	case 68:
+	case 85:
+	case 86:
+	case 219:
+		break;
+	default:
+		return;
+	}
+
+	mtk_hw_get_value(hw, desc, PINCTRL_PIN_REG_MODE, &mode);
+	mtk_hw_get_value(hw, desc, PINCTRL_PIN_REG_DIR, &direction);
+	mtk_hw_get_value(hw, desc, PINCTRL_PIN_REG_DO, &output);
+	mtk_hw_get_value(hw, desc, PINCTRL_PIN_REG_DI, &input);
+	if (desc->number == 85)
+		dev_info(hw->dev, "COROT-TE: GPIO85 %s status=%d mode=%d dir=%d input=%d output=%d\n",
+			 operation, status, mode, direction, input, output);
+	else
+		dev_info(hw->dev, "COROT-PIN: GPIO%u %s status=%d mode=%d dir=%d output=%d input=%d\n",
+			 desc->number, operation, status, mode, direction, output, input);
+}
+
 static int mtk_pinmux_gpio_request_enable(struct pinctrl_dev *pctldev,
 					  struct pinctrl_gpio_range *range,
 					  unsigned int pin)
 {
 	struct mtk_pinctrl *hw = pinctrl_dev_get_drvdata(pctldev);
 	const struct mtk_pin_desc *desc;
+	int ret;
 
 	desc = (const struct mtk_pin_desc *)&hw->soc->pins[pin];
 
-	return mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_MODE,
-				hw->soc->gpio_m);
+	ret = mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_MODE, hw->soc->gpio_m);
+	mtk_corot_display_pin_state(hw, desc, "gpio-request", ret);
+	return ret;
 }
 
 static int mtk_pinmux_gpio_set_direction(struct pinctrl_dev *pctldev,
@@ -119,11 +155,14 @@ static int mtk_pinmux_gpio_set_direction(struct pinctrl_dev *pctldev,
 {
 	struct mtk_pinctrl *hw = pinctrl_dev_get_drvdata(pctldev);
 	const struct mtk_pin_desc *desc;
+	int ret;
 
 	desc = (const struct mtk_pin_desc *)&hw->soc->pins[pin];
 
 	/* hardware would take 0 as input direction */
-	return mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_DIR, !input);
+	ret = mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_DIR, !input);
+	mtk_corot_display_pin_state(hw, desc, "direction", ret);
+	return ret;
 }
 
 static int mtk_pinconf_get(struct pinctrl_dev *pctldev,
@@ -750,6 +789,7 @@ static int mtk_pmx_set_mux(struct pinctrl_dev *pctldev,
 	const struct mtk_func_desc *desc_func;
 	const struct mtk_pin_desc *desc;
 	bool ret;
+	int err;
 
 	ret = mtk_pctrl_is_function_valid(hw, grp->pin, function);
 	if (!ret) {
@@ -763,7 +803,9 @@ static int mtk_pmx_set_mux(struct pinctrl_dev *pctldev,
 		return -EINVAL;
 
 	desc = (const struct mtk_pin_desc *)&hw->soc->pins[grp->pin];
-	return mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_MODE, desc_func->muxval);
+	err = mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_MODE, desc_func->muxval);
+	mtk_corot_display_pin_state(hw, desc, "set-mux", err);
+	return err;
 }
 
 static const struct pinmux_ops mtk_pmxops = {
@@ -877,10 +919,13 @@ static int mtk_gpio_set(struct gpio_chip *chip, unsigned int gpio, int value)
 {
 	struct mtk_pinctrl *hw = gpiochip_get_data(chip);
 	const struct mtk_pin_desc *desc;
+	int ret;
 
 	desc = (const struct mtk_pin_desc *)&hw->soc->pins[gpio];
 
-	return mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_DO, !!value);
+	ret = mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_DO, !!value);
+	mtk_corot_display_pin_state(hw, desc, "set-output", ret);
+	return ret;
 }
 
 static int mtk_gpio_direction_input(struct gpio_chip *chip, unsigned int gpio)
@@ -1069,15 +1114,16 @@ int mtk_paris_pinctrl_probe(struct platform_device *pdev)
 	if (err)
 		return err;
 
-	err = mtk_build_eint(hw, pdev);
-	if (err)
-		dev_warn(&pdev->dev,
-			 "Failed to add EINT, but pinctrl still can work\n");
-
-	/* Build gpiochip should be after pinctrl_enable is done */
+	/* Register GPIO before publishing an EINT domain that locks its lines. */
 	err = mtk_build_gpiochip(hw);
 	if (err)
 		return dev_err_probe(dev, err, "Failed to add gpio_chip\n");
+
+	err = mtk_build_eint(hw, pdev);
+	if (err == -EPROBE_DEFER)
+		return err;
+	if (err)
+		dev_warn(dev, "Failed to add EINT (%d), pinctrl remains available\n", err);
 
 	platform_set_drvdata(pdev, hw);
 

@@ -19,6 +19,7 @@
 #include <linux/io.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqdomain.h>
+#include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
@@ -73,6 +74,21 @@ const unsigned int debounce_time_mt6878[] = {
 };
 EXPORT_SYMBOL_GPL(debounce_time_mt6878);
 
+static bool mtk_eint_valid(const struct mtk_eint *eint,
+			   unsigned long hwirq)
+{
+	unsigned int inst, idx;
+
+	if (!eint || !eint->hw || hwirq >= eint->hw->ap_num ||
+	    !eint->pins || !eint->base_pin_num || !eint->pin_list)
+		return false;
+
+	inst = eint->pins[hwirq].instance;
+	idx = eint->pins[hwirq].index;
+	return inst < eint->nbase && idx < eint->base_pin_num[inst] &&
+	       eint->pin_list[inst] && eint->pin_list[inst][idx] == hwirq;
+}
+
 static void __iomem *mtk_eint_get_offset(struct mtk_eint *eint,
 					 unsigned int eint_num,
 					 unsigned int offset)
@@ -114,6 +130,8 @@ static int mtk_eint_flip_edge(struct mtk_eint *eint, int hwirq)
 	void __iomem *reg = eint->base[eint->pins[hwirq].instance] + (port << 2);
 
 	curr_level = eint->gpio_xlate->get_gpio_state(eint->pctl, hwirq);
+	if (curr_level < 0)
+		return curr_level;
 
 	do {
 		start_level = curr_level;
@@ -125,6 +143,8 @@ static int mtk_eint_flip_edge(struct mtk_eint *eint, int hwirq)
 
 		curr_level = eint->gpio_xlate->get_gpio_state(eint->pctl,
 							      hwirq);
+		if (curr_level < 0)
+			return curr_level;
 	} while (start_level != curr_level);
 
 	return start_level;
@@ -157,8 +177,12 @@ static void mtk_eint_unmask(struct irq_data *d)
 
 	writel(mask, reg);
 
-	if (eint->pins[d->hwirq].dual_edge)
-		mtk_eint_flip_edge(eint, d->hwirq);
+	if (eint->pins[d->hwirq].dual_edge &&
+	    mtk_eint_flip_edge(eint, d->hwirq) < 0) {
+		mtk_eint_mask(d);
+		dev_err_ratelimited(eint->dev,
+				    "Unable to sample dual-edge EINT%lu\n", d->hwirq);
+	}
 }
 
 static unsigned int mtk_eint_get_mask(struct mtk_eint *eint,
@@ -196,10 +220,16 @@ static int mtk_eint_set_type(struct irq_data *d, unsigned int type)
 		return -EINVAL;
 	}
 
-	if ((type & IRQ_TYPE_EDGE_BOTH) == IRQ_TYPE_EDGE_BOTH)
-		eint->pins[d->hwirq].dual_edge = 1;
-	else
-		eint->pins[d->hwirq].dual_edge = 0;
+	if ((type & IRQ_TYPE_EDGE_BOTH) == IRQ_TYPE_EDGE_BOTH) {
+		int level = eint->gpio_xlate->get_gpio_state(eint->pctl, d->hwirq);
+
+		/* Virtual EINT sources have no GPIO level to sample. */
+		if (level < 0)
+			return level;
+		eint->pins[d->hwirq].dual_edge = true;
+	} else {
+		eint->pins[d->hwirq].dual_edge = false;
+	}
 
 	if (!mtk_eint_get_mask(eint, d->hwirq)) {
 		mtk_eint_mask(d);
@@ -266,9 +296,13 @@ static void mtk_eint_chip_write_mask(const struct mtk_eint *eint,
 static int mtk_eint_irq_request_resources(struct irq_data *d)
 {
 	struct mtk_eint *eint = irq_data_get_irq_chip_data(d);
-	struct gpio_chip *gpio_c;
+	struct gpio_chip *gpio_c = NULL;
 	unsigned int gpio_n;
 	int err;
+
+	/* Acquire the complete state published at the end of do_init(). */
+	if (!smp_load_acquire(&eint->ready))
+		return -EPROBE_DEFER;
 
 	err = eint->gpio_xlate->get_gpio_n(eint->pctl, d->hwirq,
 					   &gpio_n, &gpio_c);
@@ -276,6 +310,9 @@ static int mtk_eint_irq_request_resources(struct irq_data *d)
 		dev_err(eint->dev, "Can not find pin\n");
 		return err;
 	}
+
+	if (!gpio_c || !gpio_c->gpiodev)
+		return -EPROBE_DEFER;
 
 	err = gpiochip_lock_as_irq(gpio_c, gpio_n);
 	if (err < 0) {
@@ -286,6 +323,7 @@ static int mtk_eint_irq_request_resources(struct irq_data *d)
 
 	err = eint->gpio_xlate->set_gpio_as_eint(eint->pctl, d->hwirq);
 	if (err < 0) {
+		gpiochip_unlock_as_irq(gpio_c, gpio_n);
 		dev_err(eint->dev, "Can not eint mode\n");
 		return err;
 	}
@@ -296,11 +334,12 @@ static int mtk_eint_irq_request_resources(struct irq_data *d)
 static void mtk_eint_irq_release_resources(struct irq_data *d)
 {
 	struct mtk_eint *eint = irq_data_get_irq_chip_data(d);
-	struct gpio_chip *gpio_c;
+	struct gpio_chip *gpio_c = NULL;
 	unsigned int gpio_n;
 
-	eint->gpio_xlate->get_gpio_n(eint->pctl, d->hwirq, &gpio_n,
-				     &gpio_c);
+	if (eint->gpio_xlate->get_gpio_n(eint->pctl, d->hwirq, &gpio_n,
+				       &gpio_c) < 0 || !gpio_c || !gpio_c->gpiodev)
+		return;
 
 	gpiochip_unlock_as_irq(gpio_c, gpio_n);
 }
@@ -315,6 +354,24 @@ static struct irq_chip mtk_eint_irq_chip = {
 	.irq_set_wake = mtk_eint_irq_set_wake,
 	.irq_request_resources = mtk_eint_irq_request_resources,
 	.irq_release_resources = mtk_eint_irq_release_resources,
+};
+
+static int mtk_eint_domain_map(struct irq_domain *domain, unsigned int virq,
+			       irq_hw_number_t hwirq)
+{
+	struct mtk_eint *eint = domain->host_data;
+
+	if (!mtk_eint_valid(eint, hwirq))
+		return -EINVAL;
+
+	irq_set_chip_and_handler(virq, &mtk_eint_irq_chip, handle_level_irq);
+	irq_set_chip_data(virq, eint);
+	return 0;
+}
+
+static const struct irq_domain_ops mtk_eint_domain_ops = {
+	.map = mtk_eint_domain_map,
+	.xlate = irq_domain_xlate_onetwocell,
 };
 
 static unsigned int mtk_eint_hw_init(struct mtk_eint *eint)
@@ -354,6 +411,18 @@ mtk_eint_debounce_process(struct mtk_eint *eint, int index)
 	}
 }
 
+static void mtk_eint_mask_ack_stray(struct mtk_eint *eint, unsigned int inst,
+				  unsigned int port, unsigned int mask)
+{
+	void __iomem *reg = eint->base[inst] + port * 4;
+
+	/* A hole or padding bit has no global source for get_offset(). */
+	eint->cur_mask[inst][port] &= ~mask;
+	eint->wake_mask[inst][port] &= ~mask;
+	writel(mask, reg + eint->regs->mask_set);
+	writel(mask, reg + eint->regs->ack);
+}
+
 static void mtk_eint_irq_handler(struct irq_desc *desc)
 {
 	struct irq_chip *chip = irq_desc_get_chip(desc);
@@ -371,7 +440,15 @@ static void mtk_eint_irq_handler(struct irq_desc *desc)
 				shift = __ffs(status);
 				status &= ~BIT(shift);
 				mask = BIT(shift);
+				if (j + shift >= eint->base_pin_num[i]) {
+					mtk_eint_mask_ack_stray(eint, i, port, mask);
+					continue;
+				}
 				eint_num = eint->pin_list[i][shift + j];
+				if (!mtk_eint_valid(eint, eint_num)) {
+					mtk_eint_mask_ack_stray(eint, i, port, mask);
+					continue;
+				}
 
 				/*
 				 * If we get an interrupt on pin that was only required
@@ -399,12 +476,23 @@ static void mtk_eint_irq_handler(struct irq_desc *desc)
 					start_level =
 					eint->gpio_xlate->get_gpio_state(eint->pctl,
 									 eint_num);
+					if (start_level < 0) {
+						mtk_eint_mask_ack_stray(eint, i, port, mask);
+						continue;
+					}
 				}
 
-				generic_handle_domain_irq(eint->domain, eint_num);
+				if (generic_handle_domain_irq(eint->domain, eint_num)) {
+					mtk_eint_mask_ack_stray(eint, i, port, mask);
+					continue;
+				}
 
 				if (dual_edge) {
 					curr_level = mtk_eint_flip_edge(eint, eint_num);
+					if (curr_level < 0) {
+						mtk_eint_mask_ack_stray(eint, i, port, mask);
+						continue;
+					}
 
 					/*
 					 * If level changed, we might lost one edge
@@ -427,6 +515,9 @@ static void mtk_eint_irq_handler(struct irq_desc *desc)
 
 int mtk_eint_do_suspend(struct mtk_eint *eint)
 {
+	if (!eint || !eint->domain)
+		return 0;
+
 	mtk_eint_chip_write_mask(eint, eint->wake_mask);
 
 	return 0;
@@ -435,6 +526,9 @@ EXPORT_SYMBOL_GPL(mtk_eint_do_suspend);
 
 int mtk_eint_do_resume(struct mtk_eint *eint)
 {
+	if (!eint || !eint->domain)
+		return 0;
+
 	mtk_eint_chip_write_mask(eint, eint->cur_mask);
 
 	return 0;
@@ -447,16 +541,25 @@ int mtk_eint_set_debounce(struct mtk_eint *eint, unsigned long eint_num,
 	int virq, eint_offset;
 	unsigned int set_offset, bit, clr_bit, clr_offset, rst, i, unmask,
 		     dbnc;
-	unsigned int inst = eint->pins[eint_num].instance;
-	unsigned int idx = eint->pins[eint_num].index;
+	unsigned int inst, idx;
 	struct irq_data *d;
+
+	if (!mtk_eint_valid(eint, eint_num) || !eint->domain)
+		return -EINVAL;
 
 	if (!eint->hw->db_time)
 		return -EOPNOTSUPP;
 
 	virq = irq_find_mapping(eint->domain, eint_num);
-	eint_offset = (idx % 4) * 8;
+	if (!virq)
+		return -EINVAL;
 	d = irq_get_irq_data(virq);
+	if (!d || irq_data_get_irq_chip_data(d) != eint)
+		return -EINVAL;
+
+	inst = eint->pins[eint_num].instance;
+	idx = eint->pins[eint_num].index;
+	eint_offset = (idx % 4) * 8;
 
 	set_offset = (idx / 4) * 4 + eint->regs->dbnc_set;
 	clr_offset = (idx / 4) * 4 + eint->regs->dbnc_clr;
@@ -479,7 +582,7 @@ int mtk_eint_set_debounce(struct mtk_eint *eint, unsigned long eint_num,
 		unmask = 0;
 	}
 
-	clr_bit = 0xff << eint_offset;
+	clr_bit = 0xffU << eint_offset;
 	writel(clr_bit, eint->base[inst] + clr_offset);
 
 	bit = ((dbnc << MTK_EINT_DBNC_SET_DBNC_BITS) | MTK_EINT_DBNC_SET_EN) <<
@@ -503,6 +606,14 @@ int mtk_eint_find_irq(struct mtk_eint *eint, unsigned long eint_n)
 {
 	int irq;
 
+	if (!eint)
+		return -EINVAL;
+	/* Pair with the readiness publication in do_init(). */
+	if (!smp_load_acquire(&eint->ready))
+		return -EPROBE_DEFER;
+	if (!mtk_eint_valid(eint, eint_n) || !eint->domain)
+		return -EINVAL;
+
 	irq = irq_find_mapping(eint->domain, eint_n);
 	if (!irq)
 		return -EINVAL;
@@ -511,18 +622,13 @@ int mtk_eint_find_irq(struct mtk_eint *eint, unsigned long eint_n)
 }
 EXPORT_SYMBOL_GPL(mtk_eint_find_irq);
 
-static void mtk_eint_teardown(void *data)
+static void mtk_eint_remove_domain(struct mtk_eint *eint)
 {
-	struct mtk_eint *eint = data;
 	unsigned int i, virq;
 
-	/* Detach the demux handler so it can no longer reference freed data. */
-	irq_set_chained_handler_and_data(eint->irq, NULL, NULL);
+	if (!eint->domain)
+		return;
 
-	/* Wait for any in-flight handler to finish before tearing down. */
-	synchronize_irq(eint->irq);
-
-	/* Dispose of all child mappings before the domain is removed. */
 	for (i = 0; i < eint->hw->ap_num; i++) {
 		virq = irq_find_mapping(eint->domain, i);
 		if (virq)
@@ -530,18 +636,53 @@ static void mtk_eint_teardown(void *data)
 	}
 
 	irq_domain_remove(eint->domain);
+	eint->domain = NULL;
+}
+
+static void mtk_eint_teardown(void *data)
+{
+	struct mtk_eint *eint = data;
+	unsigned int inst, port;
+
+	WRITE_ONCE(eint->ready, false);
+	/* Keep MMIO and GPIO data alive until all IRQ users are detached. */
+	irq_set_chained_handler_and_data(eint->irq, NULL, NULL);
+	synchronize_irq(eint->irq);
+	mtk_eint_remove_domain(eint);
+
+	/* An in-flight child may unmask while it completes; mask last. */
+	for (inst = 0; inst < eint->nbase; inst++) {
+		for (port = 0; port < DIV_ROUND_UP(eint->base_pin_num[inst], 32);
+		     port++)
+			writel(U32_MAX, eint->base[inst] + port * 4 +
+			       eint->regs->mask_set);
+	}
 }
 
 int mtk_eint_do_init(struct mtk_eint *eint, struct mtk_eint_pin *eint_pin)
 {
-	unsigned int size, i, port, virq, inst = 0;
+	unsigned int i, idx, port, virq, inst;
+	int ret = -ENOMEM;
 
-	/* If clients don't assign a specific regs, let's use generic one */
+	if (!eint || !eint->dev || !eint->hw || !eint->hw->ap_num ||
+	    eint->hw->ap_num > U16_MAX || eint->nbase <= 0 ||
+	    eint->nbase > U8_MAX || !eint->base || eint->irq <= 0 ||
+	    !eint->gpio_xlate || !eint->gpio_xlate->get_gpio_n ||
+	    !eint->gpio_xlate->get_gpio_state ||
+	    !eint->gpio_xlate->set_gpio_as_eint)
+		return -EINVAL;
+
+	for (i = 0; i < eint->nbase; i++)
+		if (!eint->base[i])
+			return -EINVAL;
+
+	eint->ready = false;
+	/* If clients don't assign specific regs, use the generic layout. */
 	if (!eint->regs)
 		eint->regs = &mtk_generic_eint_regs;
 
-	eint->base_pin_num = devm_kmalloc_array(eint->dev, eint->nbase, sizeof(u16),
-						GFP_KERNEL | __GFP_ZERO);
+	eint->base_pin_num = devm_kcalloc(eint->dev, eint->nbase,
+					 sizeof(*eint->base_pin_num), GFP_KERNEL);
 	if (!eint->base_pin_num)
 		return -ENOMEM;
 
@@ -549,21 +690,36 @@ int mtk_eint_do_init(struct mtk_eint *eint, struct mtk_eint_pin *eint_pin)
 		eint->pins = eint_pin;
 		for (i = 0; i < eint->hw->ap_num; i++) {
 			inst = eint->pins[i].instance;
-			if (inst >= eint->nbase)
+			if (inst == U8_MAX)
 				continue;
-			eint->base_pin_num[inst]++;
+			if (inst >= eint->nbase || eint->pins[i].number != i) {
+				dev_err(eint->dev, "Invalid EINT source %u\n", i);
+				ret = -EINVAL;
+				goto err_pins;
+			}
+			/* Size by hardware index, including sparse holes. */
+			idx = eint->pins[i].index;
+			eint->base_pin_num[inst] = max_t(u16,
+						  eint->base_pin_num[inst], idx + 1);
+			eint->pins[i].dual_edge = false;
 		}
 	} else {
-		size = eint->hw->ap_num * sizeof(struct mtk_eint_pin);
-		eint->pins = devm_kmalloc(eint->dev, size, GFP_KERNEL);
+		/* The legacy linear index is stored in an eight-bit field. */
+		if (eint->hw->ap_num > U8_MAX + 1) {
+			ret = -EINVAL;
+			goto err_pins;
+		}
+		eint->pins = devm_kcalloc(eint->dev, eint->hw->ap_num,
+					 sizeof(*eint->pins), GFP_KERNEL);
 		if (!eint->pins)
 			goto err_pins;
 
-		eint->base_pin_num[inst] = eint->hw->ap_num;
+		eint->base_pin_num[0] = eint->hw->ap_num;
 		for (i = 0; i < eint->hw->ap_num; i++) {
-			eint->pins[i].instance = inst;
+			eint->pins[i].number = i;
+			eint->pins[i].instance = 0;
 			eint->pins[i].index = i;
-			eint->pins[i].debounce = (i < eint->hw->db_cnt) ? 1 : 0;
+			eint->pins[i].debounce = i < eint->hw->db_cnt;
 		}
 	}
 
@@ -583,24 +739,36 @@ int mtk_eint_do_init(struct mtk_eint *eint, struct mtk_eint_pin *eint_pin)
 		goto err_cur_mask;
 
 	for (i = 0; i < eint->nbase; i++) {
-		eint->pin_list[i] = devm_kzalloc(eint->dev,
-						 eint->base_pin_num[i] * sizeof(**eint->pin_list),
-						 GFP_KERNEL);
+		if (!eint->base_pin_num[i])
+			continue;
+		eint->pin_list[i] = devm_kmalloc_array(eint->dev,
+					eint->base_pin_num[i], sizeof(**eint->pin_list),
+					GFP_KERNEL);
 		port = DIV_ROUND_UP(eint->base_pin_num[i], 32);
-		eint->wake_mask[i] = devm_kzalloc(eint->dev,
-						  port * sizeof(**eint->wake_mask),
-						  GFP_KERNEL);
-		eint->cur_mask[i] = devm_kzalloc(eint->dev,
-						 port * sizeof(**eint->cur_mask),
-						 GFP_KERNEL);
+		eint->wake_mask[i] = devm_kcalloc(eint->dev, port,
+						 sizeof(**eint->wake_mask), GFP_KERNEL);
+		eint->cur_mask[i] = devm_kcalloc(eint->dev, port,
+					       sizeof(**eint->cur_mask), GFP_KERNEL);
 		if (!eint->pin_list[i] || !eint->wake_mask[i] || !eint->cur_mask[i])
 			goto err_eint;
+		/* U16_MAX is EINT_NA; zero would incorrectly alias source 0. */
+		memset(eint->pin_list[i], 0xff,
+		       eint->base_pin_num[i] * sizeof(**eint->pin_list));
 	}
 
-	eint->domain = irq_domain_create_linear(dev_fwnode(eint->dev), eint->hw->ap_num,
-						&irq_domain_simple_ops, NULL);
-	if (!eint->domain)
-		goto err_eint;
+	/* Complete the reverse map before the IRQ domain is published. */
+	for (i = 0; i < eint->hw->ap_num; i++) {
+		inst = eint->pins[i].instance;
+		if (inst == U8_MAX)
+			continue;
+		idx = eint->pins[i].index;
+		if (eint->pin_list[inst][idx] != U16_MAX) {
+			dev_err(eint->dev, "Duplicate EINT bank %u index %u\n", inst, idx);
+			ret = -EINVAL;
+			goto err_eint;
+		}
+		eint->pin_list[inst][idx] = i;
+	}
 
 	if (eint->hw->db_time) {
 		for (i = 0; i < MTK_EINT_DBNC_MAX; i++)
@@ -609,23 +777,32 @@ int mtk_eint_do_init(struct mtk_eint *eint, struct mtk_eint_pin *eint_pin)
 		eint->num_db_time = i;
 	}
 
+	/* Consumers may run as soon as irq_domain_create_linear publishes. */
 	mtk_eint_hw_init(eint);
+	eint->domain = irq_domain_create_linear(dev_fwnode(eint->dev), eint->hw->ap_num,
+						&mtk_eint_domain_ops, eint);
+	if (!eint->domain)
+		goto err_eint;
+
 	for (i = 0; i < eint->hw->ap_num; i++) {
-		inst = eint->pins[i].instance;
-		if (inst >= eint->nbase)
+		if (!mtk_eint_valid(eint, i))
 			continue;
-		eint->pin_list[inst][eint->pins[i].index] = i;
 		virq = irq_create_mapping(eint->domain, i);
-		irq_set_chip_and_handler(virq, &mtk_eint_irq_chip,
-					 handle_level_irq);
-		irq_set_chip_data(virq, eint);
+		if (!virq)
+			goto err_domain;
 	}
 
-	irq_set_chained_handler_and_data(eint->irq, mtk_eint_irq_handler,
-					 eint);
+	ret = devm_add_action(eint->dev, mtk_eint_teardown, eint);
+	if (ret)
+		goto err_domain;
 
-	return devm_add_action_or_reset(eint->dev, mtk_eint_teardown, eint);
+	irq_set_chained_handler_and_data(eint->irq, mtk_eint_irq_handler, eint);
+	/* Publish all initialized IRQ/GPIO state before admitting requests. */
+	smp_store_release(&eint->ready, true);
+	return 0;
 
+err_domain:
+	mtk_eint_remove_domain(eint);
 err_eint:
 	for (i = 0; i < eint->nbase; i++) {
 		devm_kfree(eint->dev, eint->cur_mask[i]);
@@ -633,16 +810,22 @@ err_eint:
 		devm_kfree(eint->dev, eint->pin_list[i]);
 	}
 	devm_kfree(eint->dev, eint->cur_mask);
+	eint->cur_mask = NULL;
 err_cur_mask:
 	devm_kfree(eint->dev, eint->wake_mask);
+	eint->wake_mask = NULL;
 err_wake_mask:
 	devm_kfree(eint->dev, eint->pin_list);
+	eint->pin_list = NULL;
 err_pin_list:
-	if (!eint_pin)
+	if (!eint_pin) {
 		devm_kfree(eint->dev, eint->pins);
+		eint->pins = NULL;
+	}
 err_pins:
 	devm_kfree(eint->dev, eint->base_pin_num);
-	return -ENOMEM;
+	eint->base_pin_num = NULL;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mtk_eint_do_init);
 

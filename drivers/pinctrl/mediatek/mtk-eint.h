@@ -68,9 +68,11 @@ struct mtk_eint {
 	struct device *dev;
 	void __iomem **base;
 	int nbase;
+	/* Hardware index spans in each bank, including sparse holes. */
 	u16 *base_pin_num;
 	struct irq_domain *domain;
 	int irq;
+	bool ready;
 
 	int *dual_edge;
 	u16 **pin_list;

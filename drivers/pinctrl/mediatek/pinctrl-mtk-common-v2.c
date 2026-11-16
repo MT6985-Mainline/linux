@@ -365,117 +365,112 @@ static const struct mtk_eint_xt mtk_eint_xt = {
 	.set_gpio_as_eint = mtk_xt_set_gpio_as_eint,
 };
 
+static void mtk_eint_put_node(void *data)
+{
+	of_node_put(data);
+}
+
+static void mtk_eint_release_resources(void *data)
+{
+	struct mtk_eint *eint = data;
+	unsigned int i;
+
+	/* The later core teardown action has already detached all children. */
+	if (eint->irq > 0)
+		irq_dispose_mapping(eint->irq);
+	for (i = 0; i < eint->nbase; i++)
+		if (eint->base[i])
+			iounmap(eint->base[i]);
+}
+
 int mtk_build_eint(struct mtk_pinctrl *hw, struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
-	struct device_node *eint_node = NULL;
-	int ret, i, j, count_reg_names;
+	struct device_node *eint_node;
+	struct mtk_eint *eint;
+	void *group;
+	unsigned int reg_offset, i;
+	int ret;
 
 	if (!IS_ENABLED(CONFIG_EINT_MTK))
 		return 0;
 
-	if (!of_property_read_bool(np, "interrupt-controller")) {
+	if (!of_property_read_bool(np, "interrupt-controller") || !hw->soc->eint_hw)
 		return -ENODEV;
-	}
 
-	hw->eint = devm_kzalloc(hw->dev, sizeof(*hw->eint), GFP_KERNEL);
-	if (!hw->eint)
+	/* Failed optional EINT setup must not retain mappings or devres. */
+	group = devres_open_group(hw->dev, NULL, GFP_KERNEL);
+	if (!group)
 		return -ENOMEM;
 
-	/*
-	 * XAGA (mt6895): the EINT register banks live in a separate
-	 * apirq@11e50000 node referenced via the "mediatek,eint" phandle
-	 * (Android DT layout), not appended to the pinctrl reg list. Resolve
-	 * the phandle first; fall back to the legacy in-pinctrl layout.
-	 */
+	eint = devm_kzalloc(hw->dev, sizeof(*eint), GFP_KERNEL);
+	if (!eint) {
+		ret = -ENOMEM;
+		goto err_release_group;
+	}
+	hw->eint = eint;
+
+	/* The phandle supplies banks and the parent IRQ, not the child domain. */
 	eint_node = of_parse_phandle(np, "mediatek,eint", 0);
 	if (eint_node) {
-		count_reg_names = of_property_count_strings(eint_node, "reg-name");
-		if (count_reg_names < 0)
-			count_reg_names = of_property_count_strings(eint_node, "reg-names");
-		if (count_reg_names < 0) {
-			of_node_put(eint_node);
-			eint_node = NULL;
-		}
-	}
-	if (!eint_node) {
-		count_reg_names = of_property_count_strings(np, "reg-names");
-		if (count_reg_names < 0) {
-			ret = -EINVAL;
-			goto err_free_eint;
-		}
-		count_reg_names -= (int)hw->soc->nbase_names;
-	}
-	hw->eint->nbase = count_reg_names;
-	if (hw->eint->nbase <= 0) {
-		if (eint_node)
-			of_node_put(eint_node);
-		ret = -EINVAL;
-		goto err_free_eint;
-	}
-
-	hw->eint->base = devm_kmalloc_array(&pdev->dev, hw->eint->nbase,
-					    sizeof(*hw->eint->base), GFP_KERNEL | __GFP_ZERO);
-	if (!hw->eint->base) {
-		if (eint_node)
-			of_node_put(eint_node);
-		ret = -ENOMEM;
-		goto err_free_base;
-	}
-
-	if (eint_node) {
-		for (j = 0; j < count_reg_names; j++) {
-			hw->eint->base[j] = of_iomap(eint_node, j);
-			if (IS_ERR(hw->eint->base[j])) {
-				ret = PTR_ERR(hw->eint->base[j]);
-				of_node_put(eint_node);
-				goto err_free_eint;
-			}
-		}
-		hw->eint->irq = irq_of_parse_and_map(eint_node, 0);
+		reg_offset = 0;
 	} else {
-		for (i = hw->soc->nbase_names, j = 0; i < count_reg_names + hw->soc->nbase_names; i++, j++) {
-			hw->eint->base[j] = of_iomap(np, i);
-			if (IS_ERR(hw->eint->base[j])) {
-				ret = PTR_ERR(hw->eint->base[j]);
-				goto err_free_eint;
-			}
+		if (of_find_property(np, "mediatek,eint", NULL)) {
+			ret = -EINVAL;
+			goto err_release_group;
 		}
-		hw->eint->irq = irq_of_parse_and_map(np, 0);
+		/* Legacy DTs append EINT banks to the pinctrl register list. */
+		eint_node = of_node_get(np);
+		reg_offset = hw->soc->nbase_names;
 	}
-	if (eint_node) {
-		of_node_put(eint_node);
-		eint_node = NULL;
-	}
-	if (!hw->eint->irq) {
-		ret = -EINVAL;
-		goto err_free_eint;
-	}
-
-	if (!hw->soc->eint_hw) {
-		ret = -ENODEV;
-		goto err_free_eint;
-	}
-
-	hw->eint->dev = &pdev->dev;
-	hw->eint->hw = hw->soc->eint_hw;
-	hw->eint->pctl = hw;
-	hw->eint->gpio_xlate = &mtk_eint_xt;
-
-	ret = mtk_eint_do_init(hw->eint, hw->soc->eint_pin);
+	ret = devm_add_action_or_reset(hw->dev, mtk_eint_put_node, eint_node);
 	if (ret)
-		goto err_free_eint;
+		goto err_release_group;
 
+	eint->nbase = of_address_count(eint_node) - (int)reg_offset;
+	if (eint->nbase <= 0 || eint->nbase > U8_MAX) {
+		ret = -EINVAL;
+		goto err_release_group;
+	}
+
+	eint->base = devm_kcalloc(hw->dev, eint->nbase, sizeof(*eint->base), GFP_KERNEL);
+	if (!eint->base) {
+		ret = -ENOMEM;
+		goto err_release_group;
+	}
+	ret = devm_add_action_or_reset(hw->dev, mtk_eint_release_resources, eint);
+	if (ret)
+		goto err_release_group;
+
+	for (i = 0; i < eint->nbase; i++) {
+		eint->base[i] = of_iomap(eint_node, reg_offset + i);
+		/* of_iomap returns NULL when a resource cannot be mapped. */
+		if (!eint->base[i]) {
+			ret = -ENOMEM;
+			goto err_release_group;
+		}
+	}
+
+	eint->irq = of_irq_get(eint_node, 0);
+	if (eint->irq <= 0) {
+		ret = eint->irq ? eint->irq : -EINVAL;
+		goto err_release_group;
+	}
+
+	eint->dev = &pdev->dev;
+	eint->hw = hw->soc->eint_hw;
+	eint->pctl = hw;
+	eint->gpio_xlate = &mtk_eint_xt;
+
+	ret = mtk_eint_do_init(eint, hw->soc->eint_pin);
+	if (ret)
+		goto err_release_group;
+
+	devres_remove_group(hw->dev, group);
 	return 0;
 
-err_free_eint:
-	for (j = 0; j < hw->eint->nbase; j++) {
-		if (hw->eint->base[j])
-			iounmap(hw->eint->base[j]);
-	}
-	devm_kfree(hw->dev, hw->eint->base);
-err_free_base:
-	devm_kfree(hw->dev, hw->eint);
+err_release_group:
+	devres_release_group(hw->dev, group);
 	hw->eint = NULL;
 	return ret;
 }
