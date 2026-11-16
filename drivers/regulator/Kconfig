@@ -984,6 +984,13 @@ config REGULATOR_MT6363
 	  This driver supports the control of different power rails of device
 	  through regulator interface.
 
+config REGULATOR_MT6363_COROT
+	tristate "MediaTek MT6363 regulators for corot"
+	depends on MFD_MTK_SPMI_PMIC && OF
+	help
+	  Support the complete MT6363 regulator tables and parent PMIC binding
+	  used by corot, including VS3, SSHUB rails and hardware load control.
+
 config REGULATOR_MT6368
 	tristate "MediaTek MT6368 PMIC Regulator"
 	depends on REGMAP && OF
@@ -1896,3 +1903,9 @@ config REGULATOR_QCOM_LABIBB
 	  for LCD display panel.
 
 endif
+
+config REGULATOR_MT6373
+	tristate "MediaTek MT6373 SPMI regulators"
+	depends on MFD_MTK_SPMI_PMIC
+	help
+	  Support MT6373 regulators, including the corot panel VIBR and VAUD18 rails.

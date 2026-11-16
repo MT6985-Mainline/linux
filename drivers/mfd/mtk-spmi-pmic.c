@@ -15,6 +15,7 @@
 #include <linux/mfd/mt6373/registers.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
@@ -185,6 +186,34 @@ static const struct mfd_cell mt6363_devs[] = {
 	},
 };
 
+static const struct mfd_cell mt6363_corot_devs[] = {
+	{
+		.name = "mt6363-auxadc",
+		.of_compatible = "mediatek,mt6363-auxadc",
+	}, {
+		.name = "mtk-dynamic-loading-throttling",
+		.of_compatible = "mediatek,mt6363-dynamic_loading_throttling",
+	}, {
+		.name = "mt6363-efuse",
+		.of_compatible = "mediatek,mt6363-efuse",
+	}, {
+		.name = "mt6363-corot-regulator",
+		.num_resources = ARRAY_SIZE(mt6363_regulators_resources),
+		.resources = mt6363_regulators_resources,
+	}, {
+		.name = "mt-pmic",
+		.of_compatible = "mediatek,spmi-pmic-debug",
+	}, {
+		.name = "mtk-pmic-keys",
+		.num_resources = ARRAY_SIZE(mt6363_keys_resources),
+		.resources = mt6363_keys_resources,
+		.of_compatible = "mediatek,mt6363-keys"
+	}, {
+		.name = "mt6363-consys",
+		.of_compatible = "mediatek,mt6363-consys",
+	},
+};
+
 static const struct mfd_cell mt6368_devs[] = {
 	{
 		.name = "second-pmic",
@@ -299,6 +328,15 @@ static const struct mtk_spmi_pmic_data common_data = {
 static const struct mtk_spmi_pmic_data mt6363_data = {
 	.cells = mt6363_devs,
 	.cell_size = ARRAY_SIZE(mt6363_devs),
+	.num_top = ARRAY_SIZE(mt6363_ints),
+	.num_pmic_irqs = MT6363_IRQ_NR,
+	.top_int_status_reg = MT6363_TOP_INT_STATUS1,
+	.pmic_ints = mt6363_ints,
+};
+
+static const struct mtk_spmi_pmic_data mt6363_corot_data = {
+	.cells = mt6363_corot_devs,
+	.cell_size = ARRAY_SIZE(mt6363_corot_devs),
 	.num_top = ARRAY_SIZE(mt6363_ints),
 	.num_pmic_irqs = MT6363_IRQ_NR,
 	.top_int_status_reg = MT6363_TOP_INT_STATUS1,
@@ -571,6 +609,10 @@ static int mtk_spmi_pmic_probe(struct spmi_device *sdev)
 	chip_data = (struct mtk_spmi_pmic_data *)of_device_get_match_data(&sdev->dev);
 	if (!chip_data)
 		return -ENODEV;
+
+	/* Corot uses the complete MT6363 regulator tables from its stock MFD. */
+	if (chip_data == &mt6363_data && of_machine_is_compatible("xiaomi,corot"))
+		chip_data = &mt6363_corot_data;
 
 	core->chip_data = chip_data;
 	core->regmap = devm_regmap_init_spmi_ext(sdev, &spmi_regmap_config);

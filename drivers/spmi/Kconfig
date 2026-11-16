@@ -55,3 +55,10 @@ config SPMI_MTK_PMIF
 	  other devices that have the SPMI interface.
 
 endif
+
+config SPMI_MTK_COROT
+    tristate "MediaTek MT6985 corot PMIF controller"
+    depends on OF && ARCH_MEDIATEK
+    help
+      Support the MT6985 PMIF register layout and software interface channels
+      used by corot, including the MT6373 panel supply PMIC.

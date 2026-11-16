@@ -117,6 +117,7 @@ obj-$(CONFIG_REGULATOR_MT6359)	+= mt6359-regulator.o
 obj-$(CONFIG_REGULATOR_MT6360) += mt6360-regulator.o
 obj-$(CONFIG_REGULATOR_MT6363) += mt6363-regulator.o
 obj-$(CONFIG_REGULATOR_MT6363) += mt6363-mt6895.o
+obj-$(CONFIG_REGULATOR_MT6363_COROT) += mt6363-corot-regulator.o
 obj-$(CONFIG_REGULATOR_MT6368) += mt6368-regulator.o
 obj-$(CONFIG_REGULATOR_MT6370) += mt6370-regulator.o
 obj-$(CONFIG_REGULATOR_MT6380)	+= mt6380-regulator.o
@@ -221,3 +222,5 @@ obj-$(CONFIG_REGULATOR_WM8400) += wm8400-regulator.o
 obj-$(CONFIG_REGULATOR_WM8994) += wm8994-regulator.o
 
 ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG
+
+obj-$(CONFIG_REGULATOR_MT6373) += mt6373-regulator.o
