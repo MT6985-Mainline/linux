@@ -63,6 +63,8 @@ enum disp_feature_id {
 	DISP_FEATURE_BIST_MODE_COLOR = 30,
 	DISP_FEATURE_ROUND_MODE = 31,
 	DISP_FEATURE_GAMUT = 32,
+	DISP_FEATURE_POWERSTATUS = 33,
+	DISP_FEATURE_SYSTEM_BUILD_VERSION = 34,
 	DISP_FEATURE_MAX,
 };
 
@@ -347,14 +349,6 @@ static inline int is_aod_brightness(__u32 doze_brightness)
 		return 0;
 }
 
-static inline int mi_get_disp_id(const char *type)
-{
-	if (!strncmp(type, "primary", 7))
-		return MI_DISP_PRIMARY;
-	else
-		return MI_DISP_SECONDARY;
-}
-
 static inline const char *get_doze_brightness_name(__u32 doze_brightness)
 {
 	switch (doze_brightness) {
@@ -548,6 +542,10 @@ static inline const char *get_disp_feature_id_name(__u32 feature_id)
 		return "round_mode";
 	case DISP_FEATURE_GAMUT:
 		return "gamut";
+	case DISP_FEATURE_POWERSTATUS:
+		return "power_status";
+	case DISP_FEATURE_SYSTEM_BUILD_VERSION:
+		return "system_build_version";
 	default:
 		return "Unknown";
 	}
@@ -802,6 +800,10 @@ static inline const char *getDispFeatureIdName(__u32 feature_id)
 		return "round_mode";
 	case DISP_FEATURE_GAMUT:
 		return "gamut";
+	case DISP_FEATURE_POWERSTATUS:
+		return "power_status";
+	case DISP_FEATURE_SYSTEM_BUILD_VERSION:
+		return "system_build_version";
 	default:
 		return "Unknown";
 	}

@@ -30,7 +30,7 @@ static ssize_t disp_param_store(struct device *device,
 	char *token, *input_copy, *input_dup = NULL;
 	const char *delim = " ";
 	u32 tmp_data = 0;
-	int ret = 0, index = 0;
+	int ret = 0;
 
 	memset(&ctl, 0, sizeof(struct disp_feature_ctl));
 
@@ -61,53 +61,22 @@ static ssize_t disp_param_store(struct device *device,
 		}
 	}
 
-	if (ctl.feature_id == DISP_FEATURE_BIST_MODE_COLOR) {
-		ctl.tx_ptr = kzalloc(sizeof(u8) * 3, GFP_KERNEL);
-		if (!ctl.tx_ptr) {
-			DISP_ERROR("vmalloc failed for DISP_FEATURE_BIST_MODE\n");
-			goto exit_free;
-		}
-		for (index = 0; index < 3; index++) {
-			/* Removes leading whitespace from input_copy */
-			if (input_copy) {
-				input_copy = skip_spaces(input_copy);
-			} else {
-				DISP_ERROR("please check the number of parameters\n");
-				ret = -EAGAIN;
-				kfree(ctl.tx_ptr);
-				goto exit_free;
-			}
-
-			token = strsep(&input_copy, delim);
-			if (token) {
-				ret = kstrtoint(token, 10, &tmp_data);
-				if (ret) {
-					DISP_ERROR("input buffer conversion failed\n");
-					ret = -EAGAIN;
-					kfree(ctl.tx_ptr);
-					goto exit_free;
-				}
-				ctl.tx_ptr[index] = tmp_data & 0xFF;
-			}
-		}
+	/* Removes leading whitespace from input_copy */
+	if (input_copy) {
+		input_copy = skip_spaces(input_copy);
 	} else {
-		/* Removes leading whitespace from input_copy */
-		if (input_copy) {
-			input_copy = skip_spaces(input_copy);
-		} else {
-			DISP_ERROR("please check the number of parameters\n");
-			ret = -EAGAIN;
-			goto exit_free;
-		}
-
-		ret = kstrtoint(input_copy, 10, &tmp_data);
-		if (ret) {
-			DISP_ERROR("input buffer conversion failed\n");
-			ret = -EAGAIN;
-			goto exit_free;
-		}
-		ctl.feature_val = tmp_data;
+		DISP_ERROR("please check the number of parameters\n");
+		ret = -EAGAIN;
+		goto exit_free;
 	}
+
+	ret = kstrtoint(input_copy, 10, &tmp_data);
+	if (ret) {
+		DISP_ERROR("input buffer conversion failed\n");
+		ret = -EAGAIN;
+		goto exit_free;
+	}
+	ctl.feature_val = tmp_data;
 
 	if (dd_ptr->intf_type == MI_INTF_DSI) {
 		ret = mi_dsi_display_set_disp_param(dd_ptr->display, &ctl);
@@ -159,6 +128,25 @@ static ssize_t gir_store(struct device *device,
 	}
 
 	return ret ? ret : count;
+}
+
+static ssize_t flat_mode_show(struct device *device,
+			   struct device_attribute *attr,
+			   char *buf)
+{
+	struct disp_display *dd_ptr = to_disp_display(device);
+
+	if (dd_ptr->intf_type == MI_INTF_DSI) {
+		int gir_status = mi_dsi_display_get_gir_status(dd_ptr->display);
+		if (gir_status < 0) {
+			return snprintf(buf, PAGE_SIZE, "invalid\n");
+		} else {
+			return snprintf(buf, PAGE_SIZE, "%d\n", gir_status ? 1 : 0);
+		}
+	} else {
+		return snprintf(buf, PAGE_SIZE, "Unsupported display(%s intf)\n",
+			get_disp_intf_type_name(dd_ptr->intf_type));
+	}
 }
 
 static ssize_t gir_show(struct device *device,
@@ -220,24 +208,6 @@ static ssize_t gray_scale_info_show(struct device *device,
 			get_disp_intf_type_name(dd_ptr->intf_type));
 	}
 
-}
-
-static ssize_t flatmode_check_show(struct device *device,
-			struct device_attribute *attr, char *buf)
-{
-	struct disp_display *dd_ptr = to_disp_display(device);
-
-	if (dd_ptr->intf_type == MI_INTF_DSI) {
-		int gir_status = mi_dsi_display_get_gir_status(dd_ptr->display);
-		if (gir_status < 0) {
-			return snprintf(buf, PAGE_SIZE, "invalid\n");
-		} else {
-			return snprintf(buf, PAGE_SIZE, "%d\n", gir_status ? 1 : 0);
-		}
-	} else {
-		return snprintf(buf, PAGE_SIZE, "Unsupported display(%s intf)\n",
-			get_disp_intf_type_name(dd_ptr->intf_type));
-	}
 }
 
 static ssize_t dynamic_fps_show(struct device *device,
@@ -325,30 +295,17 @@ static ssize_t brightness_clone_store(struct device *device,
 	return ret ? ret : count;
 }
 
-static ssize_t max_brightness_clone_show(struct device *device,
-				struct device_attribute *attr, char *buf)
-  {
-	int max_brightness_clone = 4095;
-	struct disp_display *dd_ptr = to_disp_display(device);
-
-	mi_dsi_display_get_max_brightness_clone(dd_ptr->display, &max_brightness_clone);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", max_brightness_clone);
-
-}
-
 static ssize_t factory_max_brightness_show(struct device *device,
-				struct device_attribute *attr, char *buf)
+  				struct device_attribute *attr, char *buf)
   {
 	int factory_max_brightness = 4095;
-	struct disp_display *dd_ptr = to_disp_display(device);
+ 	struct disp_display *dd_ptr = to_disp_display(device);
 
 	mi_dsi_display_get_factory_max_brightness(dd_ptr->display,&factory_max_brightness);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", factory_max_brightness);
+  	return snprintf(buf, PAGE_SIZE, "%d\n", factory_max_brightness);
 
 }
-
 static ssize_t panel_event_show(struct device *device,
 		struct device_attribute *attr,
 		char *buf)
@@ -361,6 +318,36 @@ static ssize_t panel_event_show(struct device *device,
 		return ret;
 	}
 	return snprintf(buf, PAGE_SIZE, "%d\n", dsi->panel_event);
+}
+
+static ssize_t disp_count_store(struct device *device,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct disp_display *dd_ptr = to_disp_display(device);
+	int ret = 0;
+
+	if (dd_ptr->intf_type == MI_INTF_DSI) {
+		return mi_dsi_display_set_disp_count(dd_ptr->display, (char *)buf);
+	} else {
+		DISP_ERROR("Unsupported display(%s intf)\n",
+			get_disp_intf_type_name(dd_ptr->intf_type));
+		ret = -EINVAL;
+	}
+
+	return ret ? ret : count;
+}
+
+static ssize_t disp_count_show(struct device *device,
+		struct device_attribute *attr, char *buf)
+{
+	struct disp_display *dd_ptr = to_disp_display(device);
+	if (dd_ptr->intf_type == MI_INTF_DSI) {
+		return mi_dsi_display_get_disp_count(dd_ptr->display, buf);
+	} else {
+		return snprintf(buf, PAGE_SIZE, "Unsupported display(%s intf)\n",
+			get_disp_intf_type_name(dd_ptr->intf_type));
+	}
+
 }
 
 static ssize_t dc_status_store(struct device *device,
@@ -502,17 +489,17 @@ static DEVICE_ATTR_RW(disp_param);
 static DEVICE_ATTR_RO(panel_info);
 static DEVICE_ATTR_RO(wp_info);
 static DEVICE_ATTR_RO(gray_scale_info);
-static DEVICE_ATTR_RO(flatmode_check);
 static DEVICE_ATTR_RO(dynamic_fps);
 static DEVICE_ATTR_RW(doze_brightness);
 static DEVICE_ATTR_RW(brightness_clone);
-static DEVICE_ATTR_RO(max_brightness_clone);
 static DEVICE_ATTR_RO(factory_max_brightness);
 static DEVICE_ATTR_RW(gir);
+static DEVICE_ATTR_RW(disp_count);
 static DEVICE_ATTR_RW(dc_status);
 static DEVICE_ATTR_RW(led_i2c_reg);
 static DEVICE_ATTR_RO(panel_event);
 static DEVICE_ATTR_RW(idle);
+static DEVICE_ATTR_RO(flat_mode);
 
 #if 0
 static DEVICE_ATTR_RO(gamma_test);
@@ -527,14 +514,14 @@ static struct attribute *disp_feature_attrs[] = {
 	&dev_attr_dynamic_fps.attr,
 	&dev_attr_doze_brightness.attr,
 	&dev_attr_brightness_clone.attr,
-	&dev_attr_max_brightness_clone.attr,
 	&dev_attr_factory_max_brightness.attr,
 	&dev_attr_gir.attr,
+	&dev_attr_disp_count.attr,
 	&dev_attr_dc_status.attr,
 	&dev_attr_led_i2c_reg.attr,
 	&dev_attr_panel_event.attr,
 	&dev_attr_idle.attr,
-	&dev_attr_flatmode_check.attr,
+	&dev_attr_flat_mode.attr,
 #if 0
 	&dev_attr_gamma_test.attr,
 	&dev_attr_hw_vsync_info.attr,

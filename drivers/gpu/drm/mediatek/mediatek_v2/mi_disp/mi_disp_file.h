@@ -58,3 +58,4 @@ long mi_disp_ioctl_compat(struct file *file, unsigned int cmd,
 unsigned int mi_disp_poll(struct file *filp, struct poll_table_struct *wait);
 
 #endif
+

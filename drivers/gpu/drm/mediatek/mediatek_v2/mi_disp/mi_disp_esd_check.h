@@ -16,9 +16,12 @@ struct mi_esd_ctx {
 	int err_flag_irq;
 	bool err_flag_enabled;
 	bool panel_init;
+	struct drm_crtc *crtc;
+	u32 event_epoch;
 };
 
 void mi_disp_esd_chk_init(struct drm_crtc *crtc);
 void mi_disp_esd_chk_deinit(struct drm_crtc *crtc);
 void mi_disp_err_flag_esd_check_switch(struct drm_crtc *crtc, bool enable);
+void mi_disp_err_flag_esd_check_arm(struct drm_crtc *crtc, bool enable);
 #endif

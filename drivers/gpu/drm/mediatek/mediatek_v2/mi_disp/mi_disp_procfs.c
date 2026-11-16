@@ -182,3 +182,5 @@ int mi_disp_procfs_deinit(void *d_display, int disp_id)
 
 	return ret;
 }
+
+

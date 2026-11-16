@@ -1,9 +1,10 @@
 mediatek-drm-y += mi_disp/mi_disp_core.o \
-       mi_disp/mi_disp_feature.o \
-       mi_disp/mi_disp_file.o \
-       mi_disp/mi_dsi_display.o \
-       mi_disp/mi_dsi_panel.o \
-       mi_disp/mi_disp_print.o
+        mi_disp/mi_disp_feature.o \
+        mi_disp/mi_disp_file.o \
+        mi_disp/mi_dsi_display.o \
+        mi_disp/mi_dsi_panel.o \
+        mi_disp/mi_disp_print.o \
+        mi_disp/mi_disp_lhbm.o
 
 ifeq ($(CONFIG_MI_DISP_DEBUGFS), y)
 mediatek-drm-y += mi_disp/mi_disp_debugfs.o
@@ -29,6 +30,10 @@ ifeq ($(CONFIG_MI_DISP_NOTIFIER), y)
 mediatek-drm-y += mi_disp/mi_disp_notifier.o
 endif
 
+ifeq ($(CONFIG_MI_HWCONF_MANAGER), y)
+mediatek-drm-y += mi_disp/mi_hwconf_manager.o
+endif
+
 ifeq ($(CONFIG_MI_DISP_LOG), y)
 mediatek-drm-y += mi_disp/mi_disp_log.o
 endif
@@ -45,6 +50,3 @@ ifeq ($(CONFIG_MI_DISP_FOD_SYNC), y)
 mediatek-drm-y += mi_disp/mi_drm_crtc.o
 endif
 
-ifeq ($(CONFIG_MI_DISP_LHBM), y)
-mediatek-drm-y += mi_disp/mi_disp_lhbm.o
-endif

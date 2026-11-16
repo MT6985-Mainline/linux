@@ -23,8 +23,9 @@
 #include <linux/rtc.h>
 #include <linux/kthread.h>
 #include <linux/eventpoll.h>
-#include "mi_dsi_display.h"
+#include <linux/soc/mediatek/mtk-cmdq-ext.h>
 
+#include "mi_dsi_display.h"
 #include "mi_disp_feature.h"
 #include "mi_dsi_panel.h"
 #include "mi_disp_file.h"
@@ -213,7 +214,7 @@ static int mi_disp_ioctl_set_feature(struct disp_feature_client *client, void *d
 	struct disp_feature_req *req = data;
 	u32 disp_id = req->base.disp_id;
 	struct disp_display *dd_ptr = NULL;
-	struct disp_feature_ctl ctl;
+	static struct disp_feature_ctl ctl;
 	int ret = 0;
 
 	ret = mutex_lock_interruptible(&client->client_lock);
@@ -305,9 +306,7 @@ static int mi_disp_ioctl_set_local_hbm(
 		if (dd_ptr->intf_type == MI_INTF_DSI) {
 			DISP_INFO("%s display local_hbm_value = %s\n",
 				get_disp_id_name(disp_id), get_lhbm_value_name(local_hbm_value));
-			#ifdef CONFIG_MI_DISP_LHBM
-			ret = mi_disp_set_local_hbm(disp_id, local_hbm_value);
-			#endif
+				ret = mi_disp_set_local_hbm(disp_id, local_hbm_value);
 		} else {
 			DISP_INFO("Unsupported display(%s intf)\n",
 				get_disp_intf_type_name(dd_ptr->intf_type));
@@ -444,43 +443,6 @@ static int mi_disp_ioctl_get_doze_brightness(
 		if (dd_ptr->intf_type == MI_INTF_DSI) {
 			ret = mi_dsi_display_get_doze_brightness(dd_ptr->display,
 					&req->doze_brightness);
-		} else {
-			DISP_INFO("Unsupported display(%s intf)\n",
-				get_disp_intf_type_name(dd_ptr->intf_type));
-			ret = -EINVAL;
-		}
-	} else {
-		DISP_INFO("Unsupported display id\n");
-		ret = -EINVAL;
-	}
-
-	mutex_unlock(&client->client_lock);
-	return ret;
-}
-
-static int mi_disp_ioctl_set_brightness(
-			struct disp_feature_client *client, void *data)
-{
-	struct disp_feature *df = client->df;
-	struct disp_brightness_req *req = data;
-	u32 disp_id = req->base.disp_id;
-	struct disp_display *dd_ptr = NULL;
-	static u32 brightness;
-	int ret = 0;
-
-	ret = mutex_lock_interruptible(&client->client_lock);
-	if (ret)
-		return ret;
-
-	brightness = req->brightness;
-
-	if (is_support_disp_id(disp_id)) {
-		dd_ptr = &df->d_display[disp_id];
-		if (dd_ptr->intf_type == MI_INTF_DSI) {
-			DISP_INFO("%s display brightness = %d\n",
-				get_disp_id_name(disp_id), brightness);
-			ret = mi_dsi_display_set_brightness(dd_ptr->display,
-					brightness);
 		} else {
 			DISP_INFO("Unsupported display(%s intf)\n",
 				get_disp_intf_type_name(dd_ptr->intf_type));
@@ -852,7 +814,6 @@ static const struct disp_ioctl_desc disp_ioctls[] = {
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_DEREGISTER_EVENT, mi_disp_ioctl_deregister_event),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_WRITE_DSI_CMD, mi_disp_ioctl_write_dsi_cmd),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_READ_DSI_CMD, mi_disp_ioctl_read_dsi_cmd),
-	DISP_IOCTL_DEF(MI_DISP_IOCTL_SET_BRIGHTNESS, mi_disp_ioctl_set_brightness),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_GET_BRIGHTNESS, mi_disp_ioctl_get_brightness),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_SET_LOCAL_HBM, mi_disp_ioctl_set_local_hbm),
 };
@@ -936,3 +897,4 @@ long mi_disp_ioctl_compat(struct file *file,
 	return mi_disp_ioctl(file, cmd, arg);
 }
 #endif
+

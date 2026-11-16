@@ -106,19 +106,27 @@ config MI_DISP_DSC2712
        help
          This is used to DSC 2712*1200.
 
-config MI_DISP_LHBM
-      bool "Xiaomi config LHBM"
-      default n
-      depends on MI_DISP
-      help
-         This is used to config FOD LHBM
-
 config MI_DISP_DOZE_SUSPEND
       bool "Xiaomi config enable doze suspend"
       default n
       depends on MI_DISP
       help
          This is used to config support doze suspend
+
+config MI_HWCONF_MANAGER
+      bool "Hardware configuration and monitor information"
+      default n
+      depends on MI_DISP
+      help
+         This is used to it provides all kinds of components configuration information and
+         monitor values.
+
+config MI_DISP_DSC2712
+       bool "Xiaomi Display DSC 2712*1200"
+       default n
+       depends on MI_DISP
+       help
+         This is used to DSC 2712*1200.
 
 config MI_DYNAMIC_OVL_WCG_ENABLE
       bool "OVL WCG with MTK on and off dynamically"

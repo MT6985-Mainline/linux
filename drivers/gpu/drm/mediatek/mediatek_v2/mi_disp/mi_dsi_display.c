@@ -21,7 +21,21 @@
 
 #include "mi_dsi_panel.h"
 #include "mi_disp_print.h"
+#include "mi_dsi_panel_count.h"
 //static atomic64_t g_param = ATOMIC64_INIT(0);
+
+int mi_get_disp_id(const char *display_type)
+{
+	if (!strncmp(display_type, "primary", 7))
+		return MI_DISP_PRIMARY;
+	else
+		return MI_DISP_SECONDARY;
+}
+
+static inline struct lcm *panel_to_lcm(struct drm_panel *panel)
+{
+	return container_of(panel, struct lcm, panel);
+}
 
 int mi_dsi_display_set_disp_param(void *display,
 			struct disp_feature_ctl *ctl)
@@ -368,4 +382,31 @@ void mi_dsi_display_wakeup_pending_doze_work(void *display)
 	}
 
 	return;
+}
+
+ssize_t mi_dsi_display_set_disp_count(void *display, char* buf)
+{
+	struct mtk_dsi *dsi_display = (struct mtk_dsi *)display;
+	struct lcm *ctx = panel_to_lcm(dsi_display->panel);
+
+	if (!dsi_display || !ctx) {
+		pr_err("Invalid display or ctx\n");
+		return -EINVAL;
+	}
+	return 0;
+	//return dsi_panel_disp_count_get(ctx, buf);
+}
+
+ssize_t mi_dsi_display_get_disp_count(void *display, char* buf)
+{
+	struct mtk_dsi *dsi_display = (struct mtk_dsi *)display;
+	struct lcm *ctx = panel_to_lcm(dsi_display->panel);
+
+	if (!dsi_display || !ctx) {
+		pr_err("Invalid display or ctx\n");
+		return -EINVAL;
+	}
+
+	return 0;
+	//return dsi_panel_disp_count_get(ctx, buf);
 }

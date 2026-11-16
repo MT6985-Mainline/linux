@@ -14,7 +14,6 @@
 #include <linux/backlight.h>
 #include <linux/workqueue.h>
 
-//#include <drm/drmP.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_mipi_dsi.h>
@@ -33,23 +32,17 @@
 #include <linux/platform_device.h>
 #include <video/mipi_display.h>
 #include <video/videomode.h>
-#include "mtk_drm_crtc.h"
+#include <linux/soc/mediatek/mtk-cmdq-ext.h>
 
-#include <linux/soc/mediatek/mtk-cmdq.h>
 #if defined(CONFIG_MACH_MT6873)
 #include <linux/ratelimit.h>
 #endif
 
-
-#include "mtk_drm_ddp_comp.h"
-
-#include "mtk_drm_drv.h"
 #include "mtk_drm_helper.h"
 #include "mtk_mipi_tx.h"
 #include "mtk_dump.h"
 #include "mtk_log.h"
 #include "mtk_drm_lowpower.h"
-#include "mtk_drm_mmp.h"
 
 #include "mi_disp_feature.h"
 #include "mi_disp_notifier.h"
@@ -93,44 +86,6 @@ struct t_condition_wq {
 struct mtk_dsi_mgr {
 	struct mtk_dsi *master;
 	struct mtk_dsi *slave;
-};
-
-struct lcm {
-	struct device *dev;
-	struct drm_panel panel;
-	struct backlight_device *backlight;
-	struct gpio_desc *reset_gpio;
-	struct gpio_desc *bias_pos;
-	struct gpio_desc *dvdd_gpio;
-	struct gpio_desc *cam_gpio;
-	struct gpio_desc *leden_gpio;
-	struct gpio_desc *vddi_gpio;
-
-	bool prepared;
-	bool enabled;
-	bool hbm_en;
-	bool wqhd_en;
-	bool dc_status;
-	bool hbm_enabled;
-	bool lhbm_en;
-	bool doze_suspend;
-
-	int error;
-	const char *panel_info;
-	int dynamic_fps;
-	u32 doze_brightness_state;
-
-	struct pinctrl *pinctrl_gpios;
-	struct pinctrl_state *err_flag_irq;
-
-	u32 max_brightness_clone;
-	u32 factory_max_brightness;
-	struct mutex panel_lock;
-	int bl_max_level;
-	int gir_status;
-	int spr_status;
-	int crc_level;
-	int peak_hdr_status;
 };
 
 struct mi_dsi_panel_cfg {
@@ -198,12 +153,10 @@ struct mi_dsi_panel_cfg {
 	u32 lhbm_ui_ready_delay_frame;
 	u32 lhbm_ui_ready_delay_frame_aod;
 	bool need_fod_animal_in_normal;
-
 };
 
 struct mtk_dsi {
 	/* Copy from mtk_dsi.c */
-	bool m12_prepare_ok;
 	struct mtk_ddp_comp ddp_comp;
 	struct device *dev;
 	struct mipi_dsi_host host;
@@ -217,6 +170,8 @@ struct mtk_dsi {
 	bool is_slave;
 	struct mtk_dsi *slave_dsi;
 	struct mtk_dsi *master_dsi;
+	struct mtk_drm_connector_caps connector_caps;
+	uint32_t connector_caps_blob_id;
 
 	void __iomem *regs;
 
@@ -226,6 +181,7 @@ struct mtk_dsi {
 
 	u32 data_rate;
 	u32 d_rate;
+	u32 bdg_data_rate;
 
 	unsigned long mode_flags;
 	enum mipi_dsi_pixel_format format;
@@ -233,6 +189,7 @@ struct mtk_dsi {
 	struct videomode vm;
 	int clk_refcnt;
 	bool output_en;
+	bool corot_te_reported;
 	bool doze_enabled;
 	u32 irq_data;
 	wait_queue_head_t irq_wait_queue;
@@ -262,13 +219,15 @@ struct mtk_dsi {
 	unsigned int hsa_byte;
 	unsigned int hbp_byte;
 	unsigned int hfp_byte;
-
+	/* for 6382 mipi hopping */
+	bool bdg_mipi_hopping_sta;
 	bool mipi_hopping_sta;
 	bool panel_osc_hopping_sta;
 	unsigned int data_phy_cycle;
 	/* for Panel Master dcs read/write */
 	struct mipi_dsi_device *dev_for_PM;
-
+	bool pending_switch;
+	struct mtk_drm_esd_ctx *esd_ctx;
 	/* Added by Xiaomi */
 	bool fod_backlight_flag;
 	bool fod_hbm_flag;
@@ -356,6 +315,7 @@ int mi_dsi_panel_set_brightness(struct mtk_dsi *dsi,
 			int brightness);
 int mi_dsi_panel_get_brightness(struct mtk_dsi *dsi,
 			u32 *brightness);
+int mi_dsi_panel_set_disp_param(struct mtk_dsi *dsi, struct disp_feature_ctl *ctl);
 
 ssize_t mi_dsi_panel_write_mipi_reg(char *buf);
 

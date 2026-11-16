@@ -17,6 +17,8 @@
 #include <drm/drm_connector.h>
 #include "mi_disp_feature.h"
 
+int mi_get_disp_id(const char *display_type);
+
 ssize_t dsi_display_get_disp_param(struct drm_connector *connector,
 			char *buf);
 ssize_t dsi_display_set_disp_param(struct drm_connector *connector,
@@ -92,4 +94,8 @@ int mi_dsi_display_set_thermal_limit_brightness_clone(void *display,
 
 int mi_dsi_display_get_thermal_limit_brightness_clone(void *display,
 			u32 *thermal_limit_brightness_clone);
+
+ssize_t mi_dsi_display_set_disp_count(void *display, char* buf);
+
+ssize_t mi_dsi_display_get_disp_count(void *display, char* buf);
 #endif /*_MI_DSI_DISPLAY_H_*/

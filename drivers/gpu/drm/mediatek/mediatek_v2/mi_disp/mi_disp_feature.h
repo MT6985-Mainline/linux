@@ -170,3 +170,4 @@ static inline void mi_disp_feature_exit(void) {}
 #endif
 
 #endif /* _MI_DISP_FEATURE_H_ */
+

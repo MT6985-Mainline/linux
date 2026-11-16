@@ -24,6 +24,8 @@
 #include <linux/kthread.h>
 #include <uapi/linux/sched/types.h>
 #include <uapi/drm/mi_disp.h>
+#include <linux/soc/mediatek/mtk-cmdq-ext.h>
+
 #include "mi_dsi_display.h"
 #include "mi_disp_core.h"
 #include "mi_disp_feature.h"
@@ -42,8 +44,9 @@
 #ifdef CONFIG_MI_DISP_BOOST
 #include "mi_disp_boost.h"
 #endif
-#ifdef CONFIG_MI_DISP_LHBM
 #include "mi_disp_lhbm.h"
+#ifdef CONFIG_MI_HWCONF_MANAGER
+#include "mi_hwconf_manager.h"
 #endif
 
 struct disp_feature *g_disp_feature = NULL;
@@ -142,9 +145,7 @@ int mi_disp_feature_attach_display(void *display, int disp_id, int intf_type)
 #ifdef CONFIG_MI_DISP_DEBUGFS
 	bool debugfs_inited = false;
 #endif
-#ifdef CONFIG_MI_DISP_LHBM
 	bool lhbm_inited = false;
-#endif
 
 	if (!df) {
 		return -ENODEV;
@@ -178,14 +179,12 @@ int mi_disp_feature_attach_display(void *display, int disp_id, int intf_type)
 		}
 		disp_thread_inited = true;
 
-#ifdef CONFIG_MI_DISP_LHBM
 		ret = mi_disp_lhbm_fod_thread_create(df, disp_id);
 		if (ret) {
 			DISP_ERROR("failed to create fod_thread kthread\n");
 			goto err;
 		}
 		lhbm_inited = true;
-#endif
 
 #ifdef CONFIG_MI_DISP_PROCFS
 		ret = mi_disp_procfs_init(dd_ptr, disp_id);
@@ -240,11 +239,9 @@ int mi_disp_feature_attach_display(void *display, int disp_id, int intf_type)
 
 
 err:
-#ifdef CONFIG_MI_DISP_LHBM
 	if (lhbm_inited) {
 		mi_disp_feature_thread_destroy(df, disp_id);
 	}
-#endif
 
 #ifdef CONFIG_MI_DISP_DEBUGFS
 	if (debugfs_inited) {
@@ -435,7 +432,7 @@ static const struct file_operations disp_feature_fops = {
 #endif
 	.poll            = mi_disp_poll,
 	.read            = mi_disp_read,
-	.llseek          = noop_llseek,
+	.llseek          = NULL,
 };
 
 int mi_disp_feature_init(void)
@@ -496,6 +493,12 @@ int mi_disp_feature_init(void)
 
 	g_disp_feature = df;
 
+#ifdef CONFIG_MI_HWCONF_MANAGER
+	if (hwconf_init() < 0) {
+		DISP_ERROR("can not initialize hwconf.\n");
+	}
+#endif
+
 	pr_info("mi disp_feature driver initialized!\n");
 
 	return 0;
@@ -510,6 +513,10 @@ err_exit:
 
 void mi_disp_feature_exit(void)
 {
+#ifdef CONFIG_MI_HWCONF_MANAGER
+	hwconf_exit();
+#endif
+
 	if (!g_disp_feature)
 		return;
 	device_destroy(g_disp_feature->class, g_disp_feature->dev_id);
@@ -518,3 +525,4 @@ void mi_disp_feature_exit(void)
 	g_disp_feature = NULL;
 	mi_disp_core_deinit();
 }
+

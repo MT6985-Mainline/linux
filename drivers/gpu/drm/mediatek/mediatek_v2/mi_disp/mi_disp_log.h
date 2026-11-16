@@ -40,3 +40,4 @@ static inline void disp_log_printk_utc(const char *fmt, ...) {}
 #endif
 
 #endif /* _MI_DISPLOG_H_ */
+

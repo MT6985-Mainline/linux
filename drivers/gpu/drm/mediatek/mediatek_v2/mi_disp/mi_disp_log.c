@@ -664,3 +664,4 @@ void mi_disp_log_exit(void)
 	kfree(g_disp_log);
 	g_disp_log = NULL;
 }
+

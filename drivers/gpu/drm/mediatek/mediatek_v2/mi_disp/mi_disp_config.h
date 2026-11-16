@@ -18,3 +18,4 @@
 #endif
 
 #endif /* _MI_DISP_CONFIG_H_ */
+

@@ -32,3 +32,4 @@ int mi_drm_crtc_update_layer_state(struct drm_crtc *crtc);
 int mi_drm_bl_wait_for_completion(struct drm_crtc *crtc, unsigned int level);
 
 #endif /* _MI_DRM_CRTC_H_ */
+

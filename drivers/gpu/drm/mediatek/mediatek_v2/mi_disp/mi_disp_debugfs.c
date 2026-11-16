@@ -58,13 +58,7 @@ static int mi_disp_debugfs_debug_log_init(void)
 	debugfs_create_bool(DEBUG_LOG_DEBUGFS_NAME,
 		S_IRUGO | S_IWUSR, disp_core->debugfs_dir,
 		&disp_debugfs.enable_debug_log);
-	if (!disp_debugfs.debug_log) {
-		DISP_ERROR("create debugfs entry failed for %s\n", DEBUG_LOG_DEBUGFS_NAME);
-		ret = -ENODEV;
-	} else {
-		DISP_INFO("create debugfs %s success!\n", DEBUG_LOG_DEBUGFS_NAME);
-		ret = 0;
-	}
+	DISP_INFO("create debugfs %s success!\n", DEBUG_LOG_DEBUGFS_NAME);
 
 	return ret;
 }
@@ -217,3 +211,5 @@ int mi_disp_debugfs_deinit(void *d_display, int disp_id)
 
 	return ret;
 }
+
+

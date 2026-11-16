@@ -17,7 +17,6 @@
 #include "mi_dsi_display.h"
 
 static struct disp_lhbm_fod *g_lhbm_fod[MI_DISP_MAX];
-
 static int mi_disp_lhbm_fod_thread_fn(void *arg);
 
 struct mtk_dsi * mi_get_primary_dsi_display(void)
@@ -102,12 +101,12 @@ int mi_disp_lhbm_fod_thread_create(struct disp_feature *df, int disp_id)
 		return -EINVAL;
 	}
 
-	if(panel_ext && panel_ext->funcs &&
+	if(panel_ext && panel_ext->funcs && 
 		panel_ext->funcs->panel_fod_lhbm_init) {
 		if(panel_ext->funcs->panel_fod_lhbm_init(dsi))
 			pr_err("panel_fod_lhbm_init failed\n");
 	}
-
+  
 	if (!mi_disp_lhbm_fod_enabled(dsi)) {
 		DISP_INFO("%s panel is not local hbm\n", get_disp_id_name(disp_id));
 		return 0;
@@ -129,7 +128,6 @@ int mi_disp_lhbm_fod_thread_create(struct disp_feature *df, int disp_id)
 
 	atomic_set(&lhbm_fod->allow_tx_lhbm, 1);
 	atomic_set(&lhbm_fod->target_brightness, LHBM_TARGET_BRIGHTNESS_OFF_FINGER_UP);
-
 
 	init_waitqueue_head(&lhbm_fod->fod_pending_wq);
 
@@ -216,7 +214,7 @@ int mi_disp_lhbm_fod_allow_tx_lhbm(struct mtk_dsi *dsi,
 			wake_up_interruptible(&lhbm_fod->fod_pending_wq);
 			DISP_INFO("primary display wake up local disp_fod kthread\n");
 		} else {
-			//atomic_set(&lhbm_fod->target_brightness, LHBM_TARGET_BRIGHTNESS_OFF_FINGER_UP);
+			atomic_set(&lhbm_fod->target_brightness, LHBM_TARGET_BRIGHTNESS_OFF_FINGER_UP);
 		}
 	}
 	return 0;
@@ -292,9 +290,8 @@ static int mi_disp_lhbm_fod_event_notify(struct disp_lhbm_fod *lhbm_fod, int fod
 		fod_ui_ready = LOCAL_HBM_UI_NONE;
 	}
 
-#if !IS_ENABLED(CONFIG_DRM_PANEL_M9_42_02_0A_DSC_CMD)
 	if (atomic_read(&lhbm_fod->allow_tx_lhbm)) {
-		mi_disp_feature_event_notify_by_type(mi_get_disp_id("primary"), MI_DISP_EVENT_FOD,
+		mi_disp_feature_event_notify_by_type(mi_get_disp_id("primary"), MI_DISP_EVENT_FOD, 
 			sizeof(fod_ui_ready), fod_ui_ready);
 		DISP_INFO("%s display fod_ui_ready notify=%d\n",
 			dsi->display_type, fod_ui_ready);
@@ -302,19 +299,12 @@ static int mi_disp_lhbm_fod_event_notify(struct disp_lhbm_fod *lhbm_fod, int fod
 		DISP_INFO("lhbm_fod->allow_tx_lhbm read false, dsi disabled");
 		return -1;
 	}
-#else
-		mi_disp_feature_event_notify_by_type(mi_get_disp_id("primary"), MI_DISP_EVENT_FOD,
-			sizeof(fod_ui_ready), fod_ui_ready);
-		DISP_INFO("%s display fod_ui_ready notify=%d\n",
-			dsi->display_type, fod_ui_ready);
-#endif
+
 	DISP_INFO("%s display fod_ui_ready notify=%d\n",
 		dsi->display_type, fod_ui_ready);
 
 	return 0;
 }
-
-
 
 static int mi_disp_lhbm_fod_set_disp_param(struct disp_lhbm_fod *lhbm_fod, u32 lhbm_value)
 {
@@ -384,12 +374,11 @@ static int mi_disp_lhbm_fod_set_disp_param(struct disp_lhbm_fod *lhbm_fod, u32 l
 	atomic_set(&lhbm_fod->target_brightness, lhbm_value);
 	//mutex_unlock(&panel->panel_lock);
 
+	//SDE_ATRACE_BEGIN("local_hbm_fod");
 	rc = mi_dsi_display_set_disp_param(lhbm_fod->dsi, &ctl);
-
+	//SDE_ATRACE_BEGIN("local_hbm_fod");
 
 	return rc;
-
-
 }
 
 void mi_disp_lhbm_animal_status_update(struct mtk_dsi *dsi,
@@ -488,6 +477,10 @@ int mi_disp_set_local_hbm(int disp_id, int lhbm_value)
 	unsigned long flags;
 	int rc = 0;
 
+#ifdef CONFIG_FACTORY_BUILD
+	return 0;
+#endif
+
 	if (!is_local_hbm(disp_id)) {
 		DISP_DEBUG("%s panel is not local hbm\n", get_disp_id_name(disp_id));
 		return 0;
@@ -522,71 +515,3 @@ exit:
 	return rc;
 }
 
-int mi_disp_set_fod_queue_work(u32 fod_status, bool from_touch)
-{
-	/* FodEngine will control lhbm via mi_disp_ioctl_set_local_hbm.
-	 * This function will not work.
-	 */
-	DISP_INFO("FodEngine change to mi_disp_ioctl_set_local_hbm\n");
-	return 0;
-
-#if 0
-	struct disp_lhbm_fod *lhbm_fod = mi_get_disp_lhbm_fod(MI_DISP_PRIMARY);
-	struct mtk_dsi *dsi = mi_get_primary_dsi_display();
-	struct lhbm_fod_event *fod_event = NULL, *entry = NULL;
-	unsigned long flags;
-	int rc = 0;
-
-	if (from_touch) {
-		if (fod_status == atomic_read(&mi_disp_fod_status)) {
-			DISP_INFO("%s Don't report after the first time anymore \n", __func__);
-			return 0;
-		}
-		atomic_set(&mi_disp_fod_status, fod_status);
-	}
-
-	if (!dsi) {
-		DISP_ERROR("invalid dsi ptr\n");
-		return -EINVAL;
-	}
-
-	if (!mi_disp_lhbm_fod_enabled(dsi)) {
-		DISP_DEBUG("%s panel is not local hbm\n", dsi->display_type);
-		return 0;
-	}
-
-	if (!lhbm_fod || lhbm_fod->dsi != dsi) {
-		DISP_ERROR("invalid lhbm_fod ptr\n");
-		return -EINVAL;
-	}
-
-	DISP_INFO("start: from_touch(%d), fod_status(%d)\n", from_touch, fod_status);
-
-	spin_lock_irqsave(&lhbm_fod->spinlock, flags);
-	fod_event = kzalloc(sizeof(struct lhbm_fod_event), GFP_ATOMIC);
-	if (!fod_event) {
-		DISP_ERROR("failed to allocate memory for fod_event\n");
-		rc = ENOMEM;
-		goto exit;
-	}
-
-	fod_event->from_touch = from_touch;
-	fod_event->fod_status = fod_status;
-	INIT_LIST_HEAD(&fod_event->link);
-	list_add_tail(&fod_event->link, &lhbm_fod->event_list);
-
-	list_for_each_entry(entry, &lhbm_fod->event_list, link) {
-		DISP_DEBUG("in list, from_touch(%d), fod_status(%d)\n",
-			entry->from_touch, entry->fod_status);
-	}
-
-	DISP_UTC_INFO("from_touch(%d), fod_status(%d)\n", from_touch, fod_status);
-	wake_up_interruptible(&lhbm_fod->fod_pending_wq);
-
-exit:
-	spin_unlock_irqrestore(&lhbm_fod->spinlock, flags);
-	return rc;
-#endif
-}
-
-EXPORT_SYMBOL_GPL(mi_disp_set_fod_queue_work);

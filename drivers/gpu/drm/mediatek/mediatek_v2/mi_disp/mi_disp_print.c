@@ -65,6 +65,7 @@ void mi_disp_printk_utc(const char *level, const char *format, ...)
 
 	va_end(args);
 }
+EXPORT_SYMBOL(mi_disp_printk_utc);
 
 void mi_disp_dbg_utc(const char *format, ...)
 {

@@ -69,5 +69,5 @@ int mi_disp_lhbm_fod_update_layer_state(struct mtk_dsi *dsi,
 void mi_disp_lhbm_animal_status_update(struct mtk_dsi *dsi,
 		bool is_layer_exit);
 int mi_disp_set_local_hbm(int disp_id, int lhbm_value);
-int mi_disp_set_fod_queue_work(u32 fod_status, bool from_touch);
 #endif /* _MI_DISP_LHBM_H_ */
+

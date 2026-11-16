@@ -57,12 +57,7 @@ int mi_drm_bl_wait_for_completion(struct drm_crtc *crtc, unsigned int level)
 		mtk_drm_trace_begin("mi_drm_bl_wait_for_completion-%d", level);
 
 		reinit_completion(&dsi->bl_wait_completion);
-
-#if IS_ENABLED(CONFIG_DRM_PANEL_M11R_38_0A_0A_DSC_CMD) || IS_ENABLED(CONFIG_DRM_PANEL_M9_42_02_0A_DSC_CMD)
 		ret = wait_for_completion_timeout(&dsi->bl_wait_completion, msecs_to_jiffies(800));
-#else
-		ret = wait_for_completion_timeout(&dsi->bl_wait_completion, msecs_to_jiffies(300));
-#endif
 		DISP_INFO("bl_wait_for_completion_timeout return %d\n", ret);
 
 		mtk_drm_trace_end();
@@ -175,3 +170,4 @@ int mi_drm_crtc_update_layer_state(struct drm_crtc *crtc)
 
 	return ret;
 }
+

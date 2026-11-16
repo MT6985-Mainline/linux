@@ -42,3 +42,4 @@ int mi_disp_register_client(struct notifier_block *nb);
 int mi_disp_unregister_client(struct notifier_block *nb);
 int mi_disp_notifier_call_chain(unsigned long val, void *v);
 #endif /*_DRM_NOTIFIER_MI_H*/
+
