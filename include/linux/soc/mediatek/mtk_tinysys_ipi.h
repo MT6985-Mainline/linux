@@ -75,6 +75,7 @@ struct mtk_ipi_chan_table {
  * @mrpdev: mtk rpmsg channel device
  * @mbdev: mtk mbox device
  * @table: channel table with endpoint & channel_info & mbox_pin info
+ * @channel_count: number of allocated channel-table entries
  * @mutex_ipi_reg: the lock must be taken when user register ipi
  * @pre_cb: the callback handler before ipi send data
  * @post_cb: the callback handler after ipi send data
@@ -94,6 +95,7 @@ struct mtk_ipi_device  {
 	struct mtk_rpmsg_device *mrpdev;
 	struct mtk_mbox_device *mbdev;
 	struct mtk_ipi_chan_table *table;
+	unsigned int channel_count;
 	struct mutex mutex_ipi_reg;
 	ipi_tx_cb_t pre_cb;
 	ipi_tx_cb_t post_cb;
@@ -122,6 +124,8 @@ int mtk_ipi_device_register(struct mtk_ipi_device *ipidev,
 		struct platform_device *pdev, struct mtk_mbox_device *mbox,
 		unsigned int ipi_chan_count);
 int mtk_ipi_device_reset(struct mtk_ipi_device *ipidev);
+/* The caller must quiesce mailbox IRQs and users before unregistering. */
+void mtk_ipi_device_unregister(struct mtk_ipi_device *ipidev);
 
 int mtk_ipi_register(struct mtk_ipi_device *ipidev, int ipi_id,
 		mbox_pin_cb_t cb, void *prdata, void *msg);

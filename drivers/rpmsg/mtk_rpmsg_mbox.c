@@ -240,7 +240,7 @@ mtk_rpmsg_create_device(struct platform_device *pdev,
 
 	ret = rpmsg_register_device(rpdev);
 	if (ret) {
-		kfree(mdev);
+		/* rpmsg core put_device() already invokes our release callback. */
 		return NULL;
 	}
 

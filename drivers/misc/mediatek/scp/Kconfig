@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_TINYSYS_SCP_SUPPORT
+	bool "MediaTek bootloader-loaded RV SCP interface"
+	depends on ARM64 && OF && OF_RESERVED_MEM && COMMON_CLK
+	depends on MTK_MBOX = y && MTK_IPI = y
+	select MFD_SYSCON
+	help
+	  Provide the reserved-memory and mailbox/IPI interface used by
+	  MediaTek RV SCP firmware loaded by the platform bootloader.
+	  This supports the vendor mediatek,scp binding used on MT6985,
+	  including AOD shared memory and the actual SCP awake protocol.
+	  The upstream MTK_SCP remoteproc driver uses a different binding.
