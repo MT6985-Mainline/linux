@@ -30,6 +30,7 @@ int mtk_smi_driver_register_notifier(struct notifier_block *nb);
 int mtk_smi_driver_unregister_notifier(struct notifier_block *nb);
 int mtk_smi_larb_get(struct device *larbdev);
 void mtk_smi_larb_put(struct device *larbdev);
+void mtk_smi_common_ostdl_set(struct device *dev, const u32 port, bool is_write, const u32 val);
 void mtk_smi_common_bw_set(struct device *dev, const u32 port, const u32 val);
 void mtk_smi_larb_bw_set(struct device *dev, const u32 port, const u32 val);
 void mtk_smi_add_device_link(struct device *dev, struct device *larbdev);

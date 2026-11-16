@@ -22,12 +22,13 @@ enum {
 	BW_THROTTLE_END
 };
 
-enum hrt_scen{
+enum hrt_scen {
 	CAM_SCEN_CHANGE,
 	MD_SPEECH,
 };
 
 #if IS_ENABLED(CONFIG_INTERCONNECT_MTK_MMQOS_COMMON)
+bool mtk_mmqos_is_ready(void);
 void mtk_mmqos_wait_throttle_done(void);
 s32 mtk_mmqos_set_hrt_bw(enum hrt_type type, u32 bw);
 s32 mtk_mmqos_get_hrt_ratio(enum hrt_type type);
@@ -36,7 +37,11 @@ s32 mtk_mmqos_register_bw_throttle_notifier(struct notifier_block *nb);
 s32 mtk_mmqos_unregister_bw_throttle_notifier(struct notifier_block *nb);
 s32 mtk_mmqos_hrt_scen(enum hrt_scen, bool is_start);
 s32 mtk_mmqos_system_qos_update(unsigned short qos_status);
+void mtk_mmqos_is_dualpipe_enable(bool is_enable);
+void mtk_mmqos_set_md_type(u32 md_type);
+s32 mtk_mmqos_get_cam_hrt(void);
 #else
+static inline bool mtk_mmqos_is_ready(void) { return false; }
 static inline void
 mtk_mmqos_wait_throttle_done(void) { return; }
 
@@ -61,6 +66,15 @@ mtk_mmqos_hrt_scen(enum hrt_scen, bool is_start) { return 0; }
 
 static inline s32
 mtk_mmqos_system_qos_update(unsigned short qos_status) { return 0; }
+
+static inline void
+mtk_mmqos_is_dualpipe_enable(bool is_enable) { return; }
+
+static inline void
+mtk_mmqos_set_md_type(u32 md_type) { return; }
+
+static inline s32
+mtk_mmqos_get_cam_hrt(void) { return 0; }
 #endif
 
 #endif /* MTK_MMQOS_H */

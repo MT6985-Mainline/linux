@@ -130,6 +130,9 @@ struct mtk_smi_common_plat {
 	u32              bus_sel; /* Balance some larbs to enter mmu0 or mmu1 */
 	bool		has_bwl;
 	u16		*bwl;
+	u32		*bwl32;
+	unsigned int num_common;
+	bool has_p2_ostdl;
 	struct mtk_smi_reg_pair *misc;
 };
 
@@ -138,7 +141,7 @@ struct mtk_smi_larb_gen {
 	int port_in_larb_gen2[MTK_LARB_NR_MAX + 1];
 	void (*config_port)(struct device *);
 	void (*sleep_ctrl)(struct device *dev, bool toslp);
-	unsigned int			larb_direct_to_common_mask;
+	u64				larb_direct_to_common_mask;
 	bool				has_gals;
 	bool		has_bwl;
 	bool		has_grouping;
@@ -312,26 +315,65 @@ void mtk_smi_larb_clamp(u32 larb_id, bool on)
 }
 EXPORT_SYMBOL_GPL(mtk_smi_larb_clamp);
 
+static u32 mtk_smi_common_bwl_read(struct mtk_smi *common, unsigned int port)
+{
+    unsigned int index = common->plat->gen == MTK_SMI_GEN3 ?
+                         common->commid * SMI_COMMON_LARB_NR_MAX + port : port;
+
+    return common->plat->bwl32 ? common->plat->bwl32[index] : common->plat->bwl[index];
+}
+
+static void mtk_smi_common_bwl_write(struct mtk_smi *common, unsigned int port, u32 value)
+{
+    unsigned int index = common->plat->gen == MTK_SMI_GEN3 ?
+                         common->commid * SMI_COMMON_LARB_NR_MAX + port : port;
+
+    if (common->plat->bwl32)
+        common->plat->bwl32[index] = value;
+    else
+        common->plat->bwl[index] = value;
+}
+
 void mtk_smi_common_bw_set(struct device *dev, const u32 port, const u32 val)
 {
-	struct mtk_smi_larb *larb = dev_get_drvdata(dev);
-	struct mtk_smi *common = dev_get_drvdata(larb->smi_common);
+    struct mtk_smi_larb *larb = dev_get_drvdata(dev);
+    struct mtk_smi *common = dev_get_drvdata(larb->smi_common);
+    u32 value;
 
-	if (port >= SMI_COMMON_LARB_NR_MAX) { /* max: 8 input larbs. */
-		dev_err(dev, "%s port invalid:%d, val:%u.\n", __func__,
-			port, val);
-		return;
-	}
-
-	if (common->plat->gen == MTK_SMI_GEN3)
-		common->plat->bwl[common->commid * SMI_COMMON_LARB_NR_MAX + port] = val;
-	else if (common->plat->gen == MTK_SMI_GEN2)
-		common->plat->bwl[port] = val;
-	if (atomic_read(&common->ref_count)) {
-		writel(val, common->base + SMI_L1ARB(port));
-	}
+    if (port >= SMI_COMMON_LARB_NR_MAX || !common->plat->has_bwl)
+        return;
+    value = (mtk_smi_common_bwl_read(common, port) & ~0x3fffU) | (val & 0x3fffU);
+    mtk_smi_common_bwl_write(common, port, value);
+    if (atomic_read(&common->ref_count))
+        writel(value, common->base + SMI_L1ARB(port));
 }
 EXPORT_SYMBOL_GPL(mtk_smi_common_bw_set);
+
+void mtk_smi_common_ostdl_set(struct device *dev, const u32 port, bool is_write,
+                            const u32 val)
+{
+    struct mtk_smi_larb *larb = dev_get_drvdata(dev);
+    struct mtk_smi *common = dev_get_drvdata(larb->smi_common);
+    unsigned int shift = is_write ? 24 : 16;
+    unsigned int other_shift = is_write ? 16 : 24;
+    u32 value;
+
+    if (port >= SMI_COMMON_LARB_NR_MAX || !common->plat->has_p2_ostdl)
+        return;
+    value = mtk_smi_common_bwl_read(common, port);
+    if (val) {
+        if ((value >> other_shift) & 0x7f)
+            value |= BIT(14);
+        value |= (val & 0x7f) << shift;
+    } else {
+        value &= ~BIT(14);
+        value &= ~(0x7fU << shift);
+    }
+    mtk_smi_common_bwl_write(common, port, value);
+    if (atomic_read(&common->ref_count))
+        writel(value, common->base + SMI_L1ARB(port));
+}
+EXPORT_SYMBOL_GPL(mtk_smi_common_ostdl_set);
 
 void mtk_smi_larb_bw_set(struct device *dev, const u32 port, const u32 val)
 {
@@ -1550,13 +1592,14 @@ static const struct mtk_smi_larb_gen mtk_smi_larb_mt6985 = {
 				 10, 10, 0, 14, 14, 8, 22, 10, 16, 16, 9,
 				 9, 8, 8, 31, 31,},
 	.config_port                = mtk_smi_larb_config_port_gen2_general,
-	.larb_direct_to_common_mask = BIT(24),
+	.larb_direct_to_common_mask = BIT_ULL(24) | BIT_ULL(36),
+				      /*skip larb: 24, 36*/
 	.has_gals                   = true,
 	.has_bwl                    = true,
 	.has_grouping               = true,
 	.has_bw_thrt                = true,
 	.bwl                        = (u8 *)mtk_smi_larb_mt6985_bwl,
-	.misc                       = (struct mtk_smi_reg_pair *)mtk_smi_larb_mt6985_misc,
+	.misc = (struct mtk_smi_reg_pair *)mtk_smi_larb_mt6985_misc,
 	.cmd_group                  = (u8 *)mtk_smi_larb_mt6985_cmd_group,
 	.bw_thrt_en                 = (u8 *)mtk_smi_larb_mt6985_bw_thrt_en,
 };
@@ -2240,7 +2283,7 @@ mtk_smi_common_mt6895_misc[MTK_COMMON_NR_MAX][SMI_COMMON_MISC_NR] = {
 	{SMI_DUMMY, 0x1},},/* SMI_IMG_SUB_COMMON1 */
 };
 
-static u16 mtk_smi_common_mt6985_bwl[MTK_SMI_MT6985_COMMON_NR_MAX][SMI_COMMON_LARB_NR_MAX] = {
+static u32 mtk_smi_common_mt6985_bwl[MTK_SMI_MT6985_COMMON_NR_MAX][SMI_COMMON_LARB_NR_MAX] = {
 	{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
 	{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
 	{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
@@ -2324,13 +2367,14 @@ mtk_smi_common_mt6985_misc[MTK_SMI_MT6985_COMMON_NR_MAX][SMI_COMMON_MISC_NR] = {
 
 
 static const struct mtk_smi_common_plat mtk_smi_common_mt6985 = {
-	.gen      = MTK_SMI_GEN3,
-	.has_gals = true,
-	.has_bwl  = true,
-	.bwl      = (u16 *)mtk_smi_common_mt6985_bwl,
-	.misc     = (struct mtk_smi_reg_pair *)mtk_smi_common_mt6985_misc,
+    .gen = MTK_SMI_GEN3,
+    .has_gals = true,
+    .has_bwl = true,
+    .bwl32 = (u32 *)mtk_smi_common_mt6985_bwl,
+    .num_common = MTK_SMI_MT6985_COMMON_NR_MAX,
+    .has_p2_ostdl = true,
+    .misc = (struct mtk_smi_reg_pair *)mtk_smi_common_mt6985_misc,
 };
-
 static const struct mtk_smi_common_plat mtk_smi_common_gen1 = {
 	.gen = MTK_SMI_GEN1,
 };
@@ -2618,6 +2662,9 @@ static int __maybe_unused mtk_smi_common_resume(struct device *dev)
 	u32 bus_sel = common->plat->bus_sel;
 	int i, ret;
 
+    if (common->plat->num_common &&
+        (common->commid < 0 || common->commid >= common->plat->num_common))
+        return -EINVAL;
 	ret = mtk_smi_clk_enable(common);
 	if (ret) {
 		dev_err(common->dev, "Failed to enable clock(%d).\n", ret);
@@ -2635,7 +2682,7 @@ static int __maybe_unused mtk_smi_common_resume(struct device *dev)
 	if (common->plat->gen == MTK_SMI_GEN3) {
 		for (i = 0; i < SMI_COMMON_LARB_NR_MAX; i++)
 			writel_relaxed(
-				common->plat->bwl[common->commid * SMI_COMMON_LARB_NR_MAX + i],
+				mtk_smi_common_bwl_read(common, i),
 				common->base + SMI_L1ARB(i));
 		for (i = 0; i < SMI_COMMON_MISC_NR; i++)
 			writel_relaxed(common->plat->misc[
@@ -2645,7 +2692,7 @@ static int __maybe_unused mtk_smi_common_resume(struct device *dev)
 
 	} else {
 		for (i = 0; i < SMI_COMMON_LARB_NR_MAX; i++)
-			writel_relaxed(common->plat->bwl[i],
+			writel_relaxed(mtk_smi_common_bwl_read(common, i),
 				common->base + SMI_L1ARB(i));
 		for (i = 0; i < SMI_COMMON_MISC_NR; i++)
 			writel_relaxed(common->plat->misc[i].value,
