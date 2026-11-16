@@ -23,3 +23,24 @@ config MTK_MML_LEGACY
 	  The module will be called mml in mediatek-drm
 	  This driver provides kernel mode setting and
 	  buffer management to display driver.
+
+
+config MTK_MML_MT6985
+	tristate "MediaTek MT6985 MML topology"
+	depends on MTK_MML
+	default MTK_MML if COMMON_CLK_MT6985
+	help
+	  Build the complete MT6985 MML path, client and mode-selection tables.
+	  This is required by the corot display pipeline.
+
+config MTK_MML_MT6886
+	tristate "MediaTek MT6886 MML topology"
+	depends on MTK_MML
+	help
+	  Build the MT6886-specific MML path tables.
+
+config MTK_MML_MT6983
+	tristate "MediaTek MT6983 MML topology"
+	depends on MTK_MML
+	help
+	  Build the legacy MT6983-specific MML path tables.

@@ -87,7 +87,7 @@ static s32 fg_tile_prepare(struct mml_comp *comp, struct mml_task *task,
 		func->full_size_x_in = in_crop_w + dest->crop.r.left;
 		func->full_size_y_in = in_crop_h + dest->crop.r.top;
 	} else {
-		func->full_size_x_in = src->width;
+ 		func->full_size_x_in = src->width;
 		func->full_size_y_in = src->height;
 	}
 	func->full_size_x_out = func->full_size_x_in;

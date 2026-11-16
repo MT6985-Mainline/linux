@@ -121,6 +121,15 @@ u16 mml_ir_get_disp_ready_event(struct mml_dev *mml);
 u16 mml_ir_get_mml_stop_event(struct mml_dev *mml);
 
 /*
+ * mml_ir_get_target_event - get target line event
+ *
+ * @mml:	The mml driver instance
+ *
+ * Return:	The event id of target line
+ */
+u16 mml_ir_get_target_event(struct mml_dev *mml);
+
+/*
  * mml_dump_thread - dump cmdq threads hold by mml
  *
  * @mml:	The mml driver instance
@@ -176,8 +185,7 @@ void mml_dev_put_drm_ctx(struct mml_dev *mml,
 	void (*ctx_release)(struct mml_drm_ctx *ctx));
 struct mml_dle_ctx *mml_dev_get_dle_ctx(struct mml_dev *mml,
 	struct mml_dle_param *dl,
-	struct mml_dle_ctx *(*ctx_create)(struct mml_dev *mml,
-	struct mml_dle_param *dl));
+	void (*ctx_setup)(struct mml_dle_ctx *ctx, struct mml_dle_param *dl));
 void mml_dev_put_dle_ctx(struct mml_dev *mml,
 	void (*ctx_release)(struct mml_dle_ctx *ctx));
 
@@ -201,6 +209,29 @@ struct mml_topology_cache *mml_topology_get_cache(struct mml_dev *mml);
  */
 struct mml_comp *mml_dev_get_comp_by_id(struct mml_dev *mml, u32 id);
 
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+/*
+ * mml for swpm
+ */
+void mml_init_swpm_comp(u32 idx, struct mml_comp *comp);
+void mml_update_comp_status(u32 idx, u32 status);
+void mml_update_freq_status(u32 freq);
+struct mml_swpm_func *mml_get_swpm_func(void);
+
+struct mml_swpm_func {
+	bool set_func; /* Function set by swpm or not */
+	void (*update_wrot)(u32 wrot0_sts, u32 wrot1_sts, u32 wrot2_sts, u32 wrot3_sts);
+	void (*update_cg)(u32 cg_con0, u32 cg_con1);
+	void (*update_freq)(u32 freq);
+};
+
+enum mml_mon_mods {
+	mml_mon_mmlsys = 0,
+	mml_mon_wrot = 1, /* wrot 0~3 occupy index 1~4 */
+	mml_mon_total = 5
+};
+#endif
+
 extern struct platform_driver mml_sys_driver;
 extern struct platform_driver mml_aal_driver;
 extern struct platform_driver mml_color_driver;
@@ -209,6 +240,8 @@ extern struct platform_driver mml_hdr_driver;
 extern struct platform_driver mml_mutex_driver;
 extern struct platform_driver mml_rdma_driver;
 extern struct platform_driver mml_rsz_driver;
+extern struct platform_driver mml_pq_rdma_driver;
+extern struct platform_driver mml_pq_birsz_driver;
 extern struct platform_driver mml_tcc_driver;
 extern struct platform_driver mml_tdshp_driver;
 extern struct platform_driver mml_wrot_driver;

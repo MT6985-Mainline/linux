@@ -1,3 +1,4 @@
+#include <linux/iosys-map.h>
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2019 MediaTek Inc.
@@ -6,11 +7,15 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
+#include <linux/dma-heap.h>
+#include <linux/dma-buf.h>
 #include <linux/fs.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/sched/clock.h>
 #include <linux/sync_file.h>
+#include <uapi/linux/dma-heap.h>
 
 #include "mtk-mml-drm-adaptor.h"
 #include "mtk-mml-color.h"
@@ -26,11 +31,16 @@
  *	3. write struct mml_test_case with [in] members
  *
  */
+
+/* test case struct use by ut bin in dpframework */
 struct mml_test_case {
 	/* [out] config next ut */
 	uint32_t cfg_src_format;
 	uint32_t cfg_src_w;
 	uint32_t cfg_src_h;
+	uint32_t cfg_src1_format;
+	uint32_t cfg_src1_w;
+	uint32_t cfg_src1_h;
 	uint32_t cfg_dest_format;
 	uint32_t cfg_dest_w;
 	uint32_t cfg_dest_h;
@@ -41,16 +51,60 @@ struct mml_test_case {
 	/* [in] */
 	int32_t fd_in;
 	uint32_t size_in;
+	int32_t fd_in1;
+	uint32_t size_in1;
 	int32_t fd_out;
 	uint32_t size_out;
 	int32_t fd_out1;
 	uint32_t size_out1;
+
+	uint32_t dump_dest;
 };
 
-static struct mml_test_case the_case;
+/* kernel level test case struct */
+struct mml_ut {
+	/* [out] config next ut */
+	uint32_t cfg_src_format;
+	uint32_t cfg_src_w;
+	uint32_t cfg_src_h;
+	uint32_t cfg_src1_format;
+	uint32_t cfg_src1_w;
+	uint32_t cfg_src1_h;
+	uint32_t cfg_dest_format;
+	uint32_t cfg_dest_w;
+	uint32_t cfg_dest_h;
+	uint32_t cfg_dest1_format;
+	uint32_t cfg_dest1_w;
+	uint32_t cfg_dest1_h;
 
-int mml_case;
-module_param(mml_case, int, 0644);
+	union {
+		struct {
+			/* [in] */
+			int32_t fd_in;
+			uint32_t size_in;
+			int32_t fd_in1;
+			uint32_t size_in1;
+			int32_t fd_out;
+			uint32_t size_out;
+			int32_t fd_out1;
+			uint32_t size_out1;
+		};
+		struct {
+			/* [in] */
+			void *buf_src[2];
+			uint32_t dma_size_in[2];
+			void *buf_dest[2];
+			uint32_t dma_size_out[2];
+			bool use_dma;
+		};
+	};
+};
+
+static struct mml_ut the_case;
+atomic_t mml_test_protect = ATOMIC_INIT(0);
+
+unsigned int mml_case;
+module_param(mml_case, uint, 0644);
 
 /* how many submit for each ut */
 int mml_test_round = 1;
@@ -59,7 +113,6 @@ module_param(mml_test_round, int, 0644);
 /* interval for each test run, in ms */
 int mml_test_interval = 16;
 module_param(mml_test_interval, int, 0644);
-
 
 int mml_test_w = 1920;
 module_param(mml_test_w, int, 0644);
@@ -85,6 +138,18 @@ module_param(mml_test_crop_width, int, 0644);
 int mml_test_crop_height = 1088;
 module_param(mml_test_crop_height, int, 0644);
 
+int mml_test_comp_left;
+module_param(mml_test_comp_left, int, 0644);
+
+int mml_test_comp_top;
+module_param(mml_test_comp_top, int, 0644);
+
+int mml_test_comp_width = 1920;
+module_param(mml_test_comp_width, int, 0644);
+
+int mml_test_comp_height = 1088;
+module_param(mml_test_comp_height, int, 0644);
+
 int mml_test_rot;
 module_param(mml_test_rot, int, 0644);
 
@@ -100,6 +165,9 @@ module_param(mml_test_in_fmt, int, 0644);
 int mml_test_out_fmt = MML_FMT_RGB888;
 module_param(mml_test_out_fmt, int, 0644);
 
+int mml_test_dump_dest = 1;
+module_param(mml_test_dump_dest, int, 0644);
+
 struct mml_test {
 	struct platform_device *pdev;
 	struct device *dev;
@@ -109,23 +177,34 @@ struct mml_test {
 	struct dentry *fs_inst;
 	struct dentry *fs_frame_in;
 	struct dentry *fs_frame_out;
+	struct dentry *fs_dump;
+	struct dentry *fs_dump_dest;
 };
 
 struct test_case_op {
 	void (*config)(void);
-	void (*run)(struct mml_test *test, struct mml_test_case *cur);
+	void (*run)(struct mml_test *test, struct mml_ut *cur);
 };
 
 static void check_fence(int32_t fd, const char *func)
 {
+#ifndef MML_FPGA
 	struct dma_fence *fence = sync_file_get_fence(fd);
-	long fret = dma_fence_wait(fence, true);
+	long fret;
+
+	if (unlikely(!fence)) {
+		mml_err("sync_file_get_fence return null");
+		return;
+	}
+
+	fret = dma_fence_wait(fence, true);
 
 	mml_log("[test]%s success fence %d %p ret %ld",
 		func, fd, fence, fret);
 
 	dma_fence_put(fence);
 	put_unused_fd(fd);
+#endif
 }
 
 #define mml_afbc_align(p) (((p + 31) >> 5) << 5)
@@ -146,29 +225,89 @@ static void fillin_info_data(u32 format, u32 width, u32 height,
 	data->secure = false;
 }
 
-static void fillin_buf(struct mml_frame_data *data, s32 fd_out, u32 fd_size,
+static void fillin_buf(struct mml_frame_data *data, s32 fd, u32 fd_size,
 	struct mml_buffer *buf)
 {
 	buf->cnt = MML_FMT_PLANE(data->format);
-	buf->fd[0] = fd_out;
+	buf->fd[0] = fd;
 	buf->size[0] = fd_size;
 	if (buf->cnt >= 2) {
 		buf->size[0] = mml_color_get_min_y_size(
 			data->format, data->width, data->height);
-		buf->fd[1] = fd_out;
+		buf->fd[1] = fd;
 		buf->size[1] = mml_color_get_min_uv_size(
 			data->format, data->width, data->height);
 	}
 	if (buf->cnt >= 3) {
-		buf->fd[2] = fd_out;
+		buf->fd[2] = fd;
 		buf->size[2] = mml_color_get_min_uv_size(
 			data->format, data->width, data->height);
 	}
 }
 
+static void fillin_buf_dma(struct mml_frame_data *data, void *dmabuf, u32 size,
+	struct mml_buffer *buf)
+{
+	buf->cnt = MML_FMT_PLANE(data->format);
+	buf->dmabuf[0] = dmabuf;
+	buf->size[0] = size;
+	if (buf->cnt >= 2) {
+		buf->size[0] = mml_color_get_min_y_size(
+			data->format, data->width, data->height);
+		buf->dmabuf[1] = dmabuf;
+		buf->size[1] = mml_color_get_min_uv_size(
+			data->format, data->width, data->height);
+	}
+	if (buf->cnt >= 3) {
+		buf->dmabuf[2] = dmabuf;
+		buf->size[2] = mml_color_get_min_uv_size(
+			data->format, data->width, data->height);
+	}
+	buf->use_dma = true;
+}
+
+static bool mml_test_check_data_valid(struct mml_frame_data *data)
+{
+	if (!(data->width >= 64 && data->width <= 8192)) {
+		mml_err("%s width not valid %u", __func__, data->width);
+		return false;
+	}
+
+	if (!(data->height >= 64 && data->height <= 8192)) {
+		mml_err("%s height not valid %u", __func__, data->height);
+		return false;
+	}
+
+	return true;
+}
+
+static bool mml_test_check_info_valid(struct mml_frame_info *info)
+{
+	u32 i;
+
+	if (!mml_test_check_data_valid(&info->src)) {
+		mml_err("%s src not valid", __func__);
+		return false;
+	}
+
+	if (!info->dest_cnt || info->dest_cnt > MML_MAX_OUTPUTS) {
+		mml_err("%s dest cnt not valid %u", __func__, info->dest_cnt);
+		return false;
+	}
+
+	for (i = 0; i < info->dest_cnt; i++) {
+		if (!mml_test_check_data_valid(&info->dest[i].data)) {
+			mml_err("%s dest %u not valid", __func__, i);
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static void case_general_submit(struct mml_test *test,
-	struct mml_test_case *cur,
-	void (*setup)(struct mml_submit *task, struct mml_test_case *cur))
+	struct mml_ut *cur,
+	void (*setup)(struct mml_submit *task, struct mml_ut *cur))
 {
 	struct platform_device *mml_pdev;
 	struct mml_drm_ctx *mml_ctx;
@@ -189,28 +328,34 @@ static void case_general_submit(struct mml_test *test,
 
 	mml_pdev = mml_get_plat_device(test->pdev);
 	if (!mml_pdev) {
-		mml_err("get mml device failed");
+		mml_err("[test]get mml device failed");
 		return;
 	}
 
 	mml_ctx = mml_drm_get_context(mml_pdev, &disp);
-	if (!mml_ctx) {
-		mml_err("get mml context failed");
+	if (IS_ERR_OR_NULL(mml_ctx)) {
+		mml_err("[test]get mml context failed %d", PTR_ERR(mml_ctx));
 		return;
 	}
 
 	/* srouce info and buffer */
-	fillin_info_data(the_case.cfg_src_format,
-		the_case.cfg_src_w, the_case.cfg_src_h,
+	fillin_info_data(cur->cfg_src_format, cur->cfg_src_w, cur->cfg_src_h,
 		&task.info.src);
-	fillin_buf(&task.info.src, cur->fd_in, cur->size_in, &task.buffer.src);
+	if (cur->use_dma)
+		fillin_buf_dma(&task.info.src, cur->buf_src[0],
+			       cur->dma_size_in[0], &task.buffer.src);
+	else
+		fillin_buf(&task.info.src, cur->fd_in, cur->size_in, &task.buffer.src);
 
 	/* destination info and buffer */
-	fillin_info_data(the_case.cfg_dest_format,
-		the_case.cfg_dest_w, the_case.cfg_dest_h,
+	fillin_info_data(cur->cfg_dest_format, cur->cfg_dest_w, cur->cfg_dest_h,
 		&task.info.dest[0].data);
-	fillin_buf(&task.info.dest[0].data, cur->fd_out, cur->size_out,
-		&task.buffer.dest[0]);
+	if (cur->use_dma)
+		fillin_buf_dma(&task.info.dest[0].data, cur->buf_dest[0], cur->dma_size_out[0],
+			&task.buffer.dest[0]);
+	else
+		fillin_buf(&task.info.dest[0].data, cur->fd_out, cur->size_out,
+			&task.buffer.dest[0]);
 
 	task.info.dest_cnt = 1;
 	task.info.mode = MML_MODE_MML_DECOUPLE;
@@ -228,12 +373,23 @@ static void case_general_submit(struct mml_test *test,
 	task.buffer.dest[1].invalid = true;
 	task.buffer.dest[1].fence = -1;
 
-	if (mml_test_pq == 1) {
+	if (mml_test_pq) {
 		pq_param.enable = 1;
 		pq_param.scenario = MML_PQ_MEDIA_VIDEO;
+		pq_param.src_hdr_video_mode = MML_PQ_NORMAL;
+		pq_param.video_param.video_id = 0x546;
 		task.pq_param[0] = &pq_param;
 		task.info.dest[0].pq_config.en = 1;
-		task.info.dest[0].pq_config.en_dre = 1;
+		task.info.dest[0].pq_config.en_dre = (mml_test_pq & MML_PQ_DRE_EN) ? 1 : 0;
+		task.info.dest[0].pq_config.en_hdr = (mml_test_pq & MML_PQ_VIDEO_HDR_EN) ? 1 : 0;
+		task.info.dest[0].pq_config.en_color = (mml_test_pq & MML_PQ_COLOR_EN) ? 1 : 0;
+		task.info.dest[0].pq_config.en_sharp = (mml_test_pq & MML_PQ_SHP_EN) ? 1 : 0;
+		task.info.dest[0].pq_config.en_dc = (mml_test_pq & MML_PQ_DYN_CONTRAST_EN) ? 1 : 0;
+		task.info.dest[0].pq_config.en_region_pq =
+			(mml_test_pq & MML_PQ_AI_SCENE_PQ_EN) ? 1 : 0;
+		if (task.info.dest[0].pq_config.en_hdr)
+			pq_param.src_hdr_video_mode = MML_PQ_HDR10;
+		mml_log("[test] %s open PQ", __func__);
 	}
 
 	if (setup)
@@ -241,13 +397,18 @@ static void case_general_submit(struct mml_test *test,
 	mode = task.info.mode;
 
 	mml_drm_try_frame(mml_ctx, &task.info);
+	if (!mml_test_check_info_valid(&task.info)) {
+		mml_err("[test]%s parameter not valid", __func__);
+		goto err_done;
+	}
+
 	if (mml_drm_query_cap(mml_ctx, &task.info) == MML_MODE_NOT_SUPPORT) {
-		mml_err("%s not support", __func__);
-		return;
+		mml_err("[test]%s not support", __func__);
+		goto err_done;
 	}
 
 	/* for ut do not fall to inline rotate unless force use */
-	if (mode == MML_MODE_RACING || mode == MML_MODE_SRAM_READ)
+	if (mode == MML_MODE_RACING || mode == MML_MODE_SRAM_READ || mode == MML_MODE_APUDC)
 		task.info.mode = mode;
 	else
 		task.info.mode = MML_MODE_MML_DECOUPLE;
@@ -259,13 +420,13 @@ static void case_general_submit(struct mml_test *test,
 	}
 
 	fences = kcalloc(run_cnt, sizeof(*fences), GFP_KERNEL);
+	ktime_get_real_ts64((struct timespec64 *)&task.end);
 	for (i = 0; i < run_cnt; i++) {
-		ktime_get_real_ts64((struct timespec64 *)&task.end);
 		timespec64_add_ns((struct timespec64 *)&task.end,
 			mml_test_interval * 1000000);
 		ret = mml_drm_submit(mml_ctx, &task, NULL);
 		if (ret) {
-			mml_err("%s submit failed: %d round: %u",
+			mml_err("[test]%s submit failed: %d round: %u",
 				__func__, ret, i);
 			fences[i] = -1;
 		} else {
@@ -287,15 +448,17 @@ static void case_general_submit(struct mml_test *test,
 	}
 
 	kfree(fences);
-	for (i = 0; i < 5 && !mml_drm_ctx_idle(mml_ctx); i++) {
-		mml_log("wait for ctx idle...");
-		msleep_interruptible(1000);	/* make sure mml stops */
+	for (i = 0; i < 5000 && !mml_drm_ctx_idle(mml_ctx); i++) {
+		mml_log("[test]wait for ctx idle...");
+		msleep_interruptible(1);	/* make sure mml stops */
 	}
+
+err_done:
 	if (mml_drm_ctx_idle(mml_ctx))
 		mml_drm_put_context(mml_ctx);
 	else
-		mml_err("fail to put ctx");
-	mml_log("%s end", __func__);
+		mml_err("[test]fail to put ctx");
+	mml_log("[test]%s end", __func__);
 }
 
 /* case_config_rgb/case_run_general
@@ -314,7 +477,7 @@ static void case_config_rgb(void)
 	the_case.cfg_dest_h = mml_test_h;
 }
 
-static void case_run_general(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_general(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, NULL);
 }
@@ -332,12 +495,12 @@ static void case_config_rgb_rot(void)
 	swap(the_case.cfg_dest_w, the_case.cfg_dest_h);
 }
 
-static void setup_rot(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_rot(struct mml_submit *task, struct mml_ut *cur)
 {
 	task->info.dest[0].rotate = MML_ROT_90;
 }
 
-static void case_run_rgb_rot(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_rgb_rot(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_rot);
 }
@@ -365,7 +528,7 @@ static void case_config_rgb_compose(void)
 }
 
 static void setup_rgb_compose(struct mml_submit *task,
-	struct mml_test_case *cur)
+	struct mml_ut *cur)
 {
 	task->info.dest[0].data.width = mml_test_w;
 	task->info.dest[0].data.height = mml_test_h;
@@ -379,7 +542,7 @@ static void setup_rgb_compose(struct mml_submit *task,
 }
 
 static void case_run_rgb_compose(struct mml_test *test,
-	struct mml_test_case *cur)
+	struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_rgb_compose);
 }
@@ -399,17 +562,16 @@ static void case_config_relay_crop(void)
 	the_case.cfg_dest_h = mml_test_h;
 }
 
-static void setup_relay(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_relay(struct mml_submit *task, struct mml_ut *cur)
 {
 	task->info.dest[0].pq_config.en = true;
-	task->info.dest[0].pq_config.en_dre = true;
 	task->info.dest[0].crop.r.left = 0;
 	task->info.dest[0].crop.r.top = 0;
 	task->info.dest[0].crop.r.width = the_case.cfg_dest_w;
 	task->info.dest[0].crop.r.height = the_case.cfg_dest_h;
 }
 
-static void case_run_relay(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_relay(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_relay);
 }
@@ -447,24 +609,24 @@ static void case_config_nv12(void)
 	the_case.cfg_dest_h = mml_test_h;
 }
 
-static void setup_nv12(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_nv12(struct mml_submit *task, struct mml_ut *cur)
 {
 	/* check src with 2 plane size */
 	if (task->buffer.src.size[0] + task->buffer.src.size[1] !=
 		cur->size_in)
-		mml_err("%s case %d src size total %u plane %u %u",
+		mml_err("[test]%s case %d src size total %u plane %u %u",
 			__func__, mml_case, cur->size_in,
-			task->buffer.src.size[0] + task->buffer.src.size[1]);
+			task->buffer.src.size[0], task->buffer.src.size[1]);
 
 	/* check dest 0 with 2 plane size */
 	if (task->buffer.dest[0].size[0] + task->buffer.dest[0].size[1] !=
 		cur->size_out)
-		mml_err("%s case %d dest size total %u plane %u %u",
+		mml_err("[test]%s case %d dest size total %u plane %u %u",
 			__func__, mml_case, cur->size_out,
-			task->buffer.dest[0].size[0] + task->buffer.dest[0].size[1]);
+			task->buffer.dest[0].size[0], task->buffer.dest[0].size[1]);
 }
 
-static void case_run_nv12(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_nv12(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_nv12);
 }
@@ -502,17 +664,17 @@ static void case_config_block_to_nv12(void)
 }
 
 static void setup_block_to_nv12(struct mml_submit *task,
-	struct mml_test_case *cur)
+	struct mml_ut *cur)
 {
 	/* check dest 0 with 2 plane size */
 	if (task->buffer.dest[0].size[0] + task->buffer.dest[0].size[1] !=
 		cur->size_out)
-		mml_err("%s case %d dest size total %u plane %u %u",
+		mml_err("[test]%s case %d dest size total %u plane %u %u",
 			__func__, mml_case, cur->size_out,
-			task->buffer.dest[0].size[0] + task->buffer.dest[0].size[1]);
+			task->buffer.dest[0].size[0], task->buffer.dest[0].size[1]);
 }
 
-static void case_run_block_to_nv12(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_block_to_nv12(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_block_to_nv12);
 }
@@ -533,7 +695,7 @@ static void case_config_afbc(void)
 	the_case.cfg_dest_h = mml_afbc_align(mml_test_h);
 }
 
-static void setup_afbc(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_afbc(struct mml_submit *task, struct mml_ut *cur)
 {
 	task->info.dest[0].compose.left = 0;
 	task->info.dest[0].compose.top = 0;
@@ -545,7 +707,7 @@ static void setup_afbc(struct mml_submit *task, struct mml_test_case *cur)
 		mml_afbc_align(task->info.dest[0].data.height);
 }
 
-static void case_run_afbc(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_afbc(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_afbc);
 }
@@ -568,7 +730,7 @@ static void case_config_afbc_to_rgb(void)
 }
 
 static void setup_afbc_to_rgb(struct mml_submit *task,
-	struct mml_test_case *cur)
+	struct mml_ut *cur)
 {
 	task->info.dest[0].crop.r.left = 0;
 	task->info.dest[0].crop.r.top = 0;
@@ -576,7 +738,7 @@ static void setup_afbc_to_rgb(struct mml_submit *task,
 	task->info.dest[0].crop.r.height = mml_test_h;
 }
 
-static void case_run_afbc_to_rgb(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_afbc_to_rgb(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_afbc_to_rgb);
 }
@@ -611,7 +773,7 @@ static void case_config_yuv_afbc_10_to_rgb(void)
 }
 
 static void setup_yuv_afbc_to_rgb(struct mml_submit *task,
-	struct mml_test_case *cur)
+	struct mml_ut *cur)
 {
 	task->info.dest[0].crop.r.left = 0;
 	task->info.dest[0].crop.r.top = 0;
@@ -619,7 +781,7 @@ static void setup_yuv_afbc_to_rgb(struct mml_submit *task,
 	task->info.dest[0].crop.r.height = mml_test_h;
 }
 
-static void case_run_yuv_afbc_to_rgb(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_yuv_afbc_to_rgb(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_yuv_afbc_to_rgb);
 }
@@ -644,7 +806,7 @@ static void case_config_2out(void)
 	the_case.cfg_dest1_h = 256;
 }
 
-static void setup_2out(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_2out(struct mml_submit *task, struct mml_ut *cur)
 {
 	/* config dest[1] info data and buf */
 	task->info.dest_cnt = 2;
@@ -652,13 +814,77 @@ static void setup_2out(struct mml_submit *task, struct mml_test_case *cur)
 	fillin_info_data(the_case.cfg_dest1_format,
 		the_case.cfg_dest1_w, the_case.cfg_dest1_h,
 		&task->info.dest[1].data);
-	fillin_buf(&task->info.dest[1].data, cur->fd_out1, cur->size_out1,
-		&task->buffer.dest[1]);
+	if (cur->use_dma)
+		fillin_buf_dma(&task->info.dest[1].data, cur->buf_dest[1], cur->dma_size_out[1],
+			&task->buffer.dest[1]);
+	else
+		fillin_buf(&task->info.dest[1].data, cur->fd_out1, cur->size_out1,
+			&task->buffer.dest[1]);
 }
 
-static void case_run_2out(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_2out(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_2out);
+}
+
+/* case_config_2in_2out
+ * 2 in 2 out + resize
+ *
+ * format in0: RGB888
+ * format in1: Y8
+ * format out0: NV12
+ * format out1: RGB resize 256x256
+ */
+static void case_config_2in_2out(void)
+{
+	the_case.cfg_src_format = mml_test_in_fmt;
+	the_case.cfg_src_w = mml_test_w;
+	the_case.cfg_src_h = mml_test_h;
+	the_case.cfg_src1_format = MML_FMT_GREY;
+	the_case.cfg_src1_w = 256;
+	the_case.cfg_src1_h = 256;
+	the_case.cfg_dest_format = mml_test_out_fmt;
+	the_case.cfg_dest_w = mml_test_out_w;
+	the_case.cfg_dest_h = mml_test_out_h;
+	the_case.cfg_dest1_format = MML_FMT_RGB888;
+	the_case.cfg_dest1_w = 256;
+	the_case.cfg_dest1_h = 256;
+}
+
+static void setup_2in_2out(struct mml_submit *task, struct mml_ut *cur)
+{
+	task->info.dest[0].crop.r.left = mml_test_crop_left;
+	task->info.dest[0].crop.r.top = mml_test_crop_top;
+	task->info.dest[0].crop.r.width = mml_test_crop_width;
+	task->info.dest[0].crop.r.height = mml_test_crop_height;
+	task->info.dest[0].rotate = mml_test_rot;
+	task->info.dest[0].flip = mml_test_flip;
+
+	fillin_info_data(the_case.cfg_src1_format,
+		the_case.cfg_src1_w, the_case.cfg_src1_h,
+		&task->info.seg_map);
+	fillin_buf(&task->info.seg_map, cur->fd_in1, cur->size_in1,
+		&task->buffer.seg_map);
+	/* config dest[1] info data and buf */
+	task->info.dest_cnt = 2;
+	task->buffer.dest_cnt = 2;
+	task->info.dest[0].pq_config.en = true;
+	task->info.dest[0].pq_config.en_region_pq = true;
+	task->info.dest[0].pq_config.en_sharp = true;
+	fillin_info_data(the_case.cfg_dest1_format,
+		the_case.cfg_dest1_w, the_case.cfg_dest1_h,
+		&task->info.dest[1].data);
+	if (cur->use_dma)
+		fillin_buf_dma(&task->info.dest[1].data, cur->buf_dest[1], cur->dma_size_out[1],
+			&task->buffer.dest[1]);
+	else
+		fillin_buf(&task->info.dest[1].data, cur->fd_out1, cur->size_out1,
+			&task->buffer.dest[1]);
+}
+
+static void case_run_2in_2out(struct mml_test *test, struct mml_ut *cur)
+{
+	case_general_submit(test, cur, setup_2in_2out);
 }
 
 /* case_config_2out_crop
@@ -670,29 +896,29 @@ static void case_run_2out(struct mml_test *test, struct mml_test_case *cur)
  */
 static void case_config_2out_crop(void)
 {
-	the_case.cfg_src_format = MML_FMT_RGB888;
+	the_case.cfg_src_format = mml_test_in_fmt;
 	the_case.cfg_src_w = mml_test_w;
 	the_case.cfg_src_h = mml_test_h;
-	the_case.cfg_dest_format = MML_FMT_NV12;
+	the_case.cfg_dest_format = mml_test_out_fmt;
 	the_case.cfg_dest_w = mml_test_w;
 	the_case.cfg_dest_h = mml_test_h;
 	the_case.cfg_dest1_format = MML_FMT_RGB888;
-	the_case.cfg_dest1_w = mml_test_w / 2;
-	the_case.cfg_dest1_h = mml_test_h / 2;
+	the_case.cfg_dest1_w = mml_test_out_w;
+	the_case.cfg_dest1_h = mml_test_out_h;
 }
 
-static void setup_2out_crop(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_2out_crop(struct mml_submit *task, struct mml_ut *cur)
 {
 	setup_2out(task, cur);
 
 	/* config dest[1] crop */
-	task->info.dest[1].crop.r.left = mml_test_w / 4;
-	task->info.dest[1].crop.r.top = mml_test_w / 4;
-	task->info.dest[1].crop.r.width = task->info.dest[1].data.width;
-	task->info.dest[1].crop.r.height = task->info.dest[1].data.height;
+	task->info.dest[1].crop.r.left = (mml_test_w - mml_test_out_w) / 2;
+	task->info.dest[1].crop.r.top = (mml_test_h - mml_test_out_h) / 2;
+	task->info.dest[1].crop.r.width = mml_test_out_w;
+	task->info.dest[1].crop.r.height = mml_test_out_h;
 }
 
-static void case_run_2out_crop(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_2out_crop(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_2out_crop);
 }
@@ -724,23 +950,26 @@ static void case_config_2out_crop_compose(void)
 #define central(out, in) (out / 2 - in / 2)
 
 static void setup_2out_crop_compose(struct mml_submit *task,
-	struct mml_test_case *cur)
+	struct mml_ut *cur)
 {
 	setup_2out(task, cur);
 
+	task->info.dest[1].data.width = CASE_CROP_W;
+	task->info.dest[1].data.height = CASE_CROP_H;
+
 	/* config dest[1] crop */
-	task->info.dest[1].crop.r.left = central(mml_test_w, CASE_CROP_W);
-	task->info.dest[1].crop.r.top = central(mml_test_h, CASE_CROP_H);
-	task->info.dest[1].crop.r.width = task->info.dest[1].data.width;
-	task->info.dest[1].crop.r.height = task->info.dest[1].data.height;
-	task->info.dest[1].compose.left = central(mml_test_w, CASE_CROP_W);
-	task->info.dest[1].compose.top = central(mml_test_h, CASE_CROP_H);
-	task->info.dest[1].compose.width = mml_test_w;
-	task->info.dest[1].compose.height = mml_test_h;
+	task->info.dest[1].crop.r.left = central(cur->cfg_dest_w, CASE_CROP_W);
+	task->info.dest[1].crop.r.top = central(cur->cfg_dest_h, CASE_CROP_H);
+	task->info.dest[1].crop.r.width = CASE_CROP_W;
+	task->info.dest[1].crop.r.height = CASE_CROP_H;
+	task->info.dest[1].compose.left = central(cur->cfg_dest1_w, CASE_CROP_W);
+	task->info.dest[1].compose.top = central(cur->cfg_dest1_h, CASE_CROP_H);
+	task->info.dest[1].compose.width = CASE_CROP_W;
+	task->info.dest[1].compose.height = CASE_CROP_H;
 }
 
 static void case_run_2out_crop_compose(struct mml_test *test,
-	struct mml_test_case *cur)
+	struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_2out_crop_compose);
 }
@@ -763,7 +992,7 @@ static void case_config_crop(void)
 	the_case.cfg_dest_h = RGB_CROP_OFF_H;
 }
 
-static void setup_crop(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_crop(struct mml_submit *task, struct mml_ut *cur)
 {
 	task->info.dest[0].crop.r.left = central(mml_test_w, RGB_CROP_OFF_W);
 	task->info.dest[0].crop.r.top = central(mml_test_h, RGB_CROP_OFF_H);
@@ -771,7 +1000,7 @@ static void setup_crop(struct mml_submit *task, struct mml_test_case *cur)
 	task->info.dest[0].crop.r.height = RGB_CROP_OFF_H;
 }
 
-static void case_run_crop(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_crop(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_crop);
 }
@@ -791,17 +1020,17 @@ static void case_config_yv12_yuyv(void)
 	the_case.cfg_dest_h = mml_test_h;
 }
 
-static void setup_yv12_yuyv(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_yv12_yuyv(struct mml_submit *task, struct mml_ut *cur)
 {
 	if (task->buffer.src.size[0] + task->buffer.src.size[1]
 		+ task->buffer.src.size[2] !=
 		cur->size_in)
-		mml_err("%s case %d src size total %u plane %u %u",
+		mml_err("[test]%s case %d src size total %u plane %u %u",
 			__func__, mml_case, cur->size_in,
-			task->buffer.src.size[0] + task->buffer.src.size[1]);
+			task->buffer.src.size[0], task->buffer.src.size[1]);
 }
 
-static void case_run_yv12_yuyv(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_yv12_yuyv(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_yv12_yuyv);
 }
@@ -811,7 +1040,7 @@ static void case_run_yv12_yuyv(struct mml_test *test, struct mml_test_case *cur)
  * format in: MML_FMT_RGB888
  * format out: MML_FMT_RGB888
  */
-static void setup_write_sram(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_write_sram(struct mml_submit *task, struct mml_ut *cur)
 {
 	task->info.mode = MML_MODE_RACING;
 	task->info.dest[0].crop.r.left = 0;
@@ -825,7 +1054,7 @@ static void setup_write_sram(struct mml_submit *task, struct mml_test_case *cur)
 	task->info.dest[0].flip = mml_test_flip;
 }
 
-static void case_run_write_sram(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_write_sram(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_write_sram);
 }
@@ -848,10 +1077,8 @@ static void case_config_read_sram(void)
 	the_case.cfg_dest_h = mml_test_out_h;
 }
 
-static void setup_read_sram_bufa(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_read_sram_bufa(struct mml_submit *task, struct mml_ut *cur)
 {
-	mml_log("%s read buf", __func__);
-
 	task->info.mode = MML_MODE_SRAM_READ;
 	task->buffer.src.flush = false;
 	task->buffer.src.invalid = false;
@@ -862,13 +1089,16 @@ static void setup_read_sram_bufa(struct mml_submit *task, struct mml_test_case *
 	task->buffer.src.size[0] /= 2;
 	task->buffer.src.size[1] /= 2;
 	task->buffer.src.size[2] /= 2;
+
+	task->info.dest[0].crop.r.width = cur->cfg_src_w;
+	task->info.dest[0].crop.r.height = SRAM_HEIGHT;
 }
 
-static void setup_read_sram_bufb(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_read_sram_bufb(struct mml_submit *task, struct mml_ut *cur)
 {
 	u32 src_offset = SRAM_SIZE, offset;
 
-	mml_log("%s read buf", __func__);
+	mml_log("[test]%s read buf", __func__);
 
 	task->info.mode = MML_MODE_SRAM_READ;
 	task->buffer.src.flush = false;
@@ -880,6 +1110,9 @@ static void setup_read_sram_bufb(struct mml_submit *task, struct mml_test_case *
 	task->buffer.src.size[0] /= 2;
 	task->buffer.src.size[1] /= 2;
 	task->buffer.src.size[2] /= 2;
+
+	task->info.dest[0].crop.r.width = cur->cfg_src_w;
+	task->info.dest[0].crop.r.height = SRAM_HEIGHT;
 
 	task->info.src.plane_offset[0] = src_offset;
 	task->info.src.plane_offset[1] = src_offset;
@@ -887,13 +1120,13 @@ static void setup_read_sram_bufb(struct mml_submit *task, struct mml_test_case *
 
 	offset = mml_color_get_min_y_size(task->info.dest[0].data.format,
 		task->info.dest[0].data.width, task->info.dest[0].data.height);
-	mml_log("%s dest plane offset %u", __func__, offset);
+	mml_log("[test]%s dest plane offset %u", __func__, offset);
 	task->info.dest[0].data.plane_offset[0] = offset;
 	task->info.dest[0].data.plane_offset[1] = offset;
 	task->info.dest[0].data.plane_offset[2] = offset;
 }
 
-static void case_run_read_sram(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_read_sram(struct mml_test *test, struct mml_ut *cur)
 {
 	struct platform_device *mml_pdev;
 	struct device *dev;
@@ -907,6 +1140,10 @@ static void case_run_read_sram(struct mml_test *test, struct mml_test_case *cur)
 
 	/* hold sram, for wrot out and rdma in */
 	dev = &mml_pdev->dev;
+	if (unlikely(!dev)) {
+		mml_err("%s dev = null", __func__);
+		return;
+	}
 	mml = dev_get_drvdata(dev);
 	mml_sram_get(mml);
 
@@ -933,15 +1170,15 @@ static void case_run_read_sram(struct mml_test *test, struct mml_test_case *cur)
  */
 static void case_config_wr_sram(void)
 {
-	the_case.cfg_src_format = MML_FMT_RGB888;
+	the_case.cfg_src_format = mml_test_in_fmt;
 	the_case.cfg_src_w = mml_test_w;
 	the_case.cfg_src_h = mml_test_h;
-	the_case.cfg_dest_format = MML_FMT_YUYV;
+	the_case.cfg_dest_format = mml_test_out_fmt;
 	the_case.cfg_dest_w = mml_test_out_w;
 	the_case.cfg_dest_h = SRAM_HEIGHT * 2;
 }
 
-static void setup_write_sram_crop(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_write_sram_crop(struct mml_submit *task, struct mml_ut *cur)
 {
 	task->info.mode = MML_MODE_RACING;
 	task->info.dest[0].crop.r.left = 0;
@@ -957,7 +1194,7 @@ static void setup_write_sram_crop(struct mml_submit *task, struct mml_test_case 
 	task->info.dest[0].flip = mml_test_flip;
 }
 
-static void case_run_wr_sram(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_wr_sram(struct mml_test *test, struct mml_ut *cur)
 {
 	struct platform_device *mml_pdev;
 	struct device *dev;
@@ -967,11 +1204,27 @@ static void case_run_wr_sram(struct mml_test *test, struct mml_test_case *cur)
 	int32_t fd = -1;
 
 	/* create context */
+	if (unlikely(!test)) {
+		mml_err("%s test = null", __func__);
+		return;
+	}
 	mml_pdev = mml_get_plat_device(test->pdev);
+	if (unlikely(!mml_pdev)) {
+		mml_err("%s mml_pdev = null", __func__);
+		return;
+	}
 	mml_ctx = mml_drm_get_context(mml_pdev, &disp);
-
+	if (unlikely(!mml_ctx)) {
+		mml_err("%s mml_ctx = null", __func__);
+		return;
+	}
 	/* hold sram, for wrot out and rdma in */
 	dev = &mml_pdev->dev;
+	if (unlikely(!dev)) {
+		mml_drm_put_context(mml_ctx);
+		mml_err("%s dev = null", __func__);
+		return;
+	}
 	mml = dev_get_drvdata(dev);
 	mml_sram_get(mml);
 
@@ -980,9 +1233,9 @@ static void case_run_wr_sram(struct mml_test *test, struct mml_test_case *cur)
 	case_general_submit(test, cur, setup_write_sram_crop);
 
 	/* correct the format in sram */
-	the_case.cfg_src_format = the_case.cfg_dest_format;
-	the_case.cfg_src_w = mml_test_out_w;
-	the_case.cfg_dest_h = SRAM_HEIGHT;
+	cur->cfg_src_format = cur->cfg_dest_format;
+	cur->cfg_src_w = mml_test_out_w;
+	cur->cfg_dest_h = SRAM_HEIGHT;
 
 	/* sram -> dram */
 	cur->fd_out = fd;
@@ -1027,11 +1280,11 @@ static void case_config_rgb_down2(void)
 	the_case.cfg_dest_h = mml_test_h / 2;
 }
 
-/* case_config_blk_manual
- * test format blk scale manual
+/* case_config_manual
+ * test format scale manual
  *
- * format in: blk
- * format out: YUYV crop
+ * format in: manual
+ * format out: manual crop
  */
 static void case_config_crop_manual(void)
 {
@@ -1043,27 +1296,100 @@ static void case_config_crop_manual(void)
 	the_case.cfg_dest_h = mml_test_out_h;
 }
 
-static void setup_crop_manual(struct mml_submit *task, struct mml_test_case *cur)
+static void setup_crop_manual(struct mml_submit *task, struct mml_ut *cur)
 {
 	task->info.dest[0].crop.r.left = mml_test_crop_left;
 	task->info.dest[0].crop.r.top = mml_test_crop_top;
 	task->info.dest[0].crop.r.width = mml_test_crop_width;
 	task->info.dest[0].crop.r.height = mml_test_crop_height;
+	task->info.dest[0].compose.left = mml_test_comp_left;
+	task->info.dest[0].compose.top = mml_test_comp_top;
+	task->info.dest[0].compose.width = mml_test_comp_width;
+	task->info.dest[0].compose.height = mml_test_comp_height;
 	task->info.dest[0].rotate = mml_test_rot;
 	task->info.dest[0].flip = mml_test_flip;
 
 	/* check dest 0 with 2 plane size */
-	if (task->buffer.dest[0].size[0] + task->buffer.dest[0].size[1] !=
-		cur->size_out)
-		mml_err("%s case %d dest size total %u plane %u %u",
+	if (task->buffer.dest[0].size[0] +
+	    task->buffer.dest[0].size[1] +
+	    task->buffer.dest[0].size[2] !=
+	    cur->size_out)
+		mml_err("[test]%s case %d dest size total %u plane %u %u %u",
 			__func__, mml_case, cur->size_out,
-			task->buffer.dest[0].size[0] + task->buffer.dest[0].size[1]);
+			task->buffer.dest[0].size[0], task->buffer.dest[0].size[1],
+			task->buffer.dest[0].size[2]);
 }
 
-static void case_run_crop_manual(struct mml_test *test, struct mml_test_case *cur)
+static void case_run_crop_manual(struct mml_test *test, struct mml_ut *cur)
 {
 	case_general_submit(test, cur, setup_crop_manual);
 }
+
+/* case_run_sram_frame / setup_read_sram_frame
+ *
+ * format in: MML_FMT_RGB888
+ * format out: MML_FMT_RGB888
+ */
+static void case_config_sram_frame(void)
+{
+	the_case.cfg_src_format = mml_test_in_fmt;
+	the_case.cfg_src_w = mml_test_w;
+	the_case.cfg_src_h = mml_test_h;
+	the_case.cfg_dest_format = mml_test_out_fmt;
+	the_case.cfg_dest_w = mml_test_w;
+	the_case.cfg_dest_h = mml_test_out_h;
+}
+
+static void setup_read_sram_frame(struct mml_submit *task, struct mml_ut *cur)
+{
+	task->info.mode = MML_MODE_APUDC;
+	task->buffer.src.flush = false;
+	task->buffer.src.invalid = false;
+	task->buffer.src.fd[0] = -1;
+
+	task->info.src.height = SRAM_HEIGHT;
+	task->info.dest[0].data.height = SRAM_HEIGHT;
+	task->buffer.src.size[0] /= 2;
+	task->buffer.src.size[1] /= 2;
+	task->buffer.src.size[2] /= 2;
+}
+
+static void case_run_sram_frame(struct mml_test *test, struct mml_ut *cur)
+{
+	struct platform_device *mml_pdev;
+	struct device *dev;
+	struct mml_drm_ctx *mml_ctx;
+	struct mml_drm_param disp = {.vdo_mode = true};
+	void *mml;
+
+	/* create context */
+	mml_pdev = mml_get_plat_device(test->pdev);
+	mml_ctx = mml_drm_get_context(mml_pdev, &disp);
+
+	/* hold sram, for wrot out and rdma in */
+	dev = &mml_pdev->dev;
+	if (unlikely(!dev)) {
+		mml_err("%s dev = null", __func__);
+		return;
+	}
+	mml = dev_get_drvdata(dev);
+	mml_sram_get(mml);
+
+	msleep_interruptible(mml_test_interval);
+
+	/* correct the format in sram */
+	the_case.cfg_src_format = the_case.cfg_dest_format;
+	the_case.cfg_dest_h = SRAM_HEIGHT;
+
+	/* sram -> dram */
+	cur->fd_in = -1;
+	case_general_submit(test, cur, setup_read_sram_frame);
+
+	/* release */
+	mml_sram_put(mml);
+	mml_drm_put_context(mml_ctx);
+}
+
 
 enum mml_ut_case {
 	MML_UT_RGB,			/* 0 */
@@ -1086,9 +1412,11 @@ enum mml_ut_case {
 	MML_UT_WR_SRAM,			/* 17 */
 	MML_UT_RESIZE_UP1_5,		/* 18 */
 	MML_UT_RGB_DOWN2,		/* 19 */
-	MML_UT_BLK_MANUAL,		/* 20 */
+	MML_UT_MANUAL,			/* 20 */
 	MML_UT_YUV_AFBC_TO_RGB,		/* 21 */
 	MML_UT_YUV_AFBC_10_TO_RGB,	/* 22 */
+	MML_UT_2IN_2OUT,		/* 23 */
+	MML_UT_SRAM_FRAME,		/* 24 */
 	MML_UT_TOTAL
 };
 
@@ -1173,7 +1501,7 @@ static struct test_case_op cases[MML_UT_TOTAL] = {
 		.config = case_config_rgb_down2,
 		.run = case_run_general,
 	},
-	[MML_UT_BLK_MANUAL] = {
+	[MML_UT_MANUAL] = {
 		.config = case_config_crop_manual,
 		.run = case_run_crop_manual,
 	},
@@ -1185,31 +1513,63 @@ static struct test_case_op cases[MML_UT_TOTAL] = {
 		.config = case_config_yuv_afbc_10_to_rgb,
 		.run = case_run_yuv_afbc_to_rgb,
 	},
+	[MML_UT_2IN_2OUT] = {
+		.config = case_config_2in_2out,
+		.run = case_run_2in_2out,
+	},
+	[MML_UT_SRAM_FRAME] = {
+		.config = case_config_sram_frame,
+		.run = case_run_sram_frame,
+	},
 };
 
 static ssize_t test_read(struct file *filep, char __user *buf, size_t size,
 	loff_t *offset)
 {
-	u32 len = sizeof(the_case);
+	struct mml_test_case user_case = {0};
+	u32 len = sizeof(user_case);
+	int ret;
 
-	if (size < sizeof(the_case)) {
+	if (size < sizeof(user_case)) {
 		mml_err("[test] buf size not match %zu %u",
-			sizeof(the_case), len);
+			sizeof(user_case), len);
 		return -EFAULT;
 	}
-
-	memset(&the_case, 0, sizeof(the_case));
 
 	if (mml_case < ARRAY_SIZE(cases) && cases[mml_case].config)
 		cases[mml_case].config();
 	else
 		mml_err("[test]no such case %d", mml_case);
 
-	copy_to_user(buf, &the_case, len);
+	user_case.cfg_src_format = the_case.cfg_src_format;
+	user_case.cfg_src_w = the_case.cfg_src_w;
+	user_case.cfg_src_h = the_case.cfg_src_h;
+	user_case.cfg_src1_format = the_case.cfg_src1_format;
+	user_case.cfg_src1_w = the_case.cfg_src1_w;
+	user_case.cfg_src1_h = the_case.cfg_src1_h;
+	user_case.cfg_dest_format = the_case.cfg_dest_format;
+	user_case.cfg_dest_w = the_case.cfg_dest_w;
+	user_case.cfg_dest_h = the_case.cfg_dest_h;
+	user_case.cfg_dest1_format = the_case.cfg_dest1_format;
+	user_case.cfg_dest1_w = the_case.cfg_dest1_w;
+	user_case.cfg_dest1_h = the_case.cfg_dest1_h;
+	user_case.fd_in = the_case.fd_in;
+	user_case.size_in = the_case.size_in;
+	user_case.fd_out = the_case.fd_out;
+	user_case.size_out = the_case.size_out;
+	user_case.fd_out1 = the_case.fd_out1;
+	user_case.size_out1 = the_case.size_out1;
+	user_case.dump_dest = mml_test_dump_dest;
+
+	ret = copy_to_user(buf, &user_case, len);
+	if (ret) {
+		mml_err("[test]%s copy case fail %d", __func__, ret);
+		return -EFAULT;
+	}
 	*offset += len;
 
-	mml_log("[test]%s format src %#010x dest %#010x size %u stride %u",
-		__func__, the_case.cfg_src_format, the_case.cfg_dest_format);
+	mml_log("[test]%s format src %#010x dest %#010x",
+		__func__, user_case.cfg_src_format, user_case.cfg_dest_format);
 
 	return 0;
 }
@@ -1218,22 +1578,55 @@ static ssize_t test_write(struct file *filp, const char *buf, size_t count,
 	loff_t *offp)
 {
 	struct mml_test *test = (struct mml_test *)filp->f_inode->i_private;
-	struct mml_test_case cur;
+	struct mml_test_case user_case = {0};
+	struct mml_ut cur = {0};
+	ssize_t ret = -EFAULT;
+	int ref;
 
-	if (count > sizeof(cur)) {
-		mml_err("buf count not match %zu %zu", count, sizeof(cur));
-		return -EFAULT;
+	ref = atomic_inc_return(&mml_test_protect);
+	if (ref != 1) {
+		mml_log("[test]single run protect %d", ref);
+		goto err_done;
 	}
 
-	if (copy_from_user(&cur, buf, count)) {
-		mml_err("copy_from_user failed len:%zu", count);
-		return -EFAULT;
+	if (count > sizeof(user_case)) {
+		mml_err("[test]buf count not match %zu %zu", count, sizeof(user_case));
+		goto err_done;
 	}
+
+	if (copy_from_user(&user_case, buf, count)) {
+		mml_err("[test]copy_from_user failed len:%zu", count);
+		goto err_done;
+	}
+
+	cur.cfg_src_format = user_case.cfg_src_format;
+	cur.cfg_src_w = user_case.cfg_src_w;
+	cur.cfg_src_h = user_case.cfg_src_h;
+	cur.cfg_src1_format = user_case.cfg_src1_format;
+	cur.cfg_src1_w = user_case.cfg_src1_w;
+	cur.cfg_src1_h = user_case.cfg_src1_h;
+	cur.cfg_dest_format = user_case.cfg_dest_format;
+	cur.cfg_dest_w = user_case.cfg_dest_w;
+	cur.cfg_dest_h = user_case.cfg_dest_h;
+	cur.cfg_dest1_format = user_case.cfg_dest1_format;
+	cur.cfg_dest1_w = user_case.cfg_dest1_w;
+	cur.cfg_dest1_h = user_case.cfg_dest1_h;
+	cur.fd_in = user_case.fd_in;
+	cur.size_in = user_case.size_in;
+	cur.fd_in1 = user_case.fd_in1;
+	cur.size_in1 = user_case.size_in1;
+	cur.fd_out = user_case.fd_out;
+	cur.size_out = user_case.size_out;
+	cur.fd_out1 = user_case.fd_out1;
+	cur.size_out1 = user_case.size_out1;
 
 	if (mml_case < ARRAY_SIZE(cases) && cases[mml_case].run)
 		cases[mml_case].run(test, &cur);
+	ret = count;
 
-	return count;
+err_done:
+	atomic_dec(&mml_test_protect);
+	return ret;
 }
 
 static const struct file_operations test_fops = {
@@ -1241,12 +1634,259 @@ static const struct file_operations test_fops = {
 	.write = test_write,
 };
 
+static void mml_test_fill_frame_rgb888(u8 *va, u32 width, u32 height)
+{
+	u32 x, y;
+	const u32 step = 0xff;
+
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			u32 r = step * x / width;
+			u32 g = step * y / height;
+			u32 b = (r + g) / 2;
+			u32 idx = (y * width + x) * 3;
+
+			va[idx] = r;
+			va[idx + 1] = g;
+			va[idx + 2] = b;
+		}
+	}
+}
+
+static void mml_test_fill_frame_rgba8888(u8 *va, u32 width, u32 height)
+{
+	u32 x, y;
+	const u32 step = 0xff;
+
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			u32 r = step * x / width;
+			u32 g = step * y / height;
+			u32 b = (r + g) / 2;
+			u32 idx = (y * width + x) * 4;
+
+			va[idx] = r;
+			va[idx + 1] = g;
+			va[idx + 2] = b;
+			va[idx + 3] = x * y * step / width / height;
+		}
+	}
+}
+
+static struct dma_buf *mml_test_create_buf(struct dma_heap *heap, u32 size)
+{
+	struct dma_buf *frame_buf;
+
+	/* fd flags align API dmabuf_heap_alloc in libdmabufheap.so */
+	frame_buf = dma_heap_buffer_alloc(heap, size,
+		O_RDWR | O_CLOEXEC, DMA_HEAP_VALID_HEAP_FLAGS);
+	if (IS_ERR_OR_NULL(frame_buf)) {
+		mml_err("[test]buffer alloc fail %d heap %p size %u",
+			PTR_ERR(frame_buf), heap, size);
+		return frame_buf;
+	}
+
+	return frame_buf;
+}
+
+static int mml_test_alloc_frame(struct dma_heap *heap, struct mml_buffer *buf,
+	u32 format, u32 width, u32 height)
+{
+	u32 plane, buf_size;
+	struct dma_buf *dmabuf;
+
+	mml_log("[test]%s format %#x res %u %u", __func__, format, width, height);
+
+	if (MML_FMT_AFBC(format)) {
+		mml_err("[test]not support format %#x", format);
+		return -EINVAL;
+	}
+
+	plane = MML_FMT_PLANE(format);
+	buf_size = mml_color_get_min_y_size(format, width, height);
+
+	if (plane == 2)
+		buf_size += mml_color_get_min_uv_size(format, width, height);
+	else if (plane >= 3)
+		buf_size += mml_color_get_min_uv_size(format, width, height) * 2;
+
+	dmabuf = mml_test_create_buf(heap, buf_size);
+	if (IS_ERR_OR_NULL(dmabuf))
+		return PTR_ERR(dmabuf);
+
+	buf->dmabuf[0] = dmabuf;
+	buf->size[0] = buf_size;
+	buf->cnt = plane;
+	buf->use_dma = true;
+
+	return 0;
+}
+
+static void mml_test_free_frame(struct mml_buffer *buf)
+{
+	if (!buf->dmabuf[0])
+		return;
+
+	dma_heap_buffer_free(buf->dmabuf[0]);
+}
+
+static int mml_test_create_src(struct dma_heap *heap, struct mml_ut *cur_case,
+	struct mml_buffer *buf)
+{
+	void *va;
+	struct iosys_map map = {0};
+	int ret;
+
+	if (mml_test_alloc_frame(heap, buf, cur_case->cfg_src_format,
+		cur_case->cfg_src_w, cur_case->cfg_src_h) < 0)
+		return -EINVAL;
+
+	/* retrieve va to fill in raw data */
+	ret = dma_buf_vmap_unlocked(buf->dmabuf[0], &map);
+	if (ret) {
+		mml_err("[test]fail to vmap");
+		return -ENOMEM;
+	}
+	va = map.vaddr;
+
+	switch (cur_case->cfg_src_format) {
+	case MML_FMT_RGB888:
+	case MML_FMT_BGR888:
+		mml_test_fill_frame_rgb888(va, cur_case->cfg_src_w, cur_case->cfg_src_h);
+		break;
+	case MML_FMT_RGBA8888:
+	case MML_FMT_BGRA8888:
+		mml_test_fill_frame_rgba8888(va, cur_case->cfg_src_w, cur_case->cfg_src_h);
+		break;
+	default:
+		mml_err("[test]not support src format %#x", cur_case->cfg_src_format);
+		break;
+	}
+
+	buf->flush = true;
+	dma_buf_vunmap_unlocked(buf->dmabuf[0], &map);
+
+	return 0;
+}
+
+static int mml_test_create_dest(struct dma_heap *heap, struct mml_ut *cur_case,
+	struct mml_buffer *buf)
+{
+	u64 *va;
+	struct iosys_map map = {0};
+	u32 i;
+	int ret;
+
+	if (mml_test_alloc_frame(heap, buf, cur_case->cfg_dest_format,
+		cur_case->cfg_dest_w, cur_case->cfg_dest_h) < 0)
+		return -EINVAL;
+
+	/* retrieve va to fill in raw data */
+	ret = dma_buf_vmap_unlocked(buf->dmabuf[0], &map);
+	if (ret) {
+		mml_err("[test]%s fail to vmap", __func__);
+		return -ENOMEM;
+	}
+	va = map.vaddr;
+
+	for (i = 0; i < buf->size[0] / 8; i++)
+		va[i] = 0xdeadbeef + i;
+
+	buf->flush = true;
+	dma_buf_vunmap_unlocked(buf->dmabuf[0], &map);
+
+	return 0;
+}
+
+static struct mml_test *main_test;
+
+static void mml_test_krun(u32 case_num)
+{
+	struct mml_buffer src_buf = {0}, dest_buf = {0};
+	struct mml_ut cur = {0};
+	struct dma_heap *heap = NULL;
+
+	mml_log("[test]%s run case %u", __func__, case_num);
+
+	if (!main_test) {
+		mml_err("[test]test drv not probe");
+		goto end;
+	}
+
+	cur.cfg_src_format = mml_test_in_fmt;
+	cur.cfg_src_w = mml_test_w;
+	cur.cfg_src_h = mml_test_h;
+	cur.cfg_dest_format = mml_test_out_fmt;
+	cur.cfg_dest_w = mml_test_out_w;
+	cur.cfg_dest_h = mml_test_out_h;
+	cur.buf_src[0] = src_buf.dmabuf[0];
+	cur.dma_size_in[0] = src_buf.size[0];
+	cur.buf_dest[0] = dest_buf.dmabuf[0];
+	cur.dma_size_out[0] = dest_buf.size[0];
+	cur.use_dma = true;
+
+	heap = dma_heap_find("mtk_mm-uncached");
+	if (!heap) {
+		mml_err("[test]heap find fail");
+		goto end;
+	}
+
+	if (mml_test_create_src(heap, &cur, &src_buf) < 0)
+		goto free_heap;
+
+	if (mml_test_create_dest(heap, &cur, &dest_buf) < 0)
+		goto free_heap;
+
+	cur.buf_src[0] = src_buf.dmabuf[0];
+	cur.dma_size_in[0] = src_buf.size[0];
+	cur.buf_src[1] = src_buf.dmabuf[1];
+	cur.dma_size_in[1] = src_buf.size[1];
+	cur.buf_dest[0] = dest_buf.dmabuf[0];
+	cur.dma_size_out[0] = dest_buf.size[0];
+	cur.buf_dest[1] = dest_buf.dmabuf[1];
+	cur.dma_size_out[1] = dest_buf.size[1];
+
+	if (case_num < ARRAY_SIZE(cases) && cases[case_num].run)
+		cases[case_num].run(main_test, &cur);
+
+free_heap:
+	/* put heap struct after use it done.
+	 * put times must same with get pass times, otherwise heap will disappear.
+	 */
+	dma_heap_put(heap);
+
+end:
+	mml_test_free_frame(&src_buf);
+	mml_test_free_frame(&dest_buf);
+}
+
+static int mml_test_krun_set(const char *val, const struct kernel_param *kp)
+{
+	int result;
+	u32 case_num;
+
+	result = kstrtoint(val, 0, &case_num);
+	if (result) {
+		mml_err("[test]case num fail %d", result);
+		return result;
+	}
+
+	mml_test_krun(case_num);
+	return 0;
+}
+
+static struct kernel_param_ops krun_ops = {
+	.set = mml_test_krun_set,
+};
+
+module_param_cb(mml_test_ut, &krun_ops, NULL, 0644);
+
 static int mml_test_inst_print(struct seq_file *seq, void *data)
 {
 	u32 size;
 	char *insts = mml_core_get_dump_inst(&size);
 
-	mml_log("%s dump inst buf size %u", __func__, size);
+	mml_log("[test]%s dump inst buf size %u", __func__, size);
 
 	seq_printf(seq, "%s\n", insts);
 
@@ -1271,11 +1911,11 @@ static int mml_test_frame_in(struct seq_file *seq, void *data)
 	struct mml_frm_dump_data *frm = mml_core_get_frame_in();
 
 	if (!frm->size) {
-		mml_log("%s no data to dump", __func__);
+		mml_log("[test]%s no data to dump", __func__);
 		return 0;
 	}
 
-	mml_log("%s dump frame %s size %u", __func__, frm->name, frm->size);
+	mml_log("[test]%s dump frame %s size %u", __func__, frm->name, frm->size);
 	seq_write(seq, frm->frame, frm->size);
 
 	return 0;
@@ -1299,11 +1939,11 @@ static int mml_test_frame_out(struct seq_file *seq, void *data)
 	struct mml_frm_dump_data *frm = mml_core_get_frame_out();
 
 	if (!frm->size) {
-		mml_log("%s no data to dump", __func__);
+		mml_log("[test]%s no data to dump", __func__);
 		return 0;
 	}
 
-	mml_log("%s dump frame %s size %u", __func__, frm->name, frm->size);
+	mml_log("[test]%s dump frame %s size %u", __func__, frm->name, frm->size);
 	seq_write(seq, frm->frame, frm->size);
 
 	return 0;
@@ -1322,13 +1962,234 @@ static const struct file_operations mml_frame_out_fops = {
 	.release = single_release,
 };
 
+/* Following code implement mml dump service node */
+int mml_dump_srv;
+module_param(mml_dump_srv, int, 0644);
+
+int mml_dump_srv_opt = DUMPOPT_ALL;
+module_param(mml_dump_srv_opt, int, 0644);
+
+#define MML_DUMP_NAME_MAX 128
+
+enum MML_DUMPSRV_ACTION {
+	DUMPSRV_STOP,
+	DUMPSRV_CONTINUE,
+	DUMPSRV_WRITE_FILE,
+};
+
+/* must sync struct with mdp_ut */
+struct mml_dump_job {
+	uint32_t action;
+	int32_t fd;
+	uint32_t size;
+	char name[MML_DUMP_NAME_MAX];
+};
+
+struct mml_dump_context {
+	wait_queue_head_t dump_queue;
+	struct completion write_done;
+
+	struct mutex job_mutex;
+	u64 stamp;
+	struct dma_buf *frame_dma_buf;
+	u32 size;
+	char name[MML_DUMP_NAME_MAX];
+
+	enum mml_dump_buf_t buf_type;
+
+	bool ready;
+	bool async;
+};
+
+static struct mml_dump_context dump_ctx[MMLDUMPT_CNT] = {
+	[MMLDUMPT_DEST] = {.buf_type = MMLDUMPT_DEST},
+};
+
+void mml_dump_buf(struct mml_task *task, struct mml_frame_data *data,
+	u32 width, u32 height, const char *prefix,
+	char *fmt, struct mml_file_buf *buf, enum mml_dump_buf_t buf_type, bool async)
+{
+	u32 i;
+	u64 stamp;
+	int ret;
+
+	if (buf_type >= ARRAY_SIZE(dump_ctx)) {
+		mml_err("[dumpsrv]%s wrong type %d", __func__, buf_type);
+		return;
+	}
+
+	mutex_lock(&dump_ctx[buf_type].job_mutex);
+
+	if (!dump_ctx[buf_type].ready) {
+		mml_err("[dumpsrv]%s type %d skip job %u cause not ready",
+			__func__, buf_type, task->job.jobid);
+		goto exit;
+	}
+
+	dump_ctx[buf_type].stamp = sched_clock();
+	stamp = div_u64(dump_ctx[buf_type].stamp, 1000000);
+
+	dump_ctx[buf_type].async = async;
+	dump_ctx[buf_type].size = 0;
+	for (i = 0; i < MML_MAX_PLANES; i++)
+		dump_ctx[buf_type].size += buf->size[i];
+
+	ret = snprintf(dump_ctx[buf_type].name, sizeof(dump_ctx[buf_type].name),
+		"mml_%llu_%u_%s_f%s_%u_%u_%u.bin",
+		stamp, task->job.jobid, prefix, fmt,
+		width, height, data->y_stride);
+	if (ret < 0)
+		dump_ctx[buf_type].name[0] = 0;
+	dump_ctx[buf_type].frame_dma_buf = buf->dma[0].dmabuf;
+	dump_ctx[buf_type].ready = false;
+
+	task->dump_queued[buf_type] = true;
+	if (!async)
+		init_completion(&dump_ctx[buf_type].write_done);
+
+	wake_up(&dump_ctx[buf_type].dump_queue);
+
+exit:
+	mutex_unlock(&dump_ctx[buf_type].job_mutex);
+}
+
+void mml_dump_wait(struct mml_task *task, enum mml_dump_buf_t buf_type)
+{
+	if (!dump_ctx[buf_type].async)
+		wait_for_completion(&dump_ctx[buf_type].write_done);
+	mutex_lock(&dump_ctx[buf_type].job_mutex);
+	task->dump_queued[buf_type] = false;
+	dump_ctx[buf_type].ready = true;
+	mutex_unlock(&dump_ctx[buf_type].job_mutex);
+}
+
+static ssize_t dumpsrv_read(struct file *filp, char __user *buf, size_t size,
+	loff_t *offset)
+{
+	struct mml_dump_context *dctx = (struct mml_dump_context *)filp->private_data;
+	struct mml_dump_job job;
+	int ret;
+
+	if (size != sizeof(struct mml_dump_job)) {
+		mml_err("[dumpsrv]size not match %u %zu",
+			size, sizeof(struct mml_dump_job));
+		return -EFAULT;
+	}
+
+	if (copy_from_user(&job, buf, sizeof(struct mml_dump_job))) {
+		mml_err("[dumpsrv]copy_from_user failed len:%zu",
+			sizeof(struct mml_dump_job));
+		return -EFAULT;
+	}
+
+	ret = wait_event_timeout(dctx->dump_queue, dctx->frame_dma_buf != NULL,
+		msecs_to_jiffies(1000));
+	if (!ret || !dctx->frame_dma_buf) {
+		if (mml_dump_srv == DUMPCTRL_DISABLE)
+			job.action = DUMPSRV_STOP;
+		else
+			job.action = DUMPSRV_CONTINUE;
+		goto exit;
+	}
+
+	mutex_lock(&dctx->job_mutex);
+	job.action = DUMPSRV_WRITE_FILE;
+	get_dma_buf(dctx->frame_dma_buf);
+	job.fd = dma_buf_fd(dctx->frame_dma_buf, O_RDWR | O_CLOEXEC);
+	job.size = dctx->size;
+	memcpy(job.name, dctx->name, sizeof(job.name));
+
+	mml_log("[dumpsrv]%s action %u fd %d size %u name %s buft %d opt %#x",
+		__func__, job.action, job.fd, job.size, job.name, dctx->buf_type,
+		mml_dump_srv_opt);
+
+	dctx->frame_dma_buf = NULL;
+	dctx->size = 0;
+	mutex_unlock(&dctx->job_mutex);
+
+exit:
+	ret = copy_to_user(buf, &job, sizeof(job));
+	if (ret)
+		mml_err("[dumpsrv]%s fail to copy job %d", __func__, ret);
+	*offset += sizeof(job);
+
+	return sizeof(job);
+}
+
+static ssize_t dumpsrv_write(struct file *filp, const char __user *buf, size_t len,
+	loff_t *offset)
+{
+	struct mml_dump_context *dctx = (struct mml_dump_context *)filp->private_data;
+	u64 stamp;
+
+	/* for safe */
+	if (len != sizeof(struct mml_dump_job))
+		return 0;
+
+	mutex_lock(&dctx->job_mutex);
+
+	if (dctx->async)
+		dctx->ready = true;
+	else
+		complete(&dctx->write_done);
+	stamp = div_u64(sched_clock() - dctx->stamp, 1000);
+	mml_log("[dumpsrv]%s done cost %lluus async %s",
+		dctx->name, stamp, dctx->async ? "true" : "false");
+
+	mutex_unlock(&dctx->job_mutex);
+
+	return 0;
+}
+
+static int dumpsrv_open(struct inode *node, struct file *filp)
+{
+	mml_log("[dumpsrv]%s %p open", __func__, filp);
+	filp->private_data = &dump_ctx[MMLDUMPT_SRC];
+	dump_ctx[MMLDUMPT_SRC].ready = true;
+	return 0;
+}
+
+static int dumpsrv_dest_open(struct inode *node, struct file *filp)
+{
+	mml_log("[dumpsrv]%s %p open", __func__, filp);
+	filp->private_data = &dump_ctx[MMLDUMPT_DEST];
+	dump_ctx[MMLDUMPT_DEST].ready = true;
+	return 0;
+}
+
+
+static int dumpsrv_release(struct inode *node, struct file *filp)
+{
+	struct mml_dump_context *dctx = (struct mml_dump_context *)filp->private_data;
+
+	dctx->ready = false;
+	filp->private_data = NULL;
+	mml_log("[dumpsrv]%p released", filp);
+	return 0;
+}
+
+static const struct file_operations dumpsrv_fops = {
+	.open = dumpsrv_open,
+	.release = dumpsrv_release,
+	.read = dumpsrv_read,
+	.write = dumpsrv_write,
+};
+
+static const struct file_operations dumpsrv_dest_fops = {
+	.open = dumpsrv_dest_open,
+	.release = dumpsrv_release,
+	.read = dumpsrv_read,
+	.write = dumpsrv_write,
+};
+
 static int probe(struct platform_device *pdev)
 {
 	struct mml_test *test;
 	struct dentry *dir;
 	bool exists = false;
+	u32 i;
 
-	mml_log("mml-test %s begin", __func__);
+	mml_log("[test]mml-test %s begin", __func__);
 	test = devm_kzalloc(&pdev->dev, sizeof(*test), GFP_KERNEL);
 	if (!test)
 		return -ENOMEM;
@@ -1339,7 +2200,7 @@ static int probe(struct platform_device *pdev)
 	if (!dir) {
 		dir = debugfs_create_dir("mml", NULL);
 		if (IS_ERR(dir) && PTR_ERR(dir) != -EEXIST) {
-			mml_err("debugfs_create_dir mml failed:%ld", PTR_ERR(dir));
+			mml_err("[test]debugfs_create_dir mml failed:%ld", PTR_ERR(dir));
 			return PTR_ERR(dir);
 		}
 	} else
@@ -1348,7 +2209,7 @@ static int probe(struct platform_device *pdev)
 	test->fs = debugfs_create_file(
 		"mml-test", 0444, dir, test, &test_fops);
 	if (IS_ERR(test->fs)) {
-		mml_err("debugfs_create_file mml-test failed:%ld",
+		mml_err("[test]debugfs_create_file mml-test failed:%ld",
 			PTR_ERR(test->fs));
 		return PTR_ERR(test->fs);
 	}
@@ -1356,26 +2217,48 @@ static int probe(struct platform_device *pdev)
 	test->fs_inst = debugfs_create_file(
 		"mml-inst-dump", 0444, dir, test, &mml_inst_dump_fops);
 	if (IS_ERR(test->fs_inst))
-		mml_err("debugfs_create_file mml-inst-dump failed:%ld",
+		mml_err("[test]debugfs_create_file mml-inst-dump failed:%ld",
 			PTR_ERR(test->fs_inst));
 
 	test->fs_frame_in = debugfs_create_file(
 		"mml-frame-dump-in", 0444, dir, test, &mml_frame_in_fops);
 	if (IS_ERR(test->fs_frame_in))
-		mml_err("debugfs_create_file mml-frame-dump-in failed:%ld",
+		mml_err("[test]debugfs_create_file mml-frame-dump-in failed:%ld",
 			PTR_ERR(test->fs_frame_in));
 
 	test->fs_frame_out = debugfs_create_file(
 		"mml-frame-dump-out", 0444, dir, test, &mml_frame_out_fops);
 	if (IS_ERR(test->fs_frame_out))
-		mml_err("debugfs_create_file mml-frame-dump-out failed:%ld",
+		mml_err("[test]debugfs_create_file mml-frame-dump-out failed:%ld",
 			PTR_ERR(test->fs_frame_out));
+
+	test->fs_dump = debugfs_create_file(
+		"mml-dumpsrv", 0444, dir, test, &dumpsrv_fops);
+	if (IS_ERR(test->fs_dump)) {
+		mml_err("debugfs_create_file mml-dumpsrv failed:%pe", test->fs_dump);
+		return PTR_ERR(test->fs_dump);
+	}
+
+	test->fs_dump_dest = debugfs_create_file(
+		"mml-dumpsrv-dest", 0444, dir, test, &dumpsrv_dest_fops);
+	if (IS_ERR(test->fs_dump_dest)) {
+		mml_err("debugfs_create_file mml-dumpsrv-dest failed:%pe", test->fs_dump_dest);
+		return PTR_ERR(test->fs_dump_dest);
+	}
 
 	if (exists)
 		dput(dir);
 
 	platform_set_drvdata(pdev, test);
-	mml_log("debugfs_create_file mml-test success");
+	mml_log("[test]debugfs_create_file mml-test success");
+
+	main_test = test;
+
+	for (i = 0; i < ARRAY_SIZE(dump_ctx); i++) {
+		mutex_init(&dump_ctx[i].job_mutex);
+		init_waitqueue_head(&dump_ctx[i].dump_queue);
+		init_completion(&dump_ctx[i].write_done);
+	}
 
 	return 0;
 }

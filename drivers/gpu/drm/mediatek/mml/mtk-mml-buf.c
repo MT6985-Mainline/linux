@@ -1,3 +1,4 @@
+#include <linux/iosys-map.h>
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Copyright (c) 2021 MediaTek Inc.
@@ -32,7 +33,9 @@ s32 mml_buf_get_fd(struct mml_file_buf *buf, int32_t *fd, u32 cnt, const char *n
 		}
 
 		buf->dma[i].dmabuf = dmabuf;
+#ifndef MML_FPGA
 		mtk_dma_buf_set_name(dmabuf, name);
+#endif
 	}
 	return 0;
 }
@@ -47,7 +50,9 @@ void mml_buf_get(struct mml_file_buf *buf, void **dmabufs, u32 cnt, const char *
 
 		get_dma_buf(dmabufs[i]);
 		buf->dma[i].dmabuf = dmabufs[i];
+#ifndef MML_FPGA
 		mtk_dma_buf_set_name(dmabufs[i], name);
+#endif
 	}
 }
 
@@ -63,7 +68,7 @@ inline static int dmabuf_to_iova(struct device *dev, struct mml_dma_buf *dma)
 		goto err;
 	}
 
-	dma->sgt = dma_buf_map_attachment(dma->attach, DMA_TO_DEVICE);
+	dma->sgt = dma_buf_map_attachment_unlocked(dma->attach, DMA_BIDIRECTIONAL);
 	if (IS_ERR_OR_NULL(dma->sgt)) {
 		err = PTR_ERR(dma->sgt);
 		mml_err("%s map failed err %d attach %p dev %p",
@@ -102,8 +107,10 @@ int mml_buf_iova_get(struct device *dev, struct mml_file_buf *buf)
 			continue;
 		}
 		ret = dmabuf_to_iova(dev, &buf->dma[i]);
-		if (ret < 0)
+		if (ret < 0) {
+			mml_aee("mml", "get iova from dma_buf failed");
 			return ret;
+		}
 	}
 	buf->map_time = sched_clock();
 
@@ -113,18 +120,16 @@ int mml_buf_iova_get(struct device *dev, struct mml_file_buf *buf)
 int mml_buf_va_get(struct mml_file_buf *buf)
 {
 	u32 i;
+	struct iosys_map map = {0};
+	int ret = 0;
 
 	for (i = 0; i < buf->cnt; i++) {
 		if (!buf->dma[i].dmabuf || buf->dma[i].va)
 			continue;
-		{
-			struct iosys_map map;
-			if (dma_buf_vmap(buf->dma[i].dmabuf, &map))
-				return -ENOMEM;
-			buf->dma[i].va = map.vaddr;
-		}
-		if (!buf->dma[i].va)
+		ret = dma_buf_vmap_unlocked(buf->dma[i].dmabuf, &map);
+		if (ret)
 			return -ENOMEM;
+		buf->dma[i].va = map.vaddr;
 	}
 
 	return 0;
@@ -132,7 +137,10 @@ int mml_buf_va_get(struct mml_file_buf *buf)
 
 inline static void dmabuf_iova_free(struct mml_dma_buf *dma)
 {
-	dma_buf_unmap_attachment(dma->attach, dma->sgt, DMA_FROM_DEVICE);
+#ifndef MML_FPGA
+	mtk_dma_buf_set_name(dma->dmabuf, NULL);
+#endif
+	dma_buf_unmap_attachment_unlocked(dma->attach, dma->sgt, DMA_BIDIRECTIONAL);
 	dma_buf_detach(dma->dmabuf, dma->attach);
 
 	dma->sgt = NULL;
@@ -142,14 +150,14 @@ inline static void dmabuf_iova_free(struct mml_dma_buf *dma)
 void mml_buf_put(struct mml_file_buf *buf)
 {
 	u8 i;
+	struct iosys_map map = {0};
 
 	for (i = 0; i < buf->cnt; i++) {
 		if (!buf->dma[i].dmabuf)
 			continue;
-		if (buf->dma[i].va)
-			{
-			struct iosys_map map = IOSYS_MAP_INIT_VADDR(buf->dma[i].va);
-			dma_buf_vunmap(buf->dma[i].dmabuf, &map);
+		if (buf->dma[i].va) {
+			map.vaddr = buf->dma[i].va;
+			dma_buf_vunmap_unlocked(buf->dma[i].dmabuf, &map);
 		}
 		if (buf->dma[i].attach)
 			dmabuf_iova_free(&buf->dma[i]);

@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/ktime.h>
 
+#define MML_MAX_INPUTS		2
 #define MML_MAX_OUTPUTS		2
 #define MML_MAX_PLANES		3
 
@@ -26,6 +27,7 @@ enum mml_mode {
 	MML_MODE_RACING,
 	MML_MODE_MML_DECOUPLE,
 	MML_MODE_MDP_DECOUPLE,
+	MML_MODE_APUDC,		/* APU Direct Couple MML_RDMA */
 
 	/* belows are modes from driver internally */
 	MML_MODE_DDP_ADDON,
@@ -66,7 +68,8 @@ struct mml_pq_config {
 	bool en_hdr:1;
 	bool en_ccorr:1;
 	bool en_dre:1;
-	bool hfg_en:1;
+	bool en_region_pq:1;
+	bool en_clarity:1;
 };
 
 enum mml_pq_enable_flag {
@@ -83,6 +86,8 @@ enum mml_pq_enable_flag {
 	MML_PQ_AI_SCENE_PQ_EN = 1 << 7,
 	MML_PQ_AI_SDR_TO_HDR_EN = 1 << 8,
 	MML_PQ_VIDEO_HDR_EN = 1 << 9,
+	MML_PQ_AI_REGION_EN = 1 << 10,
+	MML_PQ_CLARITY_EN = 1 << 11,
 };
 
 enum mml_gamut {
@@ -107,6 +112,8 @@ enum mml_pq_video_mode {
 	MML_PQ_HDRVIVID,
 	MML_PQ_AISPQ,
 	MML_PQ_AISDR2HDR,
+	MML_PQ_AIREGION,
+	MML_PQ_CCORR,
 };
 
 struct mml_pq_param {
@@ -121,6 +128,8 @@ struct mml_pq_param {
 	uint32_t metadata_mem_id;
 	struct mml_pq_video_param video_param;
 	uint32_t user_info;
+	uint32_t app_hint;
+	uint32_t connector_id;
 };
 
 struct mml_frame_data {
@@ -163,6 +172,7 @@ struct mml_frame_dest {
 
 struct mml_frame_info {
 	struct mml_frame_data src;
+	struct mml_frame_data seg_map;
 	struct mml_frame_dest dest[MML_MAX_OUTPUTS];
 	uint32_t act_time;	/* ns time for mml frame */
 	uint8_t dest_cnt;	/* should be < MML_MAX_OUTPUTS */
@@ -189,6 +199,7 @@ struct mml_buffer {
 
 struct mml_frame_buffer {
 	struct mml_buffer src;
+	struct mml_buffer seg_map;
 	struct mml_buffer dest[MML_MAX_OUTPUTS];
 	uint8_t dest_cnt;
 };
@@ -202,6 +213,7 @@ struct mml_frame_buffer {
  * @info:	Frame configs which not change between frame-to-frame.
  *		MML try to match same info in cache and reuse same commands.
  * @buffer:	Buffer fd and related parameters.
+ * @layer:	Rect on display screen for mml detect layout (left/right pipe).
  * @sec:	End-Time for time value second
  * @usec:	End-Time for time value usecond
  * @pq_param:	PQ parameters pointer. Leave empty also disable PQ.
@@ -213,8 +225,7 @@ struct mml_submit {
 	struct mml_job *job;
 	struct mml_frame_info info;
 	struct mml_frame_buffer buffer;
-	u16 layer_width;
-	u16 layer_height;
+	struct mml_rect layer;
 	struct timeval_t {
 		uint64_t sec;
 		uint64_t nsec;

@@ -67,6 +67,7 @@ struct mml_mutex {
 	struct mml_comp comp;
 	const struct mutex_data *data;
 	bool ddp_bound;
+	atomic_t connect[MML_PIPE_CNT];
 
 	struct mutex_module modules[MML_MAX_COMPONENTS];
 };
@@ -77,7 +78,8 @@ static inline struct mml_mutex *comp_to_mutex(struct mml_comp *comp)
 }
 
 static s32 mutex_enable(struct mml_mutex *mutex, struct cmdq_pkt *pkt,
-			const struct mml_topology_path *path, u32 mutex_sof)
+			const struct mml_topology_path *path, u32 mutex_sof,
+			enum mml_mode mode)
 {
 	const phys_addr_t base_pa = mutex->comp.base_pa;
 	s32 mutex_id = -1;
@@ -92,6 +94,17 @@ static s32 mutex_enable(struct mml_mutex *mutex, struct cmdq_pkt *pkt,
 		if (mod->trigger)
 			mutex_mod[mod->index] |= 1 << mod->field;
 	}
+
+	if (unlikely(mml_wrot_bkgd_en) &&
+		(mode == MML_MODE_RACING || mode == MML_MODE_MML_DECOUPLE)) {
+		u32 comp_id = path->out_engine_ids[0];
+		struct mutex_module *mod = &mutex->modules[comp_id];
+
+		memset(mutex_mod, 0, sizeof(mutex_mod));
+		if (mod->trigger)
+			mutex_mod[mod->index] |= 1 << mod->field;
+	}
+
 	/* TODO: get sof group0 shift from dts */
 	mutex_mod[1] |= 1 << (24 + path->mux_group);
 
@@ -138,7 +151,7 @@ static s32 mutex_trigger(struct mml_comp *comp, struct mml_task *task,
 	const struct mml_topology_path *path = task->config->path[ccfg->pipe];
 	struct cmdq_pkt *pkt = task->pkts[ccfg->pipe];
 
-	return mutex_enable(mutex, pkt, path, 0x0);
+	return mutex_enable(mutex, pkt, path, 0x0, task->config->info.mode);
 }
 
 static const struct mml_comp_config_ops mutex_config_ops = {
@@ -152,15 +165,27 @@ static void mutex_debug_dump(struct mml_comp *comp)
 	u8 i, j;
 
 	mml_err("mutex component %u dump:", comp->id);
-
 	for (i = 0; i < mutex->data->mutex_cnt; i++) {
+		u32 en = readl(base + MUTEX_EN(i));
+		u32 sof = readl(base + MUTEX_SOF(i));
+		u32 mod[MUTEX_MAX_MOD_REGS] = {0};
+		bool used = false;
+
 		for (j = 0; j < mutex->data->mod_cnt; j++) {
 			u32 offset = mutex->data->mod_offsets[j];
-			u32 value;
 
-			value = readl(base + MUTEX_MOD(i, offset));
-			mml_err("MDP_MUTEX%d_MOD%d %#010x",
-			i, j, value);
+			mod[j] = readl(base + MUTEX_MOD(i, offset));
+			if (mod[j])
+				used = true;
+		}
+		if (used) {
+			if (en) {
+				mml_err("MDP_MUTEX%d_EN %#010x", i, en);
+				mml_err("MDP_MUTEX%d_SOF %#010x", i, sof);
+			}
+			for (j = 0; j < mutex->data->mod_cnt; j++)
+				mml_err("MDP_MUTEX%d_MOD%d %#010x",
+					i, j, mod[j]);
 		}
 	}
 }
@@ -261,23 +286,23 @@ static void mutex_addon_config(struct mtk_ddp_comp *ddp_comp,
 	struct mml_mutex *mutex = ddp_comp_to_mutex(ddp_comp);
 	struct mtk_addon_mml_config *cfg = &addon_config->addon_mml_config;
 	const struct mml_topology_path *path;
-	u32 pipe;
 
 	if (!cfg->task) {
 		mml_err("%s cannot configure without mml_task", __func__);
 		return;
 	}
 
-	if (cfg->config_type.module == MML_RSZ_v2)
-		pipe = 1;
-	else
-		pipe = 0;
-	path = cfg->task->config->path[pipe];
+	path = cfg->task->config->path[cfg->pipe];
 
-	if (cfg->config_type.type == ADDON_DISCONNECT)
-		mutex_disable(mutex, pkt, path);
-	else
-		mutex_enable(mutex, pkt, path, get_mutex_sof(&cfg->mutex));
+	if (cfg->config_type.type == ADDON_DISCONNECT) {
+		if (atomic_cmpxchg_acquire(&mutex->connect[cfg->pipe], 1, 0))
+			mutex_disable(mutex, pkt, path);
+		else
+			mml_err("%s disconnect without connect pipe %u", __func__, cfg->pipe);
+	} else {
+		atomic_set(&mutex->connect[cfg->pipe], 1);
+		mutex_enable(mutex, pkt, path, get_mutex_sof(&cfg->mutex), MML_MODE_DDP_ADDON);
+	}
 }
 
 static const struct mtk_ddp_comp_funcs ddp_comp_funcs = {
@@ -403,6 +428,14 @@ const struct of_device_id mml_mutex_driver_dt_match[] = {
 		.compatible = "mediatek,mt6895-mml_mutex",
 		.data = &mt6895_mutex_data
 	},
+	{
+		.compatible = "mediatek,mt6985-mml_mutex",
+		.data = &mt6983_mutex_data,
+	},
+	{
+		.compatible = "mediatek,mt6886-mml_mutex",
+		.data = &mt6895_mutex_data
+	},
 	{},
 };
 MODULE_DEVICE_TABLE(of, mml_mutex_driver_dt_match);
@@ -451,11 +484,11 @@ static s32 dbg_get(char *buf, const struct kernel_param *kp)
 			struct mml_comp *comp = &dbg_probed_components[i]->comp;
 
 			length += snprintf(buf + length, PAGE_SIZE - length,
-				"  - [%d] mml comp_id: %d.%d @%08x name: %s bound: %d\n", i,
+				"  - [%d] mml comp_id: %d.%d @%llx name: %s bound: %d\n", i,
 				comp->id, comp->sub_idx, comp->base_pa,
 				comp->name ? comp->name : "(null)", comp->bound);
 			length += snprintf(buf + length, PAGE_SIZE - length,
-				"  -         larb_port: %d @%08x pw: %d clk: %d\n",
+				"  -         larb_port: %d @%llx pw: %d clk: %d\n",
 				comp->larb_port, comp->larb_base,
 				comp->pw_cnt, comp->clk_cnt);
 			length += snprintf(buf + length, PAGE_SIZE - length,

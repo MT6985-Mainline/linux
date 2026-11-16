@@ -15,6 +15,7 @@
 struct mml_dle_ctx;
 struct mml_task;
 struct mml_comp;
+struct mml_dev;
 
 struct mml_dle_param {
 	/* [in]set true if direct-link uses dual pipe */
@@ -23,6 +24,20 @@ struct mml_dle_param {
 	/* config done callback api */
 	void (*config_cb)(struct mml_task *task, void *cb_param);
 };
+
+struct mml_dle_frame_info {
+	struct mml_rect dl_out[MML_DL_OUT_CNT];
+};
+
+/*
+ * mml_dle_ctx_create - Create dle context structure
+ *
+ * @mml:	The mml driver device context.
+ *
+ * Return:	The dle context pointer to represent mml driver instance.
+ *
+ */
+struct mml_dle_ctx *mml_dle_ctx_create(struct mml_dev *mml);
 
 /*
  * mml_dle_get_context - Get mml dle context to configure mml.
@@ -50,12 +65,13 @@ void mml_dle_put_context(struct mml_dle_ctx *ctx);
  *
  * @ctx:	Context of mml dle adaptor. Get by mml_dle_get_context API.
  * @submit:	Frame info which want mml driver to configure.
+ * @dle_info:	Extra dle frame info.
  * @cb_param:	The parameter used in config done callback (if registered).
  *
  * Return:	Result of config. In value < 0 case job was not configured.
  */
 s32 mml_dle_config(struct mml_dle_ctx *ctx, struct mml_submit *submit,
-	void *cb_param);
+		   struct mml_dle_frame_info *dle_info, void *cb_param);
 
 /*
  * mml_dle_start - tell mml dle to start hw task

@@ -130,13 +130,14 @@ ISP_TILE_MESSAGE_ENUM tile_convert_func(TILE_REG_MAP_STRUCT *ptr_tile_reg_map,
 		memset(ptr_func, 0x0, sizeof(*ptr_func));
 
 		ptr_func->func_num = node->id;
-		sprintf(ptr_func->func_name, "%d", node->id);
+		snprintf(ptr_func->func_name, sizeof(ptr_func->func_name),
+			 "%d %s", node->id, node->comp->name);
 		ptr_func->run_mode = TILE_RUN_MODE_MAIN;
 		ptr_func->enable_flag = true;
 
 		ptr_func->tot_prev_num = 1;
-		if (node->prev)
-			ptr_func->last_func_num[0] = node->prev->id;
+		if (node->prev[0])
+			ptr_func->last_func_num[0] = node->prev[0]->id;
 		else
 			ptr_func->last_func_num[0] = LAST_MODULE_ID_OF_START;
 
@@ -8002,3 +8003,4 @@ static ISP_TILE_MESSAGE_ENUM tile_check_y_end_pos_with_flag(
 	}
     return result;
 }
+

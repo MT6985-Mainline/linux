@@ -720,7 +720,7 @@ static __init int mml_topology_ip_init(void)
 {
 	return mml_topology_register_ip(TOPOLOGY_PLATFORM, &tp_ops_mt6983);
 }
-module_init(mml_topology_ip_init);
+subsys_initcall(mml_topology_ip_init);
 
 static __exit void mml_topology_ip_exit(void)
 {

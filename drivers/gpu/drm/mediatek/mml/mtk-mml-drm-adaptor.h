@@ -19,6 +19,23 @@ struct cmdq_pkt;
 #define MML_DEFAULT_PANEL_PX	(1080 * 2412)
 #define MML_HRT_FPS		120
 
+enum mml_query_mode_reason {
+	mml_query_default,
+	mml_query_userdc,
+	mml_query_norsz,
+	mml_query_sec,
+	mml_query_pqen,
+	mml_query_2out,
+	mml_query_opp_out,
+	mml_query_acttime,
+	mml_query_rot,
+	mml_query_highpixel,
+	mml_query_lowpixel,
+	mml_query_outwidth,
+	mml_query_rszratio,
+	mml_query_apudc,
+};
+
 struct mml_drm_param {
 	/* [in]set true if display uses dual pipe */
 	bool dual;
@@ -28,6 +45,18 @@ struct mml_drm_param {
 
 	/* submit done callback api */
 	void (*submit_cb)(void *cb_param);
+
+	/* ddren callback api */
+	void (*ddren_cb)(struct cmdq_pkt *pkt, bool enable, void *ddren_param);
+
+	/* parameter send back to ddren_cb */
+	void *ddren_param;
+
+	/* dispen callback api, helps mml driver turn on dispsys clock */
+	void (*dispen_cb)(bool enable, void *dispen_param);
+
+	/* parameter send back to ddren_cb */
+	void *dispen_param;
 
 	/* [out]The height of racing mode for each output tile in pixel. */
 	u8 racing_height;

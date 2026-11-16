@@ -5,6 +5,7 @@
  */
 
 #include <linux/component.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
@@ -14,6 +15,8 @@
 #include "mtk-mml-core.h"
 #include "mtk-mml-driver.h"
 #include "mtk-mml-dle-adaptor.h"
+#include "mtk-mml-mmp.h"
+#include "mtk-mml-sys.h"
 
 #include "tile_driver.h"
 #include "mtk-mml-tile.h"
@@ -22,12 +25,13 @@
 #define SYS_MISC_REG		0x0f0
 #define SYS_SW0_RST_B_REG	0x700
 #define SYS_SW1_RST_B_REG	0x704
-#define SYS_AID_SEL		0xfa8
+#define SYS_AID_SEL		0xfa8	/* only for mt6983/mt6895 */
 
-#define MML_MAX_SYS_COMPONENTS	10
+#define MML_MAX_SYS_COMPONENTS	16
 #define MML_MAX_SYS_MUX_PINS	88
-#define MML_MAX_SYS_DL_RELAYS	4
-#define MML_MAX_SYS_DBG_REGS	60
+#define MML_MAX_SYS_DL_RELAYS	7
+#define MML_MAX_SYS_DBG_REGS	75
+#define MML_MAX_AID_COMPS	8
 
 int mml_ir_loop = 1;
 module_param(mml_ir_loop, int, 0644);
@@ -35,13 +39,20 @@ module_param(mml_ir_loop, int, 0644);
 int mml_racing_sleep = 16000;
 module_param(mml_racing_sleep, int, 0644);
 
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+int mml_ddp_dump = 1;
+module_param(mml_ddp_dump, int, 0644);
+
+int mml_dle_delay;
+module_param(mml_dle_delay, int, 0644);
+#endif
+
 enum mml_comp_type {
 	MML_CT_COMPONENT = 0,
 	MML_CT_SYS,
 	MML_CT_PATH,
 	MML_CT_DL_IN,
 	MML_CT_DL_OUT,
-
 	MML_COMP_TYPE_TOTAL
 };
 
@@ -51,7 +62,10 @@ struct mml_data {
 	int (*comp_inits[MML_COMP_TYPE_TOTAL])(struct device *dev,
 		struct mml_sys *sys, struct mml_comp *comp);
 	const struct mtk_ddp_comp_funcs *ddp_comp_funcs[MML_COMP_TYPE_TOTAL];
+	void (*aid_sel)(struct mml_comp *comp, struct mml_task *task,
+		struct mml_comp_config *ccfg);
 	u8 gpr[MML_PIPE_CNT];
+	bool use_aidsel_engine;
 };
 
 enum mml_mux_type {
@@ -122,6 +136,7 @@ struct mml_sys {
 	u32 dbg_reg_cnt;
 
 	/* store the bit to enable aid_sel for specific component */
+	u16 aid_sel_regs[MML_MAX_AID_COMPS];
 	u8 aid_sel[MML_MAX_COMPONENTS];
 
 	/* register for racing mode select ready signal */
@@ -131,14 +146,19 @@ struct mml_sys {
 	struct device *master;
 	/* adaptor for display addon config */
 	struct mml_dle_ctx *dle_ctx;
+	struct mml_dle_param dle_param;
 	/* addon status */
-	bool ddp_connected[MML_PIPE_CNT];
+	const struct mml_topology_path *ddp_path[MML_PIPE_CNT];
 
 	/* racing mode pipe sync event */
 	u16 event_racing_pipe0;
 	u16 event_racing_pipe1;
 	u16 event_racing_pipe1_next;
-	u16 event_ir_eof;
+
+#ifndef MML_FPGA
+	/* for config sspm aid */
+	void *mml_scmi;
+#endif
 };
 
 struct sys_frame_data {
@@ -193,13 +213,17 @@ static void sys_sync_racing(struct mml_comp *comp, struct mml_task *task,
 {
 	struct mml_dev *mml = task->config->mml;
 	struct cmdq_pkt *pkt = task->pkts[ccfg->pipe];
+	struct mml_frame_config *cfg = task->config;
 
 	/* synchronize disp and mml task by for MML pkt:
 	 *	set MML_READY
 	 *	wait_and_clear DISP_READY
 	 */
-	cmdq_pkt_set_event(pkt, mml_ir_get_mml_ready_event(mml));
+	if (cfg->disp_vdo)
+		cmdq_pkt_set_event(pkt, mml_ir_get_mml_ready_event(mml));
 	cmdq_pkt_wfe(pkt, mml_ir_get_disp_ready_event(mml));
+	if (cfg->disp_vdo)
+		cmdq_pkt_clear_event(pkt, mml_ir_get_target_event(mml));
 }
 
 static void sys_config_frame_racing(struct mml_comp *comp, struct mml_task *task,
@@ -239,11 +263,7 @@ static s32 sys_config_frame(struct mml_comp *comp, struct mml_task *task,
 {
 	struct mml_sys *sys = comp_to_sys(comp);
 	struct mml_frame_config *cfg = task->config;
-	const struct mml_topology_path *path = cfg->path[ccfg->pipe];
 	struct cmdq_pkt *pkt = task->pkts[ccfg->pipe];
-	u32 aid_sel = 0, mask = 0;
-	u32 in_engine_id = path->nodes[path->tile_engines[0]].comp->id;
-	u32 i;
 
 	if (cfg->info.mode == MML_MODE_RACING) {
 		sys_config_frame_racing(comp, task, ccfg);
@@ -252,9 +272,32 @@ static s32 sys_config_frame(struct mml_comp *comp, struct mml_task *task,
 		cmdq_pkt_write(pkt, NULL, comp->base_pa + SYS_MISC_REG, 0, 0x80000000);
 	}
 
+	/* config aid sel by platform */
+	sys->data->aid_sel(comp, task, ccfg);
+
+	return 0;
+}
+
+static void sys_config_aid_sel(struct mml_comp *comp, struct mml_task *task,
+			       struct mml_comp_config *ccfg)
+{
+	struct mml_sys *sys = comp_to_sys(comp);
+	struct mml_frame_config *cfg = task->config;
+	struct cmdq_pkt *pkt = task->pkts[ccfg->pipe];
+	const struct mml_topology_path *path = cfg->path[ccfg->pipe];
+	u32 aid_sel = 0, mask = 0;
+	u32 in_engine_id = path->nodes[path->tile_engines[0]].comp->id;
+	u32 i;
+
 	if (cfg->info.src.secure)
 		aid_sel |= 1 << sys->aid_sel[in_engine_id];
 	mask |= 1 << sys->aid_sel[in_engine_id];
+
+	if (cfg->info.dest[0].pq_config.en_region_pq &&
+	    cfg->info.seg_map.secure)
+		aid_sel |= 1 << sys->aid_sel[path->pq_rdma_id];
+	mask |= 1 << sys->aid_sel[path->pq_rdma_id];
+
 	for (i = 0; i < cfg->info.dest_cnt; i++) {
 		if (!path->out_engine_ids[i])
 			continue;
@@ -263,8 +306,37 @@ static s32 sys_config_frame(struct mml_comp *comp, struct mml_task *task,
 		mask |= 1 << sys->aid_sel[path->out_engine_ids[i]];
 	}
 	cmdq_pkt_write(pkt, NULL, comp->base_pa + SYS_AID_SEL, aid_sel, mask);
+}
 
-	return 0;
+static void sys_config_aid_sel_engine(struct mml_comp *comp, struct mml_task *task,
+				      struct mml_comp_config *ccfg)
+{
+	struct mml_sys *sys = comp_to_sys(comp);
+	struct mml_frame_config *cfg = task->config;
+	struct cmdq_pkt *pkt = task->pkts[ccfg->pipe];
+	const struct mml_topology_path *path = cfg->path[ccfg->pipe];
+	u32 in_engine_id = path->nodes[path->tile_engines[0]].comp->id;
+	u32 i, ca_idx;
+
+	ca_idx = sys->aid_sel[in_engine_id];
+	cmdq_pkt_write(pkt, NULL, comp->base_pa + sys->aid_sel_regs[ca_idx],
+		cfg->info.src.secure, U32_MAX);
+
+	if (cfg->info.dest[0].pq_config.en_region_pq) {
+		ca_idx = sys->aid_sel[path->pq_rdma_id];
+		cmdq_pkt_write(pkt, NULL, comp->base_pa + sys->aid_sel_regs[ca_idx],
+			cfg->info.seg_map.secure, U32_MAX);
+	}
+
+	for (i = 0; i < cfg->info.dest_cnt; i++) {
+		/* comp to aid sel idx */
+		ca_idx = sys->aid_sel[path->out_engine_ids[i]];
+		/* Note here write all 32bits since bit 31:1 are ignore,
+		 * and mask costs more time and instruction.
+		 */
+		cmdq_pkt_write(pkt, NULL, comp->base_pa + sys->aid_sel_regs[ca_idx],
+			cfg->info.dest[i].data.secure, U32_MAX);
+	}
 }
 
 static void config_mux(struct mml_sys *sys, struct cmdq_pkt *pkt,
@@ -428,6 +500,8 @@ static void sys_racing_loop(struct mml_comp *comp, struct mml_task *task,
 	struct cmdq_pkt *pkt = task->pkts[ccfg->pipe];
 	struct sys_frame_data *sys_frm = sys_frm_data(ccfg);
 	struct cmdq_operand lhs, rhs;
+	struct mml_frame_config *cfg = task->config;
+	u16 event_ir_eof = mml_ir_get_target_event(cfg->mml);
 
 	if (unlikely(mml_racing_ut == 1))
 		return;
@@ -437,14 +511,13 @@ static void sys_racing_loop(struct mml_comp *comp, struct mml_task *task,
 			sys->data->gpr[ccfg->pipe]);
 
 	/* do eoc to avoid task timeout during self-loop */
-	if (likely(!mml_racing_timeout) && likely(!mml_racing_wdone_eoc))
-		cmdq_pkt_eoc(pkt, false);
+	cmdq_pkt_eoc(pkt, false);
 
 	/* wait display frame done before checking next, so disp driver has
 	 * chance to tell mml to entering next task.
 	 */
-	if (task->config->disp_vdo)
-		cmdq_pkt_wfe(task->pkts[0], sys->event_ir_eof);
+	if (cfg->disp_vdo && event_ir_eof)
+		cmdq_pkt_wfe(task->pkts[0], event_ir_eof);
 
 	/* reserve assign inst for jump addr */
 	cmdq_pkt_assign_command(pkt, CMDQ_THR_SPR_IDX0, 0);
@@ -487,8 +560,7 @@ static void sys_racing_loop_pipe1(struct mml_comp *comp, struct mml_task *task,
 	struct cmdq_operand lhs, rhs;
 
 	/* do eoc to avoid task timeout during self-loop */
-	if (likely(!mml_racing_timeout) && likely(!mml_racing_wdone_eoc))
-		cmdq_pkt_eoc(pkt, false);
+	cmdq_pkt_eoc(pkt, false);
 
 	/* reserve assign inst for jump addr */
 	cmdq_pkt_assign_command(pkt, CMDQ_THR_SPR_IDX0, 0);
@@ -583,11 +655,13 @@ static void sys_reset(struct mml_comp *comp, struct mml_frame_config *cfg, u32 p
 
 	if (cfg->info.mode == MML_MODE_RACING) {
 		struct mml_sys *sys = comp_to_sys(comp);
+		u16 event_ir_eof = mml_ir_get_target_event(cfg->mml);
 
 		cmdq_clear_event(path->clt->chan, sys->event_racing_pipe0);
 		cmdq_clear_event(path->clt->chan, sys->event_racing_pipe1);
 		cmdq_clear_event(path->clt->chan, sys->event_racing_pipe1_next);
-		cmdq_clear_event(path->clt->chan, sys->event_ir_eof);
+		if (event_ir_eof)
+			cmdq_clear_event(path->clt->chan, event_ir_eof);
 	}
 }
 
@@ -595,6 +669,59 @@ static const struct mml_comp_debug_ops sys_debug_ops = {
 	.dump = &sys_debug_dump,
 	.reset = &sys_reset,
 };
+
+static s32 mml_comp_clk_aid_enable(struct mml_comp *comp)
+{
+	struct mml_sys *sys = comp_to_sys(comp);
+	s32 ret = mml_comp_clk_enable(comp);
+
+	if (ret < 0)
+		return ret;
+
+	if (comp->clk_cnt == 1)
+		mml_set_uid(&sys->mml_scmi);
+
+	return 0;
+}
+
+static s32 mml_sys_comp_clk_enable(struct mml_comp *comp)
+{
+	int ret;
+
+	/* original clk enable */
+	ret = mml_comp_clk_aid_enable(comp);
+	if (ret < 0)
+		return ret;
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	mml_update_comp_status(mml_mon_mmlsys, 1);
+#endif
+
+	return 0;
+}
+
+static s32 mml_sys_comp_clk_disable(struct mml_comp *comp)
+{
+	int ret;
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	mml_update_comp_status(mml_mon_mmlsys, 0);
+#endif
+
+	/* original clk enable */
+	ret = mml_comp_clk_disable(comp);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+#ifndef MML_FPGA
+static const struct mml_comp_hw_ops sys_hw_ops_aid = {
+	.clk_enable = &mml_sys_comp_clk_enable,
+	.clk_disable = &mml_sys_comp_clk_disable,
+};
+#endif
 
 static int sys_comp_init(struct device *dev, struct mml_sys *sys,
 			 struct mml_comp *comp)
@@ -634,8 +761,8 @@ static int sys_comp_init(struct device *dev, struct mml_sys *sys,
 
 	/* Initialize dbg-regs */
 	i = 0;
-	while (of_property_read_u32_index(node, "dbg-reg-offsets", i, &value) == 0) {
-		if (i > MML_MAX_SYS_DBG_REGS) {
+	of_property_for_each_u32(node, "dbg-reg-offsets", value) {
+		if (i >= MML_MAX_SYS_DBG_REGS) {
 			dev_err(dev, "no dbg-reg-offsets or out of size in component %s: %d\n",
 				node->full_name, i);
 				return -EINVAL;
@@ -656,22 +783,52 @@ static int sys_comp_init(struct device *dev, struct mml_sys *sys,
 		i++;
 	}
 
-	cnt = of_property_count_u32_elems(node, "aid-sel");
-	for (i = 0; i + 1 < cnt; i += 2) {
-		of_property_read_u32_index(node, "aid-sel", i, &comp_id);
-		of_property_read_u32_index(node, "aid-sel", i + 1, &value);
-		if (comp_id >= MML_MAX_COMPONENTS) {
-			dev_err(dev, "component id %u is larger than max:%d\n",
-				comp_id, MML_MAX_COMPONENTS);
-			return -EINVAL;
+	if (sys->data->use_aidsel_engine) {
+		cnt = of_property_count_u32_elems(node, "aid-sel-engine");
+		if (cnt / 2 > MML_MAX_AID_COMPS) {
+			mml_err("count of aid-sel-engine %u more max aid comps",
+				cnt);
+			cnt = MML_MAX_AID_COMPS * 2;
 		}
-		sys->aid_sel[comp_id] = (u8)value;
+		for (i = 0; i + 1 < cnt; i += 2) {
+			of_property_read_u32_index(node, "aid-sel-engine", i, &comp_id);
+			of_property_read_u32_index(node, "aid-sel-engine", i + 1, &value);
+			if (comp_id >= MML_MAX_COMPONENTS) {
+				dev_err(dev, "component id %u is larger than max:%d\n",
+					comp_id, MML_MAX_COMPONENTS);
+				return -EINVAL;
+			}
+			sys->aid_sel[comp_id] = (u8)i / 2;
+			sys->aid_sel_regs[i / 2] = (u16)value;
+		}
+	} else {
+		cnt = of_property_count_u32_elems(node, "aid-sel");
+		for (i = 0; i + 1 < cnt; i += 2) {
+			of_property_read_u32_index(node, "aid-sel", i, &comp_id);
+			of_property_read_u32_index(node, "aid-sel", i + 1, &value);
+			if (comp_id >= MML_MAX_COMPONENTS) {
+				dev_err(dev, "component id %u is larger than max:%d\n",
+					comp_id, MML_MAX_COMPONENTS);
+				return -EINVAL;
+			}
+			sys->aid_sel[comp_id] = (u8)value;
+		}
 	}
 
 	of_property_read_u16(dev->of_node, "ready-sel", &sys->inline_ready_sel);
 
 	comp->config_ops = &sys_config_ops;
 	comp->debug_ops = &sys_debug_ops;
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	mml_init_swpm_comp(mml_mon_mmlsys, comp);
+#endif
+
+#ifndef MML_FPGA
+	/* scmi(sspm) config aid/uid support */
+	if (of_property_read_bool(dev->of_node, "sspm-aid-enable"))
+		comp->hw_ops = &sys_hw_ops_aid;
+#endif
 	return 0;
 }
 
@@ -683,14 +840,14 @@ static void sys_config_done_cb(struct mml_task *task, void *cb_param)
 	mml_msg("%s mml task:%p", __func__, cfg->task);
 }
 
-static struct mml_dle_ctx *sys_get_dle_ctx(struct mml_sys *sys)
+static struct mml_dle_ctx *sys_get_dle_ctx(struct mml_sys *sys,
+					   struct mml_dle_param *dl)
 {
-	struct mml_dle_param dl;
-
-	if (!sys->dle_ctx) {
-		dl.dual = false;
-		dl.config_cb = sys_config_done_cb;
-		sys->dle_ctx = mml_dle_get_context(sys->master, &dl);
+	if (dl && (IS_ERR_OR_NULL(sys->dle_ctx) ||
+	    memcmp(&sys->dle_param, dl, sizeof(*dl)))) {
+		mml_dle_put_context(sys->dle_ctx);
+		sys->dle_ctx = mml_dle_get_context(sys->master, dl);
+		sys->dle_param = *dl;
 	}
 	return sys->dle_ctx;
 }
@@ -712,6 +869,7 @@ static void ddp_command_make(struct mml_task *task, u32 pipe,
 	struct mml_comp *comp;
 	u32 i;
 
+	/* borrow task pkt pointer */
 	task->pkts[pipe] = pkt;
 
 	/* call all component init and frame op, include mmlsys and mutex */
@@ -727,6 +885,68 @@ static void ddp_command_make(struct mml_task *task, u32 pipe,
 		comp = path->nodes[i].comp;
 		call_cfg_op(comp, tile, task, &ccfg[i], 0);
 	}
+
+	for (i = 0; i < path->node_cnt; i++) {
+		comp = path->nodes[i].comp;
+		call_cfg_op(comp, post, task, &ccfg[i]);
+	}
+
+	/* return task pkt pointer */
+	task->pkts[pipe] = NULL;
+}
+
+static void sys_ddp_disable_locked(struct mml_sys *sys, u32 pipe)
+{
+	const struct mml_topology_path *path = sys->ddp_path[pipe];
+	struct mml_comp *comp;
+	u32 i;
+
+	mml_trace_ex_begin("%s_%s_%u", __func__, "clk", pipe);
+	for (i = 0; i < path->node_cnt; i++) {
+		if (i == path->mmlsys_idx || i == path->mutex_idx)
+			continue;
+		comp = path->nodes[i].comp;
+		call_hw_op(comp, clk_disable);
+	}
+
+	if (path->mutex)
+		call_hw_op(path->mutex, clk_disable);
+	if (path->mmlsys)
+		call_hw_op(path->mmlsys, clk_disable);
+	mml_trace_ex_end();
+
+	mml_trace_ex_begin("%s_%s_%u", __func__, "pw", pipe);
+	for (i = 0; i < path->node_cnt; i++) {
+		comp = path->nodes[i].comp;
+		call_hw_op(comp, pw_disable);
+	}
+	mml_trace_ex_end();
+}
+
+static void sys_ddp_disable(struct mml_sys *sys, struct mml_task *task, u32 pipe)
+{
+	const struct mml_topology_path *path = task->config->path[pipe];
+
+	mml_clock_lock(task->config->mml);
+
+	/* path disconnected */
+	if (!sys->ddp_path[pipe])
+		goto disabled;
+	/* check task path */
+	if (path != sys->ddp_path[pipe])
+		mml_log("[warn]%s task path found %p was not path connected %p",
+			__func__, path, sys->ddp_path[pipe]);
+
+	if (task->pipe[pipe].en.clk) {
+		sys_ddp_disable_locked(sys, pipe);
+		task->pipe[pipe].en.clk = false;
+	}
+	sys->ddp_path[pipe] = NULL;
+
+disabled:
+	mml_clock_unlock(task->config->mml);
+
+	mml_msg("%s task %p pipe %u", __func__, task, pipe);
 }
 
 static void sys_ddp_enable(struct mml_sys *sys, struct mml_task *task, u32 pipe)
@@ -739,9 +959,9 @@ static void sys_ddp_enable(struct mml_sys *sys, struct mml_task *task, u32 pipe)
 
 	mml_clock_lock(task->config->mml);
 
-	if (sys->ddp_connected[pipe])
+	/* path connected */
+	if (path == sys->ddp_path[pipe])
 		goto enabled;
-	sys->ddp_connected[pipe] = true;
 
 	mml_trace_ex_begin("%s_%s_%u", __func__, "pw", pipe);
 	for (i = 0; i < path->node_cnt; i++) {
@@ -764,49 +984,18 @@ static void sys_ddp_enable(struct mml_sys *sys, struct mml_task *task, u32 pipe)
 	}
 	mml_trace_ex_end();
 
+	/* disable old path */
+	if (sys->ddp_path[pipe])
+		sys_ddp_disable_locked(sys, pipe);
+	sys->ddp_path[pipe] = path;
+
+#ifndef MML_FPGA
 	cmdq_util_prebuilt_init(CMDQ_PREBUILT_MML);
+#endif
 
 enabled:
+	task->pipe[pipe].en.clk = true;
 	mml_clock_unlock(task->config->mml);
-}
-
-static void sys_ddp_disable(struct mml_sys *sys, struct mml_task *task, u32 pipe)
-{
-	const struct mml_topology_path *path = task->config->path[pipe];
-	struct mml_comp *comp;
-	u32 i;
-
-	mml_clock_lock(task->config->mml);
-
-	if (!sys->ddp_connected[pipe])
-		goto disabled;
-	sys->ddp_connected[pipe] = false;
-
-	mml_trace_ex_begin("%s_%s_%u", __func__, "clk", pipe);
-	for (i = 0; i < path->node_cnt; i++) {
-		if (i == path->mmlsys_idx || i == path->mutex_idx)
-			continue;
-		comp = path->nodes[i].comp;
-		call_hw_op(comp, clk_disable);
-	}
-
-	if (path->mutex)
-		call_hw_op(path->mutex, clk_disable);
-	if (path->mmlsys)
-		call_hw_op(path->mmlsys, clk_disable);
-	mml_trace_ex_end();
-
-	mml_trace_ex_begin("%s_%s_%u", __func__, "pw", pipe);
-	for (i = 0; i < path->node_cnt; i++) {
-		comp = path->nodes[i].comp;
-		call_hw_op(comp, pw_disable);
-	}
-	mml_trace_ex_end();
-
-disabled:
-	mml_clock_unlock(task->config->mml);
-
-	mml_msg("%s task %p pipe %u", __func__, task, pipe);
 }
 
 static const struct mml_submit bypass_submit = {
@@ -843,63 +1032,144 @@ static const struct mml_submit bypass_submit = {
 	},
 };
 
-static void sys_addon_connect(struct mml_sys *sys,
-			      struct mtk_addon_mml_config *cfg,
-			      struct cmdq_pkt *pkt)
+static void sys_mml_calc_cfg(struct mtk_ddp_comp *ddp_comp,
+			     union mtk_addon_config *addon_config,
+			     struct cmdq_pkt *pkt)
 {
+	struct mml_sys *sys = ddp_comp_to_sys(ddp_comp);
+	struct mtk_addon_mml_config *cfg = &addon_config->addon_mml_config;
 	struct mml_dle_ctx *ctx;
-	u32 pipe;
+	struct mml_dle_param dl;
+	struct mml_dle_frame_info info = {0};
+	struct mml_tile_output **outputs;
+	struct mml_frame_config *frame_cfg;
+	s32 i, pipe_cnt = cfg->dual ? 2 : 1;
 	s32 ret;
+	u32 src_offset, sz = 0;
+	char frame[64];
 
-	if (!cfg->submit.info.src.width) {
+	mml_msg("%s module:%d", __func__, cfg->config_type.module);
+
+	mml_mmp(addon_mml_calc_cfg, MMPROFILE_FLAG_PULSE, 0, 0);
+
+	if (!cfg->submit.info.src.width ||
+	    (cfg->submit.info.dest[0].pq_config.en_region_pq &&
+	    !cfg->submit.info.seg_map.width)) {
 		/* set test submit */
 		cfg->submit = bypass_submit;
 	}
 
-	if (cfg->config_type.module == MML_RSZ_v2) {
-		pipe = 1;
-	} else {
-		pipe = 0;
-
-		ctx = sys_get_dle_ctx(sys);
-		if (IS_ERR(ctx)) {
-			mml_err("fail to get mml ctx for addon config");
-			return;
-		}
-
-		ret = mml_dle_config(ctx, &cfg->submit, cfg);
-		if (ret) {
-			mml_err("%s config fail", __func__);
-			return;
-		}
-	}
-
-	/* wait submit_done */
-	if (!cfg->task || !cfg->task->config->tile_output[pipe]) {
-		mml_err("%s no tile for task %p pipe %u", __func__,
-			cfg->task, pipe);
+	dl.dual = cfg->dual;
+	dl.config_cb = sys_config_done_cb;
+	ctx = sys_get_dle_ctx(sys, &dl);
+	if (IS_ERR(ctx)) {
+		mml_err("%s fail to get mml ctx", __func__);
 		return;
 	}
 
-	ddp_command_make(cfg->task, pipe, pkt);
+	for (i = 0; i < pipe_cnt; i++) {
+		info.dl_out[i].left = cfg->mml_dst_roi[i].x;
+		info.dl_out[i].top = cfg->mml_dst_roi[i].y;
+		info.dl_out[i].width = cfg->mml_dst_roi[i].width;
+		info.dl_out[i].height = cfg->mml_dst_roi[i].height;
+	}
 
-	sys_ddp_enable(sys, cfg->task, pipe);
+	mml_mmp(addon_dle_config, MMPROFILE_FLAG_START, 0, 0);
+	ret = mml_dle_config(ctx, &cfg->submit, &info, cfg);
+	mml_mmp(addon_dle_config, MMPROFILE_FLAG_END, 0, 0);
+	if (ret) {
+		mml_err("%s config fail", __func__);
+		return;
+	}
+
+	/* wait submit_done */
+	if (unlikely(pipe_cnt <= 0)) {
+		mml_err("%s pipe_cnt <=0 %d", __func__, pipe_cnt);
+		return;
+	}
+	if (!cfg->task || !cfg->task->config->tile_output[pipe_cnt - 1]) {
+		mml_err("%s no tiles for task %p pipe_cnt %d", __func__,
+			cfg->task, pipe_cnt);
+		/* avoid disp exception */
+		for (i = 0; i < pipe_cnt; i++)
+			cfg->mml_src_roi[i] = cfg->mml_dst_roi[i];
+		return;
+	}
+
+	frame_cfg = cfg->task->config;
+	outputs = cfg->task->config->tile_output;
+	src_offset = cfg->submit.info.dest[0].crop.r.left;
+	for (i = 0; i < pipe_cnt; i++) {
+		cfg->mml_src_roi[i].x = outputs[i]->src_crop.left + src_offset;
+		cfg->mml_src_roi[i].y = outputs[i]->src_crop.top;
+		cfg->mml_src_roi[i].width = outputs[i]->src_crop.width;
+		cfg->mml_src_roi[i].height = outputs[i]->src_crop.height;
+
+		mml_mmp2(addon_dle_config, MMPROFILE_FLAG_PULSE,
+			cfg->mml_src_roi[i].x,
+			cfg->mml_src_roi[i].y,
+			cfg->mml_src_roi[i].width,
+			cfg->mml_src_roi[i].height);
+
+		if (frame_cfg->dl_in[i].width || frame_cfg->dl_in[i].height)
+			continue;
+
+		frame_cfg->dl_in[i] = outputs[i]->src_crop;
+		frame_cfg->dl_in[i].left = cfg->mml_src_roi[i].x;
+
+		if (sz >= sizeof(frame))
+			continue;
+
+		ret = snprintf(&frame[sz], sizeof(frame) - sz,
+			" %u:(%u, %u, %u, %u)",
+			i,
+			frame_cfg->dl_in[i].left,
+			frame_cfg->dl_in[i].top,
+			frame_cfg->dl_in[i].width,
+			frame_cfg->dl_in[i].height);
+		if (ret > 0)
+			sz += ret;
+	}
+
+	if (sz)
+		mml_log("dl_in%s left offset %u", frame, src_offset);
+}
+
+static void sys_addon_connect(struct mml_sys *sys,
+			      struct mtk_addon_mml_config *cfg,
+			      struct cmdq_pkt *pkt)
+{
+	if (!cfg->task || !cfg->task->config->tile_output[cfg->pipe]) {
+		mml_err("%s no tile for task %p pipe %u", __func__,
+			cfg->task, cfg->pipe);
+		return;
+	}
+
+	if (cfg->task->err) {
+		mml_err("%s tile error stop make command task %p pipe %u",
+			__func__, cfg->task, cfg->pipe);
+		return;
+	}
+
+	ddp_command_make(cfg->task, cfg->pipe, pkt);
+
+	sys_ddp_enable(sys, cfg->task, cfg->pipe);
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	if (mml_dle_delay)
+		usleep_range(mml_dle_delay, mml_dle_delay + 10);
+#endif
 }
 
 static void sys_addon_disconnect(struct mml_sys *sys,
 				 struct mtk_addon_mml_config *cfg)
 {
 	struct mml_dle_ctx *ctx;
-	u32 pipe;
 
-	if (cfg->config_type.module == MML_RSZ_v2) {
-		pipe = 1;
-	} else {
-		pipe = 0;
-
-		ctx = sys_get_dle_ctx(sys);
-		if (IS_ERR(ctx)) {
-			mml_err("fail to get mml ctx for addon config");
+	if (cfg->pipe == 0) {
+		ctx = sys_get_dle_ctx(sys, NULL);
+		if (IS_ERR_OR_NULL(ctx)) {
+			mml_err("%s fail to get mml ctx", __func__);
 			return;
 		}
 
@@ -910,9 +1180,9 @@ static void sys_addon_disconnect(struct mml_sys *sys,
 		}
 	}
 
-	if (!cfg->task || !cfg->task->config->path[pipe]) {
+	if (!cfg->task || !cfg->task->config->path[cfg->pipe]) {
 		mml_err("%s no path for task %p pipe %u", __func__,
-			cfg->task, pipe);
+			cfg->task, cfg->pipe);
 		return;
 	}
 
@@ -928,7 +1198,9 @@ static void sys_addon_config(struct mtk_ddp_comp *ddp_comp,
 	struct mml_sys *sys = ddp_comp_to_sys(ddp_comp);
 	struct mtk_addon_mml_config *cfg = &addon_config->addon_mml_config;
 
-	mml_msg("%s %d", __func__, cfg->config_type.type);
+	mml_mmp(addon_addon_config, MMPROFILE_FLAG_PULSE, cfg->config_type.type, 0);
+
+	mml_msg("%s type:%d", __func__, cfg->config_type.type);
 	if (cfg->config_type.type == ADDON_DISCONNECT)
 		sys_addon_disconnect(sys, cfg);
 	else
@@ -938,11 +1210,12 @@ static void sys_addon_config(struct mtk_ddp_comp *ddp_comp,
 static void sys_start(struct mtk_ddp_comp *ddp_comp, struct cmdq_pkt *pkt)
 {
 	struct mml_sys *sys = ddp_comp_to_sys(ddp_comp);
-	struct mml_dle_ctx *ctx;
+	struct mml_dle_ctx *ctx = sys_get_dle_ctx(sys, NULL);
 
-	ctx = sys_get_dle_ctx(sys);
-	if (IS_ERR(ctx)) {
-		mml_err("fail to get mml ctx for addon config");
+	mml_mmp(addon_start, MMPROFILE_FLAG_PULSE, 0, 0);
+
+	if (IS_ERR_OR_NULL(ctx)) {
+		mml_err("%s fail to get mml ctx", __func__);
 		return;
 	}
 
@@ -952,12 +1225,13 @@ static void sys_start(struct mtk_ddp_comp *ddp_comp, struct cmdq_pkt *pkt)
 static void sys_unprepare(struct mtk_ddp_comp *ddp_comp)
 {
 	struct mml_sys *sys = ddp_comp_to_sys(ddp_comp);
-	struct mml_dle_ctx *ctx;
+	struct mml_dle_ctx *ctx = sys_get_dle_ctx(sys, NULL);
 	struct mml_task *task;
 
-	ctx = sys_get_dle_ctx(sys);
-	if (IS_ERR(ctx)) {
-		mml_err("fail to get mml ctx for addon config");
+	mml_mmp(addon_unprepare, MMPROFILE_FLAG_PULSE, 0, 0);
+
+	if (IS_ERR_OR_NULL(ctx)) {
+		mml_msg("%s fail to get mml ctx", __func__);
 		return;
 	}
 
@@ -972,10 +1246,48 @@ static void sys_unprepare(struct mtk_ddp_comp *ddp_comp)
 		sys_ddp_disable(sys, task, 1);
 }
 
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+#define call_dbg_op(_comp, op, ...) \
+	((_comp->debug_ops && _comp->debug_ops->op) ? \
+		_comp->debug_ops->op(_comp, ##__VA_ARGS__) : 0)
+
+static void ddp_comp_dump(const struct mml_topology_path *path)
+{
+	struct mml_comp *comp;
+	u32 i;
+
+	if (!path)
+		return;
+	for (i = 0; i < path->node_cnt; i++) {
+		comp = path->nodes[i].comp;
+		call_dbg_op(comp, dump);
+	}
+}
+#endif
+
+static void sys_ddp_dump(struct mtk_ddp_comp *ddp_comp)
+{
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	struct mml_sys *sys;
+
+	if (!mml_ddp_dump) {
+		mml_err("Inline rotate direct link fail");
+		return;
+	}
+
+	sys = ddp_comp_to_sys(ddp_comp);
+
+	ddp_comp_dump(sys->ddp_path[0]);
+	ddp_comp_dump(sys->ddp_path[1]);
+#endif
+}
+
 static const struct mtk_ddp_comp_funcs sys_ddp_funcs = {
+	.mml_calc_cfg = sys_mml_calc_cfg,
 	.addon_config = sys_addon_config,
 	.start = sys_start,
 	.unprepare = sys_unprepare,
+	.dump = sys_ddp_dump,
 };
 
 static s32 dli_tile_prepare(struct mml_comp *comp, struct mml_task *task,
@@ -984,12 +1296,15 @@ static s32 dli_tile_prepare(struct mml_comp *comp, struct mml_task *task,
 			    union mml_tile_data *data)
 {
 	struct mml_frame_data *src = &task->config->info.src;
+	struct mml_frame_dest *dest = &task->config->info.dest[0];
 
 	func->type = TILE_TYPE_RDMA;
-	func->full_size_x_in = src->width;
+	/* height align wrot out cause height value config in inlinerot height */
+	func->full_size_x_in = dest->crop.r.width;
 	func->full_size_y_in = src->height;
-	func->full_size_x_out = src->width;
+	func->full_size_x_out = dest->crop.r.width;
 	func->full_size_y_out = src->height;
+
 	return 0;
 }
 
@@ -997,20 +1312,34 @@ static const struct mml_comp_tile_ops dli_tile_ops = {
 	.prepare = dli_tile_prepare,
 };
 
-static void dlo_config_left(struct mml_frame_dest *dest,
+static void dlo_config_left(struct mml_frame_config *cfg,
+			    struct mml_frame_dest *dest,
 			    struct dlo_tile_data *data)
 {
 	data->enable_x_crop = true;
-	data->crop_left = 0;
-	data->crop_width = dest->data.width >> 1;
+	data->crop.left = 0;
+	data->crop.width = cfg->dl_out[0].width;
+	if (data->crop.width == 0 || data->crop.width >= dest->compose.width ||
+	    cfg->dl_out[0].height != dest->compose.height)
+		mml_err("dlo[0] (%u, %u, %u, %u) cannot match compose (%u, %u)",
+			data->crop.left, 0, data->crop.width, cfg->dl_out[0].height,
+			dest->compose.width, dest->compose.height);
 }
 
-static void dlo_config_right(struct mml_frame_dest *dest,
+static void dlo_config_right(struct mml_frame_config *cfg,
+			     struct mml_frame_dest *dest,
 			     struct dlo_tile_data *data)
 {
 	data->enable_x_crop = true;
-	data->crop_left = dest->data.width >> 1;
-	data->crop_width = dest->data.width - data->crop_left;
+	data->crop.left = cfg->dl_out[1].left - cfg->dl_out[0].left;
+	data->crop.width = cfg->dl_out[1].width;
+	if (data->crop.left > cfg->dl_out[0].width ||
+	    data->crop.left + data->crop.width != dest->compose.width ||
+	    cfg->dl_out[1].height != dest->compose.height)
+		mml_err("dlo[1] (%u, %u, %u, %u) cannot match compose (%u, %u) left %u",
+			data->crop.left, 0, data->crop.width, cfg->dl_out[1].height,
+			dest->compose.width, dest->compose.height,
+			cfg->dl_out[1].left - cfg->dl_out[0].left);
 }
 
 static s32 dlo_tile_prepare(struct mml_comp *comp, struct mml_task *task,
@@ -1018,18 +1347,18 @@ static s32 dlo_tile_prepare(struct mml_comp *comp, struct mml_task *task,
 			    struct tile_func_block *func,
 			    union mml_tile_data *data)
 {
-	struct mml_frame_dest *dest = &task->config->info.dest[ccfg->node->out_idx];
+	struct mml_frame_config *cfg = task->config;
+	struct mml_frame_dest *dest = &cfg->info.dest[ccfg->node->out_idx];
 
-	if (task->config->dual) {
+	if (cfg->dual) {
 		if (ccfg->pipe == 0)
-			dlo_config_left(dest, &data->dlo);
+			dlo_config_left(cfg, dest, &data->dlo);
 		else
-			dlo_config_right(dest, &data->dlo);
+			dlo_config_right(cfg, dest, &data->dlo);
+	} else {
+		data->dlo.crop.width = dest->compose.width;
 	}
-	func->full_size_x_in = dest->data.width;
-	func->full_size_y_in = dest->data.height;
-	func->full_size_x_out = dest->data.width;
-	func->full_size_y_out = dest->data.height;
+	data->dlo.crop.height = dest->compose.height;
 
 	func->type = TILE_TYPE_WDMA;
 	func->back_func = tile_dlo_back;
@@ -1079,8 +1408,8 @@ static int dl_comp_init(struct device *dev, struct mml_sys *sys,
 {
 	struct device_node *node = dev->of_node;
 	char name[32] = "";
-	u16 offset;
-	int ret;
+	u16 offset = 0;
+	int ret = 0;
 
 	/* init larb for mtcmos */
 	ret = mml_comp_init_larb(comp, dev);
@@ -1152,7 +1481,7 @@ static int subcomp_init(struct platform_device *pdev, struct mml_sys *sys,
 	struct device *dev = &pdev->dev;
 	struct mml_comp *comp = &sys->comps[subcomponent];
 	const struct mml_data *data = sys->data;
-	u32 comp_type;
+	u32 comp_type = 0;
 	int ret;
 
 	ret = mml_subcomp_init(pdev, subcomponent, comp);
@@ -1164,22 +1493,26 @@ static int subcomp_init(struct platform_device *pdev, struct mml_sys *sys,
 		dev_info(dev, "no comp-type of mmlsys comp-%d\n", subcomponent);
 		return 0;
 	}
-	if (data->comp_inits[comp_type]) {
-		ret = data->comp_inits[comp_type](dev, sys, comp);
-		if (ret)
-			return ret;
-	}
-
-	if (data->ddp_comp_funcs[comp_type]) {
-		ret = mml_ddp_comp_init(dev, &sys->ddp_comps[subcomponent],
-					comp, data->ddp_comp_funcs[comp_type]);
-		if (unlikely(ret)) {
-			mml_log("failed to init ddp comp-%d: %d",
-				subcomponent, ret);
-			return ret;
+	if (comp_type < MML_COMP_TYPE_TOTAL) {
+		if (data->comp_inits[comp_type]) {
+			ret = data->comp_inits[comp_type](dev, sys, comp);
+			if (ret)
+				return ret;
 		}
-		sys->ddp_comp_en |= 1 << subcomponent;
-	}
+
+		if (data->ddp_comp_funcs[comp_type]) {
+			ret = mml_ddp_comp_init(dev, &sys->ddp_comps[subcomponent],
+						comp, data->ddp_comp_funcs[comp_type]);
+			if (unlikely(ret)) {
+				mml_log("failed to init ddp comp-%d: %d",
+					subcomponent, ret);
+				return ret;
+			}
+			sys->ddp_comp_en |= 1 << subcomponent;
+		}
+	} else
+		mml_err(" %s comp_type %d >= MML_COMP_TYPE_TOTAL", __func__, comp_type);
+
 	return ret;
 }
 
@@ -1231,14 +1564,12 @@ static int mml_sys_init(struct platform_device *pdev, struct mml_sys *sys,
 		ret = component_add(dev, comp_ops);
 
 	/* events for racing mode */
-	of_property_read_u16(dev->of_node, "event_racing_pipe0",
+	of_property_read_u16(dev->of_node, "event-racing-pipe0",
 			     &sys->event_racing_pipe0);
-	of_property_read_u16(dev->of_node, "event_racing_pipe1",
+	of_property_read_u16(dev->of_node, "event-racing-pipe1",
 			     &sys->event_racing_pipe1);
-	of_property_read_u16(dev->of_node, "event_racing_pipe1_next",
+	of_property_read_u16(dev->of_node, "event-racing-pipe1-next",
 			     &sys->event_racing_pipe1_next);
-	of_property_read_u16(dev->of_node, "event_ir_eof",
-			     &sys->event_ir_eof);
 	return 0;
 
 err_comp_add:
@@ -1268,6 +1599,9 @@ struct mml_sys *mml_sys_create(struct platform_device *pdev,
 		return ERR_PTR(ret);
 	}
 
+	if (unlikely(dbg_probed_count < 0))
+		return ERR_PTR(-EFAULT);
+
 	dbg_probed_components[dbg_probed_count++] = sys;
 	return sys;
 }
@@ -1289,6 +1623,11 @@ static int bind_mml(struct device *dev, struct device *master,
 		    struct mml_sys *sys)
 {
 	s32 ret;
+
+	if (unlikely(!sys)) {
+		dev_err(dev, "sys is NULL\n");
+		return -EFAULT;
+	}
 
 	if (WARN_ON(sys->master && sys->master != master)) {
 		dev_err(dev, "failed to register component %s to new master %s from old %s\n",
@@ -1355,7 +1694,8 @@ int mml_sys_bind(struct device *dev, struct device *master,
 
 static void unbind_mml(struct device *master, struct mml_sys *sys)
 {
-	if (WARN_ON(sys->comp_bound <= 0))
+	if (WARN_ON(sys->comp_bound == 0 ||
+		    sys->comp_bound > MML_MAX_SYS_COMPONENTS))
 		return;
 	mml_unregister_comp(master, &sys->comps[--sys->comp_bound]);
 }
@@ -1369,7 +1709,8 @@ static void unbind_ddp(struct drm_device *drm_dev, struct mml_sys *sys)
 			break;
 	sys->ddp_bound = i;
 
-	if (WARN_ON(sys->ddp_bound <= 0))
+	if (WARN_ON(sys->ddp_bound == 0 ||
+		    sys->ddp_bound > MML_MAX_SYS_COMPONENTS))
 		return;
 	mml_ddp_comp_unregister(drm_dev, &sys->ddp_comps[--sys->ddp_bound]);
 }
@@ -1423,6 +1764,7 @@ static const struct mml_data mt6893_mml_data = {
 		[MML_CT_SYS] = &sys_comp_init,
 		[MML_CT_DL_IN] = &dl_comp_init,
 	},
+	.aid_sel = sys_config_aid_sel,
 	.gpr = {CMDQ_GPR_R08, CMDQ_GPR_R10},
 };
 
@@ -1437,6 +1779,7 @@ static const struct mml_data mt6983_mml_data = {
 		[MML_CT_DL_IN] = &dl_ddp_funcs,
 		[MML_CT_DL_OUT] = &dl_ddp_funcs,
 	},
+	.aid_sel = sys_config_aid_sel,
 	.gpr = {CMDQ_GPR_R08, CMDQ_GPR_R10},
 };
 
@@ -1446,6 +1789,7 @@ static const struct mml_data mt6879_mml_data = {
 		[MML_CT_DL_IN] = &dli_comp_init,
 		[MML_CT_DL_OUT] = &dlo_comp_init,
 	},
+	.aid_sel = sys_config_aid_sel,
 	.gpr = {CMDQ_GPR_R08, CMDQ_GPR_R10},
 };
 
@@ -1455,7 +1799,45 @@ static const struct mml_data mt6895_mml_data = {
 		[MML_CT_DL_IN] = &dli_comp_init,
 		[MML_CT_DL_OUT] = &dlo_comp_init,
 	},
+	.ddp_comp_funcs = {
+		[MML_CT_SYS] = &sys_ddp_funcs,
+		[MML_CT_DL_IN] = &dl_ddp_funcs,
+		[MML_CT_DL_OUT] = &dl_ddp_funcs,
+	},
+	.aid_sel = sys_config_aid_sel,
 	.gpr = {CMDQ_GPR_R08, CMDQ_GPR_R10},
+};
+
+static const struct mml_data mt6985_mml_data = {
+	.comp_inits = {
+		[MML_CT_SYS] = &sys_comp_init,
+		[MML_CT_DL_IN] = &dli_comp_init,
+		[MML_CT_DL_OUT] = &dlo_comp_init,
+	},
+	.ddp_comp_funcs = {
+		[MML_CT_SYS] = &sys_ddp_funcs,
+		[MML_CT_DL_IN] = &dl_ddp_funcs,
+		[MML_CT_DL_OUT] = &dl_ddp_funcs,
+	},
+	.aid_sel = sys_config_aid_sel_engine,
+	.gpr = {CMDQ_GPR_R08, CMDQ_GPR_R10},
+	.use_aidsel_engine = true,
+};
+
+static const struct mml_data mt6886_mml_data = {
+	.comp_inits = {
+		[MML_CT_SYS] = &sys_comp_init,
+		[MML_CT_DL_IN] = &dli_comp_init,
+		[MML_CT_DL_OUT] = &dlo_comp_init,
+	},
+	.ddp_comp_funcs = {
+		[MML_CT_SYS] = &sys_ddp_funcs,
+		[MML_CT_DL_IN] = &dl_ddp_funcs,
+		[MML_CT_DL_OUT] = &dl_ddp_funcs,
+	},
+	.aid_sel = sys_config_aid_sel_engine,
+	.gpr = {CMDQ_GPR_R08, CMDQ_GPR_R10},
+	.use_aidsel_engine = true,
 };
 
 const struct of_device_id mtk_mml_of_ids[] = {
@@ -1474,6 +1856,14 @@ const struct of_device_id mtk_mml_of_ids[] = {
 	{
 		.compatible = "mediatek,mt6895-mml",
 		.data = &mt6895_mml_data,
+	},
+	{
+		.compatible = "mediatek,mt6985-mml",
+		.data = &mt6985_mml_data,
+	},
+	{
+		.compatible = "mediatek,mt6886-mml",
+		.data = &mt6886_mml_data,
 	},
 	{},
 };
@@ -1539,11 +1929,11 @@ static s32 dbg_get(char *buf, const struct kernel_param *kp)
 				struct mtk_ddp_comp *ddp_comp = &sys->ddp_comps[i];
 
 				length += snprintf(buf + length, PAGE_SIZE - length,
-					"    - [%d] mml comp_id: %d.%d @%08x name: %s bound: %d\n",
+					"    - [%d] mml comp_id: %d.%d @%llx name: %s bound: %d\n",
 					i, comp->id, comp->sub_idx, comp->base_pa,
 					comp->name ? comp->name : "(null)", comp->bound);
 				length += snprintf(buf + length, PAGE_SIZE - length,
-					"    -         larb_port: %d @%08x pw: %d clk: %d\n",
+					"    -         larb_port: %d @%llx pw: %d clk: %d\n",
 					comp->larb_port, comp->larb_base,
 					comp->pw_cnt, comp->clk_cnt);
 				length += snprintf(buf + length, PAGE_SIZE - length,

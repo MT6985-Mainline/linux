@@ -21,17 +21,6 @@ struct rdma_tile_data {
 	u32 max_width;
 };
 
-struct hdr_tile_data {
-	bool relay_mode;
-	u32 min_width;
-};
-
-struct aal_tile_data {
-	u32 min_width;
-	u32 max_width;
-	u32 min_hist_width;
-};
-
 struct rsz_tile_data {
 	bool use_121filter;
 	u32 coeff_step_x;
@@ -51,9 +40,11 @@ struct rsz_tile_data {
 	bool ver_first;
 	bool ver_cubic_trunc;
 	u32 max_width;
+	bool crop_aal_tile_loss;
 };
 
 struct tdshp_tile_data {
+	bool relay_mode;
 	u32 max_width;
 };
 
@@ -72,24 +63,19 @@ struct wrot_tile_data {
 
 struct dlo_tile_data {
 	bool enable_x_crop;
-	u32 crop_left;
-	u32 crop_width;
+	struct mml_rect crop;
 };
 
 union mml_tile_data {
 	struct rdma_tile_data rdma;
-	struct hdr_tile_data hdr;
-	struct aal_tile_data aal;
 	struct rsz_tile_data rsz;
 	struct tdshp_tile_data tdshp;
 	struct wrot_tile_data wrot;
 	struct dlo_tile_data dlo;
 };
 
-s32 calc_tile(struct mml_task *task, u32 pipe_idx, struct mml_tile_cache *tile_cache);
-
+s32 calc_tile(struct mml_task *task, u32 pipe, struct mml_tile_cache *tile_cache);
 void destroy_tile_output(struct mml_tile_output *output);
-
-void dump_tile_output(struct mml_task *task, u32 pipe_idx);
+void dump_tile_output(struct mml_tile_output *output);
 
 #endif	/* __MTK_MML_TILE_H__ */

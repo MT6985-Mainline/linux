@@ -106,14 +106,27 @@
 /* SMI offset */
 #define SMI_LARB_NON_SEC_CON		0x380
 
-#define MML_WROT_RACING_MIN		64
+#define MML_WROT_RACING_MAX		64
 
 /* debug option to change sram write height */
-int mml_racing_h = MML_WROT_RACING_MIN;
+int mml_racing_h = MML_WROT_RACING_MAX;
 module_param(mml_racing_h, int, 0644);
 
 int mml_racing_rdone;
 module_param(mml_racing_rdone, int, 0644);
+
+/* 0x1 for input crc, 0xd for output crc */
+int mml_wrot_crc;
+module_param(mml_wrot_crc, int, 0644);
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+static u32 *wrot_crc_va[MML_PIPE_CNT];
+static dma_addr_t wrot_crc_pa[MML_PIPE_CNT];
+#endif
+
+int mml_wrot_bkgd_en;
+module_param(mml_wrot_bkgd_en, int, 0644);
+int mml_wrot_bkgd;
+module_param(mml_wrot_bkgd, int, 0644);
 
 /* ceil_m and floor_m helper function */
 static u32 ceil_m(u64 n, u64 d)
@@ -163,6 +176,7 @@ static s32 wrot_write_addr(struct cmdq_pkt *pkt,
 			reuse, cache, label_idx);
 	if (ret)
 		return ret;
+
 	ret = mml_write(pkt, addr_high, value >> 32, U32_MAX,
 			reuse, cache, label_idx + 1);
 	return ret;
@@ -187,6 +201,12 @@ static const struct wrot_data mml_wrot_data = {
 	.tile_width = 512,
 	.sram_size = 512 * 1024,
 	.rb_swap = 1,
+};
+
+static const struct wrot_data mt6985_wrot_data = {
+	.fifo = 256,
+	.tile_width = 512,
+	.sram_size = 512 * 1024,
 };
 
 struct mml_comp_wrot {
@@ -354,8 +374,15 @@ static void wrot_config_left(struct mml_frame_dest *dest,
 	wrot_frm->out_crop.left = 0;
 	wrot_frm->out_crop.width = wrot_frm->out_w >> 1;
 
-	if (MML_FMT_10BIT_PACKED(dest->data.format) &&
-	    wrot_frm->out_crop.width & 3) {
+	if (MML_FMT_ARGB_COMPRESS(dest->data.format) &&
+	    wrot_frm->out_crop.width & 31) {
+		wrot_frm->out_crop.width =
+			(wrot_frm->out_crop.width & ~31) + 32;
+		if (is_change_wx(dest->rotate, dest->flip))
+			wrot_frm->out_crop.width = wrot_frm->out_w -
+						   wrot_frm->out_crop.width;
+	} else if (MML_FMT_10BIT_PACKED(dest->data.format) &&
+		 wrot_frm->out_crop.width & 3) {
 		wrot_frm->out_crop.width = (wrot_frm->out_crop.width & ~3) + 4;
 		if (is_change_wx(dest->rotate, dest->flip))
 			wrot_frm->out_crop.width = wrot_frm->out_w -
@@ -371,7 +398,14 @@ static void wrot_config_right(struct mml_frame_dest *dest,
 	wrot_frm->en_x_crop = true;
 	wrot_frm->out_crop.left = wrot_frm->out_w >> 1;
 
-	if (MML_FMT_10BIT_PACKED(dest->data.format) &&
+	if (MML_FMT_ARGB_COMPRESS(dest->data.format) &&
+	    wrot_frm->out_crop.left & 31) {
+		wrot_frm->out_crop.left =
+			(wrot_frm->out_crop.left & ~31) + 32;
+		if (is_change_wx(dest->rotate, dest->flip))
+			wrot_frm->out_crop.left = wrot_frm->out_w -
+						   wrot_frm->out_crop.left;
+	} else if (MML_FMT_10BIT_PACKED(dest->data.format) &&
 	    wrot_frm->out_crop.left & 3) {
 		wrot_frm->out_crop.left = (wrot_frm->out_crop.left & ~3) + 4;
 		if (is_change_wx(dest->rotate, dest->flip))
@@ -384,24 +418,32 @@ static void wrot_config_right(struct mml_frame_dest *dest,
 	wrot_frm->out_crop.width = wrot_frm->out_w - wrot_frm->out_crop.left;
 }
 
-static void wrot_config_top(struct mml_frame_dest *dest,
+static void wrot_config_top(struct mml_frame_data *src,
+			    struct mml_frame_dest *dest,
 			    struct wrot_frame_data *wrot_frm)
 {
 	wrot_frm->en_y_crop = true;
 	wrot_frm->out_crop.top = 0;
 	wrot_frm->out_crop.height = wrot_frm->out_h >> 1;
-	if (wrot_frm->out_crop.height & 0x1)
+	if (MML_FMT_IS_YUV(src->format) || MML_FMT_COMPRESS(src->format))
+		wrot_frm->out_crop.height = align_up(wrot_frm->out_crop.height, 16);
+	else if (wrot_frm->out_crop.height & 0x1)
 		wrot_frm->out_crop.height++;
+	wrot_frm->out_crop.width = dest->data.height;
 }
 
-static void wrot_config_bottom(struct mml_frame_dest *dest,
+static void wrot_config_bottom(struct mml_frame_data *src,
+			       struct mml_frame_dest *dest,
 			       struct wrot_frame_data *wrot_frm)
 {
 	wrot_frm->en_y_crop = true;
 	wrot_frm->out_crop.top = wrot_frm->out_h >> 1;
-	if (wrot_frm->out_crop.top & 0x1)
+	if (MML_FMT_COMPRESS(src->format))
+		wrot_frm->out_crop.top = align_up(wrot_frm->out_crop.top, 16);
+	else if (wrot_frm->out_crop.top & 0x1)
 		wrot_frm->out_crop.top++;
 	wrot_frm->out_crop.height = wrot_frm->out_h - wrot_frm->out_crop.top;
+	wrot_frm->out_crop.width = dest->data.height;
 }
 
 static void wrot_config_pipe0(struct mml_frame_config *cfg,
@@ -411,10 +453,10 @@ static void wrot_config_pipe0(struct mml_frame_config *cfg,
 	if (cfg->info.mode == MML_MODE_RACING) {
 		if ((dest->rotate == MML_ROT_90 && !dest->flip) ||
 		    (dest->rotate == MML_ROT_270 && dest->flip))
-			wrot_config_bottom(dest, wrot_frm);
+			wrot_config_bottom(&cfg->info.src, dest, wrot_frm);
 		else if ((dest->rotate == MML_ROT_90 && dest->flip) ||
 			 (dest->rotate == MML_ROT_270 && !dest->flip))
-			wrot_config_top(dest, wrot_frm);
+			wrot_config_top(&cfg->info.src, dest, wrot_frm);
 		else if ((dest->rotate == MML_ROT_0 && !dest->flip) ||
 			 (dest->rotate == MML_ROT_180 && dest->flip))
 			wrot_config_left(dest, wrot_frm);
@@ -433,10 +475,10 @@ static void wrot_config_pipe1(struct mml_frame_config *cfg,
 	if (cfg->info.mode == MML_MODE_RACING) {
 		if ((dest->rotate == MML_ROT_90 && !dest->flip) ||
 		    (dest->rotate == MML_ROT_270 && dest->flip))
-			wrot_config_top(dest, wrot_frm);
+			wrot_config_top(&cfg->info.src, dest, wrot_frm);
 		else if ((dest->rotate == MML_ROT_90 && dest->flip) ||
 			 (dest->rotate == MML_ROT_270 && !dest->flip))
-			wrot_config_bottom(dest, wrot_frm);
+			wrot_config_bottom(&cfg->info.src, dest, wrot_frm);
 		else if ((dest->rotate == MML_ROT_0 && !dest->flip) ||
 			 (dest->rotate == MML_ROT_180 && dest->flip))
 			wrot_config_right(dest, wrot_frm);
@@ -505,6 +547,11 @@ static s32 wrot_prepare(struct mml_comp *comp, struct mml_task *task,
 
 			if (dest->flip)
 				wrot_frm->sram_side = !wrot_frm->sram_side;
+
+			mml_msg("%s wrot pipe %u out crop %u %u %u %u",
+				__func__, ccfg->pipe,
+				wrot_frm->out_crop.left, wrot_frm->out_crop.top,
+				wrot_frm->out_crop.width, wrot_frm->out_crop.height);
 		}
 	}
 
@@ -556,16 +603,27 @@ static s32 wrot_buf_prepare(struct mml_comp *comp, struct mml_task *task,
 
 	if (task->config->info.mode == MML_MODE_RACING) {
 		/* assign sram pa directly */
+		mml_mmp(buf_map, MMPROFILE_FLAG_START,
+			((u64)task->job.jobid << 16) | comp->id, 0);
 		mutex_lock(&wrot->sram_mutex);
 		if (!wrot->sram_cnt)
 			wrot->sram_pa = (u64)mml_sram_get(task->config->mml);
 		wrot->sram_cnt++;
+		/* store it for mml record */
+		task->buf.dest[wrot_frm->out_idx].dma[0].iova = wrot->sram_pa;
+		task->buf.dest[wrot_frm->out_idx].size[0] = wrot->sram_size;
 		mutex_unlock(&wrot->sram_mutex);
 		wrot_frm->iova[0] = wrot->sram_pa;
+		mml_mmp(buf_map, MMPROFILE_FLAG_END,
+			((u64)task->job.jobid << 16) | comp->id, wrot_frm->iova[0]);
 	} else {
 		for (i = 0; i < dest_buf->cnt; i++)
 			wrot_frm->iova[i] = dest_buf->dma[i].iova;
 	}
+
+	if (!wrot_frm->iova[0])
+		return -EINVAL;
+
 	return 0;
 }
 
@@ -598,7 +656,7 @@ static s32 wrot_tile_prepare(struct mml_comp *comp, struct mml_task *task,
 	data->wrot.flip = dest->flip;
 	data->wrot.alpharot = cfg->alpharot;
 	data->wrot.racing = cfg->info.mode == MML_MODE_RACING;
-	data->wrot.racing_h = max(mml_racing_h, MML_WROT_RACING_MIN);
+	data->wrot.racing_h = max(mml_racing_h, MML_WROT_RACING_MAX);
 
 	/* reuse wrot_frm data which processed with rotate and dual */
 	data->wrot.enable_x_crop = wrot_frm->en_x_crop;
@@ -639,7 +697,7 @@ static void wrot_color_fmt(struct mml_frame_config *cfg,
 	u16 profile_out = cfg->info.dest[wrot_frm->out_idx].data.profile;
 
 	wrot_frm->mat_en = 0;
-	wrot_frm->mat_sel = 0;
+	wrot_frm->mat_sel = 15;
 	wrot_frm->bbp_y = MML_FMT_BITS_PER_PIXEL(fmt);
 
 	switch (fmt) {
@@ -796,8 +854,6 @@ static void wrot_color_fmt(struct mml_frame_config *cfg,
 	/* Enable dither */
 	if (MML_FMT_10BIT(cfg->info.src.format) && !MML_FMT_10BIT(fmt)) {
 		wrot_frm->mat_en = 1;
-		if (!wrot_frm->mat_sel) // if didn't set profile
-			wrot_frm->mat_sel = 15;
 		wrot_frm->dither_con = (0x1 << 10) +
 			 (0x0 << 8) +
 			 (0x0 << 4) +
@@ -886,7 +942,7 @@ static void wrot_config_addr(const struct mml_frame_dest *dest,
 {
 	u64 addr_c, addr_v, addr;
 
-	if (MML_FMT_COMPRESS(dest_fmt)) {
+	if (MML_FMT_AFBC(dest_fmt)) {
 		/* wrot afbc output case */
 		u32 block_x;
 		u32 frame_size;
@@ -1011,12 +1067,12 @@ static s32 wrot_config_frame(struct mml_comp *comp, struct mml_task *task,
 		wrot_frm->mat_en = 0;
 
 		if (wrot->data->rb_swap == 1) {
-			if (!MML_FMT_COMPRESS(src_fmt) && !MML_FMT_10BIT(src_fmt))
+			if (!MML_FMT_AFBC(src_fmt) && !MML_FMT_10BIT(src_fmt))
 				out_swap ^= MML_FMT_SWAP(src_fmt);
-			else if (MML_FMT_COMPRESS(src_fmt) && !MML_FMT_10BIT(src_fmt))
+			else if (MML_FMT_AFBC(src_fmt) && !MML_FMT_10BIT(src_fmt))
 				out_swap =
 					(MML_FMT_SWAP(src_fmt) == MML_FMT_SWAP(dest_fmt)) ? 1 : 0;
-			else if (MML_FMT_COMPRESS(src_fmt) && MML_FMT_10BIT(src_fmt))
+			else if (MML_FMT_AFBC(src_fmt) && MML_FMT_10BIT(src_fmt))
 				out_swap = out_swap ? 0 : 1;
 		}
 	}
@@ -1025,6 +1081,9 @@ static s32 wrot_config_frame(struct mml_comp *comp, struct mml_task *task,
 
 	/* Enable engine */
 	cmdq_pkt_write(pkt, NULL, base_pa + VIDO_ROT_EN, 0x01, 0x00000001);
+
+	if (mml_wrot_crc)
+		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_CRC_CTRL, mml_wrot_crc, U32_MAX);
 
 	/* Enable shadow */
 	cmdq_pkt_write(pkt, NULL, base_pa + VIDO_SHADOW_CTRL, 0x1, U32_MAX);
@@ -1055,17 +1114,20 @@ static s32 wrot_config_frame(struct mml_comp *comp, struct mml_task *task,
 		swap(wrot_frm->plane_offset[1], wrot_frm->plane_offset[2]);
 	}
 
-	calc_plane_offset(wrot_frm->compose.left, wrot_frm->compose.top,
-			  wrot_frm->y_stride, wrot_frm->uv_stride,
-			  wrot_frm->bbp_y, wrot_frm->bbp_uv,
-			  wrot_frm->hor_sh_uv, wrot_frm->ver_sh_uv,
-			  wrot_frm->plane_offset);
-
 	if (dest->data.secure) {
 		/* TODO: for secure case setup plane offset and reg */
 	}
 
 	if (task->config->info.mode == MML_MODE_RACING) {
+		u64 sram_addr;
+
+		calc_plane_offset(wrot_frm->compose.left, 0,
+			wrot_frm->y_stride, wrot_frm->uv_stride,
+			wrot_frm->bbp_y, wrot_frm->bbp_uv,
+			wrot_frm->hor_sh_uv, wrot_frm->ver_sh_uv,
+			wrot_frm->plane_offset);
+		sram_addr = wrot->sram_pa + wrot_frm->plane_offset[0];
+
 		/* config smi addr to emi (iova) or sram */
 		cmdq_pkt_write(pkt, NULL, wrot->smi_larb_con,
 			GENMASK(19, 16), GENMASK(19, 16));
@@ -1075,17 +1137,17 @@ static s32 wrot_config_frame(struct mml_comp *comp, struct mml_task *task,
 
 		/* inline rotate case always write to sram pa */
 		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_BASE_ADDR,
-			wrot->sram_pa, U32_MAX);
+			sram_addr, U32_MAX);
 		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_BASE_ADDR_HIGH,
-			wrot->sram_pa >> 32, U32_MAX);
+			sram_addr >> 32, U32_MAX);
 		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_BASE_ADDR_C,
-			wrot->sram_pa, U32_MAX);
+			sram_addr, U32_MAX);
 		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_BASE_ADDR_HIGH_C,
-			wrot->sram_pa >> 32, U32_MAX);
+			sram_addr >> 32, U32_MAX);
 		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_BASE_ADDR_V,
-			wrot->sram_pa, U32_MAX);
+			sram_addr, U32_MAX);
 		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_BASE_ADDR_HIGH_V,
-			wrot->sram_pa >> 32, U32_MAX);
+			sram_addr >> 32, U32_MAX);
 
 		cmdq_pkt_write(pkt, NULL,
 			wrot->irot_base[0] + DISPSYS_SHADOW_CTRL, 0x2, U32_MAX);
@@ -1097,8 +1159,20 @@ static s32 wrot_config_frame(struct mml_comp *comp, struct mml_task *task,
 			cmdq_pkt_write(pkt, NULL,
 				wrot->irot_base[0] + INLINEROT_OVLSEL, 0xc, U32_MAX);
 
-		mml_msg("%s sram pa %#x", __func__, (u32)wrot->sram_pa);
+		mml_msg("%s sram pa %#x offset %u",
+			__func__, (u32)sram_addr, wrot_frm->plane_offset[0]);
 	} else {
+		calc_plane_offset(wrot_frm->compose.left, wrot_frm->compose.top,
+			wrot_frm->y_stride, wrot_frm->uv_stride,
+			wrot_frm->bbp_y, wrot_frm->bbp_uv,
+			wrot_frm->hor_sh_uv, wrot_frm->ver_sh_uv,
+			wrot_frm->plane_offset);
+
+		if (wrot->smi_larb_con) {
+			/* always reset larb con to va mode to avoid last frame fail */
+			cmdq_pkt_write(pkt, NULL, wrot->smi_larb_con, 0, GENMASK(19, 16));
+		}
+
 		/* normal dram case config wrot iova with reuse */
 		wrot_config_addr(dest, dest_fmt, base_pa,
 				 wrot_frm, pkt, reuse, cache);
@@ -1121,6 +1195,12 @@ static s32 wrot_config_frame(struct mml_comp *comp, struct mml_task *task,
 		       (out_swap	<<  8) +
 		       (hw_fmt		<<  0), 0xf131510f);
 
+
+	if (unlikely(mml_wrot_bkgd_en)) {
+		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_CTRL, BIT(5), BIT(5));
+		cmdq_pkt_write(pkt, NULL, base_pa + VIDO_BKGD, mml_wrot_bkgd, U32_MAX);
+	}
+
 	if (MML_FMT_10BIT_LOOSE(dest_fmt)) {
 		scan_10bit = 1;
 		bit_num = 1;
@@ -1133,7 +1213,7 @@ static s32 wrot_config_frame(struct mml_comp *comp, struct mml_task *task,
 		bit_num = 1;
 	}
 	/* DMA_SUPPORT_AFBC */
-	if (MML_FMT_COMPRESS(dest_fmt)) {
+	if (MML_FMT_AFBC(dest_fmt)) {
 		scan_10bit = 0;
 		pending_zero = 1;
 	}
@@ -1143,7 +1223,7 @@ static s32 wrot_config_frame(struct mml_comp *comp, struct mml_task *task,
 	cmdq_pkt_write(pkt, NULL, base_pa + VIDO_CTRL_2, bit_num,
 		       0x00000007);
 
-	if (MML_FMT_COMPRESS(dest_fmt)) {
+	if (MML_FMT_AFBC(dest_fmt)) {
 		pvric |= BIT(0);
 		if (MML_FMT_10BIT(dest_fmt))
 			pvric |= BIT(1);
@@ -1574,6 +1654,16 @@ static void wrot_check_buf(const struct mml_frame_dest *dest,
 	} else {
 		buf->uv_buf_check = 1;
 	}
+
+	if (dest->rotate == MML_ROT_90 || dest->rotate == MML_ROT_270) {
+		if (dest->data.format == MML_FMT_NV12_10P ||
+		    dest->data.format == MML_FMT_NV21_10P) {
+			if (setting->main_buf_line_num > 32)
+				setting->main_buf_line_num = 64;
+			else
+				setting->main_buf_line_num = 32;
+		}
+	}
 }
 
 static void wrot_calc_setting(struct mml_comp_wrot *wrot,
@@ -1655,7 +1745,7 @@ static s32 wrot_config_tile(struct mml_comp *comp, struct mml_task *task,
 	u32 buf_line_num;
 
 	/* Fill the the tile settings */
-	if (MML_FMT_COMPRESS(dest_fmt))
+	if (MML_FMT_AFBC(dest_fmt))
 		wrot_tile_calc_comp(dest, wrot_frm, tile, &ofst);
 	else
 		wrot_tile_calc(task, wrot, dest, tout, tile, idx, cfg->info.mode,
@@ -1680,16 +1770,16 @@ static s32 wrot_config_tile(struct mml_comp *comp, struct mml_task *task,
 			base_pa + VIDO_OFST_ADDR_V,
 			base_pa + VIDO_OFST_ADDR_HIGH_V, ofst.v);
 
-	/* Write source size */
-	wrot_in_xsize = in_xe  - in_xs + 1;
-	wrot_in_ysize = in_ye  - in_ys  + 1;
+	/* Write source size and target size */
+	wrot_in_xsize = in_xe - in_xs + 1;
+	wrot_in_ysize = in_ye - in_ys + 1;
+	wrot_tar_xsize = out_xe - out_xs + 1;
+	wrot_tar_ysize = out_ye - out_ys + 1;
+
 	cmdq_pkt_write(pkt, NULL, base_pa + VIDO_IN_SIZE,
 		       (wrot_in_ysize << 16) + (wrot_in_xsize <<  0),
 		       U32_MAX);
 
-	/* Write target size */
-	wrot_tar_xsize = out_xe - out_xs + 1;
-	wrot_tar_ysize = out_ye - out_ys + 1;
 	cmdq_pkt_write(pkt, NULL, base_pa + VIDO_TAR_SIZE,
 		       (wrot_tar_ysize << 16) + (wrot_tar_xsize <<  0),
 		       U32_MAX);
@@ -1727,16 +1817,19 @@ static s32 wrot_config_tile(struct mml_comp *comp, struct mml_task *task,
 	/* qos accumulate tile pixel */
 	wrot_frm->pixel_acc += wrot_tar_xsize * wrot_tar_ysize;
 
-	/* calculate qos for later use */
-	plane = MML_FMT_PLANE(dest->data.format);
-	wrot_frm->datasize += mml_color_get_min_y_size(dest->data.format,
-		wrot_tar_xsize, wrot_tar_ysize);
-	if (plane > 1)
-		wrot_frm->datasize += mml_color_get_min_uv_size(dest->data.format,
+	/* no bandwidth for racing mode since wrot write to sram */
+	if (cfg->info.mode != MML_MODE_RACING) {
+		/* calculate qos for later use */
+		plane = MML_FMT_PLANE(dest->data.format);
+		wrot_frm->datasize += mml_color_get_min_y_size(dest->data.format,
 			wrot_tar_xsize, wrot_tar_ysize);
-	if (plane > 2)
-		wrot_frm->datasize += mml_color_get_min_uv_size(dest->data.format,
-			wrot_tar_xsize, wrot_tar_ysize);
+		if (plane > 1)
+			wrot_frm->datasize += mml_color_get_min_uv_size(dest->data.format,
+				wrot_tar_xsize, wrot_tar_ysize);
+		if (plane > 2)
+			wrot_frm->datasize += mml_color_get_min_uv_size(dest->data.format,
+				wrot_tar_xsize, wrot_tar_ysize);
+	}
 
 	mml_msg("%s min block width: %u min buf line num: %u",
 		__func__, setting.main_blk_width, setting.main_buf_line_num);
@@ -1835,10 +1928,6 @@ static void wrot_config_inlinerot(struct mml_comp *comp, struct mml_task *task,
 			wrot->irot_base[wrot_frm->sram_side] + INLINEROT_WDONE,
 			1 << wrot_frm->wdone[idx].sram, U32_MAX);
 	}
-
-	/* debug, make gce send irq to cmdq and mark mmp pulse */
-	if (unlikely(mml_racing_wdone_eoc))
-		cmdq_pkt_eoc(pkt, false);
 }
 
 static s32 wrot_wait(struct mml_comp *comp, struct mml_task *task,
@@ -1854,6 +1943,18 @@ static s32 wrot_wait(struct mml_comp *comp, struct mml_task *task,
 	if (task->config->info.mode == MML_MODE_RACING && wrot_frm->wdone[idx].eol) {
 		wrot_config_inlinerot(comp, task, ccfg, idx);
 		wrot_frm->wdone_cnt++;
+
+		/* debug, make gce send irq to cmdq and mark mmp pulse */
+		if (mml_racing_eoc == 1)
+			cmdq_pkt_eoc(pkt, false);
+		else if (mml_racing_eoc == 2) {
+			if (wrot_frm->wdone_cnt == 1 || wrot_frm->wdone_cnt == 2)
+				cmdq_pkt_eoc(pkt, false);
+		}
+
+		if (!task->config->disp_vdo && wrot_frm->wdone_cnt == 1)
+			cmdq_pkt_set_event(pkt,
+				mml_ir_get_mml_ready_event(task->config->mml));
 	}
 
 	return 0;
@@ -1881,6 +1982,33 @@ static s32 wrot_post(struct mml_comp *comp, struct mml_task *task,
 			0, GENMASK(19, 16));
 	}
 
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	if (unlikely(mml_wrot_crc)) {
+		if (!wrot_crc_va[ccfg->pipe] && !wrot_crc_pa[ccfg->pipe]) {
+			wrot_crc_va[ccfg->pipe] =
+				cmdq_mbox_buf_alloc(task->config->path[ccfg->pipe]->clt,
+					&wrot_crc_pa[ccfg->pipe]);
+			mml_log("%s wrot component %u job %u pipe %u va[%p] pa[%llx]",
+				__func__, comp->id, task->job.jobid,
+				ccfg->pipe, wrot_crc_va[ccfg->pipe], wrot_crc_pa[ccfg->pipe]);
+		}
+
+		if (unlikely(!wrot_crc_va[ccfg->pipe]) || unlikely(!wrot_crc_pa[ccfg->pipe])) {
+			mml_err("%s job %u pipe %u get dram va[%p] pa[%llx] failed",
+				__func__, comp->id, task->job.jobid,
+				ccfg->pipe, wrot_crc_va[ccfg->pipe], wrot_crc_pa[ccfg->pipe]);
+		} else {
+			/* read reg value to spr : CMDQ_THR_SPR_IDX2*/
+			cmdq_pkt_read_addr(task->pkts[ccfg->pipe],
+				comp->base_pa + VIDO_CRC_VALUE,
+				CMDQ_THR_SPR_IDX2);
+
+			/* write spr to dram pa */
+			cmdq_pkt_write_indriect(task->pkts[ccfg->pipe],
+				NULL, wrot_crc_pa[ccfg->pipe], CMDQ_THR_SPR_IDX2, UINT_MAX);
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -1904,7 +2032,7 @@ static s32 update_frame_addr(struct mml_comp *comp, struct mml_task *task,
 	}
 
 	/* DMA_SUPPORT_AFBC */
-	if (MML_FMT_COMPRESS(dest_fmt)) {
+	if (MML_FMT_AFBC(dest_fmt)) {
 		u32 block_x;
 
 		/* Write frame base address */
@@ -1967,15 +2095,65 @@ u32 wrot_format_get(struct mml_task *task, struct mml_comp_config *ccfg)
 	return task->config->info.dest[ccfg->node->out_idx].data.format;
 }
 
+static void wrot_task_done(struct mml_comp *comp, struct mml_task *task,
+			   struct mml_comp_config *ccfg)
+{
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	if (mml_wrot_crc && wrot_crc_va[ccfg->pipe]) {
+		task->dest_crc[ccfg->pipe] = readl(wrot_crc_va[ccfg->pipe]);
+		mml_msg("%s wrot component %u, job %u pipe %u crc %#010x",
+			__func__, comp->id, task->job.jobid,
+			ccfg->pipe, task->dest_crc[ccfg->pipe]);
+	}
+#endif
+}
+
+static s32 mml_wrot_comp_clk_enable(struct mml_comp *comp)
+{
+	int ret;
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	struct mml_comp_wrot *wrot = comp_to_wrot(comp);
+#endif
+
+	/* original clk enable */
+	ret = mml_comp_clk_enable(comp);
+	if (ret < 0)
+		return ret;
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	mml_update_comp_status(mml_mon_wrot + wrot->idx, 1);
+#endif
+
+	return 0;
+}
+
+static s32 mml_wrot_comp_clk_disable(struct mml_comp *comp)
+{
+	int ret;
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	struct mml_comp_wrot *wrot = comp_to_wrot(comp);
+
+	mml_update_comp_status(mml_mon_wrot + wrot->idx, 0);
+#endif
+
+	/* original clk enable */
+	ret = mml_comp_clk_disable(comp);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
 static const struct mml_comp_hw_ops wrot_hw_ops = {
 	.pw_enable = &mml_comp_pw_enable,
 	.pw_disable = &mml_comp_pw_disable,
-	.clk_enable = &mml_comp_clk_enable,
-	.clk_disable = &mml_comp_clk_disable,
+	.clk_enable = &mml_wrot_comp_clk_enable,
+	.clk_disable = &mml_wrot_comp_clk_disable,
 	.qos_datasize_get = &wrot_datasize_get,
 	.qos_format_get = &wrot_format_get,
 	.qos_set = &mml_comp_qos_set,
 	.qos_clear = &mml_comp_qos_clear,
+	.task_done = wrot_task_done,
 };
 
 static const char *wrot_state(u32 state)
@@ -1993,14 +2171,18 @@ static const char *wrot_state(u32 state)
 static void wrot_debug_dump(struct mml_comp *comp)
 {
 	void __iomem *base = comp->base;
-	struct mml_comp_wrot *wrot = comp_to_wrot(comp);
-	u32 value[33];
+	u32 value[35];
 	u32 debug[33];
 	u32 dbg_id = 0, state, smi_req;
 	u32 shadow_ctrl;
 	u32 i;
 
 	mml_err("wrot component %u dump:", comp->id);
+	value[0] = readl(base + VIDO_CTRL);
+	value[1] = readl(base + VIDO_IN_SIZE);
+	value[2] = readl(base + VIDO_TAR_SIZE);
+	mml_err("shadow status VIDO_CTRL %#010x VIDO_IN_SIZE %#010x VIDO_TAR_SIZE %#010x",
+		value[0], value[1], value[2]);
 
 	/* Enable shadow read working */
 	shadow_ctrl = readl(base + VIDO_SHADOW_CTRL);
@@ -2040,6 +2222,8 @@ static void wrot_debug_dump(struct mml_comp *comp)
 	value[30] = readl(base + VIDO_BASE_ADDR_C);
 	value[31] = readl(base + VIDO_BASE_ADDR_HIGH_V);
 	value[32] = readl(base + VIDO_BASE_ADDR_V);
+	value[33] = readl(base + VIDO_CRC_CTRL);
+	value[34] = readl(base + VIDO_CRC_VALUE);
 
 	/* debug id from 0x0100 ~ 0x2100, count 33 which is debug array size */
 	for (i = 0; i < ARRAY_SIZE(debug); i++) {
@@ -2056,6 +2240,8 @@ static void wrot_debug_dump(struct mml_comp *comp)
 		value[6], value[7], value[8]);
 	mml_err("VIDO_FRAME_SIZE %#010x",
 		value[9]);
+	if (value[33] || value[34])
+		mml_err("VIDO_CRC_CTRL %#010x VIDO_CRC_VALUE %#010x", value[33], value[34]);
 	mml_err("VIDO_OFST ADDR_HIGH   %#010x ADDR   %#010x",
 		value[10], value[11]);
 	mml_err("VIDO_OFST ADDR_HIGH_C %#010x ADDR_C %#010x",
@@ -2089,21 +2275,11 @@ static void wrot_debug_dump(struct mml_comp *comp)
 		(debug[2] >> 1) & 0x1, (debug[2] >> 2) & 0x1,
 		(debug[2] >> 3) & 0x1);
 	state = debug[2] & 0x1;
-	smi_req = (debug[18] >> 30) & 0x1;
+	smi_req = (debug[24] >> 30) & 0x1;
 	mml_err("WROT state: %#x (%s)", state, wrot_state(state));
 	mml_err("WROT x_cnt %u y_cnt %u",
 		debug[9] & 0xffff, (debug[9] >> 16) & 0xffff);
 	mml_err("WROT smi_req:%u => suggest to ask SMI help:%u", smi_req, smi_req);
-
-	/* inlinerot debug */
-	if (wrot->irot_va[0]) {
-		value[0] = readl(wrot->irot_va[0] + INLINEROT_OVLSEL);
-		mml_err("INLINEROT0 INLINEROT_OVLSEL %#x", value[0]);
-	}
-	if (wrot->irot_va[1]) {
-		value[1] = readl(wrot->irot_va[1] + INLINEROT_OVLSEL);
-		mml_err("INLINEROT1 INLINEROT_OVLSEL %#x", value[1]);
-	}
 }
 
 static void wrot_reset(struct mml_comp *comp, struct mml_frame_config *cfg, u32 pipe)
@@ -2233,17 +2409,17 @@ static int probe(struct platform_device *pdev)
 		SMI_LARB_NON_SEC_CON + priv->comp.larb_port * 4;
 	mutex_init(&priv->sram_mutex);
 
-	of_property_read_u16(dev->of_node, "event_frame_done",
+	of_property_read_u16(dev->of_node, "event-frame-done",
 			     &priv->event_eof);
-	of_property_read_u16(dev->of_node, "event_bufa",
+	of_property_read_u16(dev->of_node, "event-bufa",
 			     &priv->event_bufa);
-	of_property_read_u16(dev->of_node, "event_bufb",
+	of_property_read_u16(dev->of_node, "event-bufb",
 			     &priv->event_bufb);
-	of_property_read_u16(dev->of_node, "event_buf_next",
+	of_property_read_u16(dev->of_node, "event-buf-next",
 			     &priv->event_buf_next);
 
 	/* get index of wrot by alias */
-	priv->idx = of_alias_get_id(dev->of_node, "mml_wrot");
+	priv->idx = of_alias_get_id(dev->of_node, "mml-wrot");
 
 	/* parse inline rot node for racing mode */
 	priv->irot_base[0] = mml_get_node_base_pa(pdev, "inlinerot", 0, &priv->irot_va[0]);
@@ -2277,6 +2453,10 @@ static int probe(struct platform_device *pdev)
 		priv->event_bufb,
 		priv->event_buf_next);
 
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	mml_init_swpm_comp(mml_mon_wrot + priv->idx, &priv->comp);
+#endif
+
 	return ret;
 }
 
@@ -2302,6 +2482,14 @@ const struct of_device_id mml_wrot_driver_dt_match[] = {
 	},
 	{
 		.compatible = "mediatek,mt6895-mml_wrot",
+		.data = &mml_wrot_data
+	},
+	{
+		.compatible = "mediatek,mt6985-mml_wrot",
+		.data = &mt6985_wrot_data,
+	},
+	{
+		.compatible = "mediatek,mt6886-mml_wrot",
 		.data = &mml_wrot_data
 	},
 	{},
@@ -2356,7 +2544,7 @@ static s32 dbg_get(char *buf, const struct kernel_param *kp)
 				comp->id, comp->sub_idx, comp->base_pa,
 				comp->name ? comp->name : "(null)", comp->bound);
 			length += snprintf(buf + length, PAGE_SIZE - length,
-				"  -         larb_port: %d @%08x pw: %d clk: %d\n",
+				"  -         larb_port: %d @%llx pw: %d clk: %d\n",
 				comp->larb_port, comp->larb_base,
 				comp->pw_cnt, comp->clk_cnt);
 			length += snprintf(buf + length, PAGE_SIZE - length,

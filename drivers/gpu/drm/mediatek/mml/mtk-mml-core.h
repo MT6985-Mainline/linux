@@ -9,6 +9,7 @@
 #define __MTK_MML_CORE_H__
 
 #include <linux/atomic.h>
+#include <linux/completion.h>
 #include <linux/dma-fence.h>
 #include <linux/file.h>
 #include <linux/kref.h>
@@ -19,20 +20,28 @@
 #include <linux/mailbox/mtk-cmdq-mailbox-ext.h>
 #include <linux/mailbox_client.h>
 #include <linux/soc/mediatek/mtk-cmdq-ext.h>
-#include <linux/soc/mediatek/mtk-cmdq-ext.h>
 #include <linux/types.h>
 #include <linux/time.h>
 #include <linux/workqueue.h>
 #include <mtk-interconnect.h>
 #include <cmdq-util.h>
+
 #include "mtk-mml.h"
 #include "mtk-mml-buf.h"
 #include "mtk-mml-driver.h"
+#include "mtk-mml-drm.h"
 #include "mtk-mml-pq.h"
 
 extern int mtk_mml_msg;
 extern int mml_cmdq_err;
+extern int mml_qos;
 extern int mml_qos_log;
+
+#define align_down(x, n)	((x) & ~((n) - 1))
+#define align_up(x, n)		(((x) + ((n) - 1)) & ~((n) - 1))
+
+/* define in mtk-mml-wrot.c */
+extern int mml_wrot_bkgd_en;
 
 #define mml_msg(fmt, args...) \
 do { \
@@ -60,6 +69,37 @@ do { \
 		pr_notice("[mml]" fmt "\n", ##args); \
 } while (0)
 
+#define DB_OPT_MML	(DB_OPT_DEFAULT | DB_OPT_PROC_CMDQ_INFO | \
+	DB_OPT_MMPROFILE_BUFFER | DB_OPT_FTRACE | DB_OPT_DUMP_DISPLAY)
+
+#if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
+#define mml_aee(key, fmt, args...) \
+	do { \
+		char tag[LINK_MAX]; \
+		int len = snprintf(tag, LINK_MAX, "CRDISPATCH_KEY:%s", key); \
+		if (len >= LINK_MAX) \
+			pr_debug("len:%d over max:%d\n", \
+				__func__, __LINE__, len, LINK_MAX); \
+		cmdq_aee(fmt, ##args); \
+		cmdq_util_error_save("[mml][aee] "fmt"\n", ##args); \
+		aee_kernel_warning_api(__FILE__, __LINE__, \
+			DB_OPT_CMDQ, tag, fmt, ##args); \
+	} while (0)
+#else
+#define mml_aee(key, fmt, args...) \
+	do { \
+		char tag[LINK_MAX]; \
+		int len = snprintf(tag, LINK_MAX, "CRDISPATCH_KEY:%s", key); \
+		if (len >= LINK_MAX) \
+			pr_debug("len:%d over max:%d\n", \
+				__func__, __LINE__, len, LINK_MAX); \
+		cmdq_aee(fmt" (aee not ready)", ##args); \
+		cmdq_util_error_save("[mml][aee] "fmt"\n", ##args); \
+	} while (0)
+
+#endif
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
 /* mml ftrace */
 extern int mml_trace;
 
@@ -91,6 +131,17 @@ extern int mml_trace;
 	if (mml_trace) \
 		mml_trace_end(); \
 } while (0)
+#else
+
+#define mml_trace_begin_tid(...)
+#define mml_trace_begin(...)
+#define mml_trace_end()
+#define mml_trace_tag_start(tag)
+#define mml_trace_tag_end(tag)
+#define mml_trace_ex_begin(...)
+#define mml_trace_ex_end()
+
+#endif
 
 /* mml pq control */
 extern int mml_pq_disable;
@@ -100,13 +151,12 @@ extern int mml_slt;
 
 /* racing mode ut and debug */
 extern int mml_racing_ut;
-extern int mml_racing_timeout;
 extern int mml_racing_urgent;
-extern int mml_racing_wdone_eoc;
+extern int mml_racing_eoc;
 
 #define MML_PIPE_CNT		2
-#define MML_MAX_PATH_NODES	16 /* must align MAX_TILE_FUNC_NO in tile_driver.h */
-#define MML_MAX_PATH_CACHES	16
+#define MML_MAX_PATH_NODES	18 /* must align MAX_TILE_FUNC_NO in tile_driver.h */
+#define MML_MAX_PATH_CACHES	18
 #define MML_MAX_CMDQ_CLTS	4
 #define MML_MAX_OPPS		5
 #define MML_MAX_TPUT		800
@@ -132,6 +182,8 @@ struct mml_task_ops {
 	s32 (*dup_task)(struct mml_task *task, u32 pipe);
 	struct mml_tile_cache *(*get_tile_cache)(struct mml_task *task, u32 pipe);
 	void (*kt_setsched)(void *adaptor_ctx);
+	void (*ddren)(struct mml_task *task, struct cmdq_pkt *pkt, bool enable);
+	void (*dispen)(struct mml_task *task, bool enable);
 };
 
 struct mml_config_ops {
@@ -146,7 +198,7 @@ struct mml_cap {
 
 struct mml_path_node {
 	u8 id;
-	struct mml_path_node *prev;
+	struct mml_path_node *prev[MML_MAX_INPUTS];
 	struct mml_path_node *next[MML_MAX_OUTPUTS];
 	struct mml_comp *comp;
 	u8 out_idx;
@@ -189,6 +241,9 @@ struct mml_topology_path {
 	u8 tile_engines[MML_MAX_PATH_NODES];
 	u8 tile_engine_cnt;
 
+	/* Describe which engine is region pq in */
+	u32 pq_rdma_id;
+
 	/* Describe which engine is out0 and which is out1 */
 	u32 out_engine_ids[MML_MAX_OUTPUTS];
 
@@ -209,7 +264,8 @@ struct mml_topology_path {
 
 struct mml_topology_ops {
 	enum mml_mode (*query_mode)(struct mml_dev *mml,
-				    struct mml_frame_info *info);
+				    struct mml_frame_info *info,
+				    u32 *reason);
 	s32 (*init_cache)(struct mml_dev *mml,
 			  struct mml_topology_cache *cache,
 			  struct cmdq_client **clts,
@@ -234,6 +290,7 @@ struct mml_topology_cache {
 	struct mml_topology_path paths[MML_MAX_PATH_CACHES];
 	struct mml_path_client path_clts[MML_MAX_CMDQ_CLTS];
 	struct regulator *reg;
+	struct clk *dvfs_clk;
 	u32 opp_cnt;
 	u32 opp_speeds[MML_MAX_OPPS];
 	int opp_volts[MML_MAX_OPPS];
@@ -253,20 +310,25 @@ struct mml_comp_config {
 };
 
 struct mml_pipe_cache {
+	/* command reuse */
 	u32 label_cnt;
-
-	/* Fillin when core call prepare. Use in prepare and make command */
-	struct mml_comp_config cfg[MML_MAX_PATH_NODES];
 
 	/* qos part */
 	u32 total_datasize;
 	u32 max_pixel;
+
+	/* Set in core and comp prepare. Used in tile prepare and make command */
+	struct mml_comp_config cfg[MML_MAX_PATH_NODES];
 };
 
 struct mml_frame_config {
 	struct list_head entry;
 	struct mml_frame_info info;
+	/* frame output pixel size */
 	struct mml_frame_size frame_out[MML_MAX_OUTPUTS];
+	/* direct-link input roi offset and output rect */
+	struct mml_rect dl_in[MML_DL_OUT_CNT];
+	struct mml_rect dl_out[MML_DL_OUT_CNT];
 	struct list_head tasks;
 	struct list_head await_tasks;
 	struct list_head done_tasks;
@@ -291,6 +353,7 @@ struct mml_frame_config {
 	struct mml_dev *mml;
 
 	/* adaptor */
+	u32 job_id;
 	u32 last_jobid;
 
 	/* core */
@@ -316,9 +379,11 @@ struct mml_frame_config {
 	bool shadow:1;
 	bool framemode:1;
 	bool nocmd:1;
+	bool err:1;
 
 	/* tile */
 	struct mml_tile_output *tile_output[MML_PIPE_CNT];
+	struct timespec64 dvfs_boost_time;
 };
 
 struct mml_dma_buf {
@@ -346,6 +411,7 @@ struct mml_file_buf {
 
 struct mml_task_buffer {
 	struct mml_file_buf src;
+	struct mml_file_buf seg_map;
 	struct mml_file_buf dest[MML_MAX_OUTPUTS];
 	u8 dest_cnt;
 	bool flushed;
@@ -385,7 +451,20 @@ struct mml_task_pipe {
 	struct list_head entry_clt;
 	u32 throughput;
 	u32 bandwidth;
+	struct completion ready;	/* ready for submit */
+
+	struct {
+		bool clk;
+	} en;
 };
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+enum mml_dump_buf_t {
+	MMLDUMPT_SRC,
+	MMLDUMPT_DEST,
+	MMLDUMPT_CNT
+};
+#endif
 
 struct mml_task {
 	struct list_head entry;
@@ -418,16 +497,61 @@ struct mml_task {
 
 	/* mml pq task */
 	struct mml_pq_task *pq_task;
+
+	bool err;
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	/* frame dump */
+	bool dump_queued[MMLDUMPT_CNT];
+#endif
+
+	u64 config_pipe_time[MML_PIPE_CNT];
+	u64 bw_time[MML_PIPE_CNT];
+	u64 freq_time[MML_PIPE_CNT];
+	u64 wait_fence_time[MML_PIPE_CNT];
+	u64 flush_time[MML_PIPE_CNT];
+	u32 src_crc[MML_PIPE_CNT];
+	u32 dest_crc[MML_PIPE_CNT];
 };
 
 struct tile_func_block;
 union mml_tile_data;
+
+struct mml_tile_region {
+	u16 xs;
+	u16 xe;
+	u16 ys;
+	u16 ye;
+};
+
+struct mml_tile_offset {
+	u32 x;
+	u32 y;
+	u32 x_sub;
+	u32 y_sub;
+};
+
+struct mml_tile_engine {
+	/* component id for dump */
+	u8 comp_id;
+
+	/* tile input/output region */
+	struct mml_tile_region in;
+	struct mml_tile_region out;
+
+	struct mml_tile_offset luma;
+	struct mml_tile_offset chroma;
+};
 
 struct mml_comp_tile_ops {
 	s32 (*prepare)(struct mml_comp *comp, struct mml_task *task,
 		       struct mml_comp_config *ccfg,
 		       struct tile_func_block *func,
 		       union mml_tile_data *data);
+	s32 (*region_pq_bw)(struct mml_comp *comp, struct mml_task *task,
+		    struct mml_comp_config *ccfg,
+		    struct mml_tile_engine *ref_tile,
+		    struct mml_tile_engine *tile);
 };
 
 struct mml_comp_config_ops {
@@ -495,39 +619,15 @@ struct mml_comp {
 	u32 larb_port;
 	s32 pw_cnt;
 	s32 clk_cnt;
-	struct icc_path *icc_path;
+	u32 cur_bw;
+	u32 cur_peak;
+	struct mtk_icc_path *icc_path;
 	const struct mml_comp_tile_ops *tile_ops;
 	const struct mml_comp_config_ops *config_ops;
 	const struct mml_comp_hw_ops *hw_ops;
 	const struct mml_comp_debug_ops *debug_ops;
 	const char *name;
 	bool bound;
-};
-
-struct mml_tile_region {
-	u16 xs;
-	u16 xe;
-	u16 ys;
-	u16 ye;
-};
-
-struct mml_tile_offset {
-	u16 x;
-	u16 y;
-	u32 x_sub;
-	u32 y_sub;
-};
-
-struct mml_tile_engine {
-	/* component id for dump */
-	u8 comp_id;
-
-	/* tile input/output region */
-	struct mml_tile_region in;
-	struct mml_tile_region out;
-
-	struct mml_tile_offset luma;
-	struct mml_tile_offset chroma;
 };
 
 struct mml_tile_config {
@@ -561,12 +661,14 @@ struct mml_tile_output {
 	u16 h_tile_cnt;
 	/* total vertical tile number */
 	u16 v_tile_cnt;
+	/* source crop with tile overhead */
+	struct mml_rect src_crop;
 	struct mml_tile_config *tiles;
 };
 
 struct mml_frm_dump_data {
 	const char *prefix;
-	char name[50];
+	char name[128];
 	void *frame;
 	u32 bufsize;
 	u32 size;
@@ -588,6 +690,24 @@ static inline struct mml_tile_engine *config_get_tile(
 		cfg->tile_output[ccfg->pipe]->tiles[idx].tile_engines;
 
 	return &engines[ccfg->tile_eng_idx];
+}
+
+/* config_get_next_node_tile - helper inline func which uses tile index to get
+ * next node mml_tile_engine instance inside config.
+ *
+ * @cfg:	The mml_frame_config contains tile output.
+ * @ccfg:	The mml_comp_config of which tile engine.
+ * @idx:	Tile index to mml_tile_output->tiles array.
+ *
+ * Return:	mml_tile_engine struct pointer to related tile and engine.
+ */
+static inline struct mml_tile_engine *config_get_next_node_tile(
+	struct mml_frame_config *cfg, struct mml_comp_config *ccfg, u32 idx)
+{
+	struct mml_tile_engine *engines =
+		cfg->tile_output[ccfg->pipe]->tiles[idx].tile_engines;
+
+	return &engines[ccfg->node->next[0]->tile_eng_idx];
 }
 
 /*
@@ -760,7 +880,54 @@ s32 mml_write_array(struct cmdq_pkt *pkt, dma_addr_t addr, u32 value, u32 mask,
 void mml_update_array(struct mml_task_reuse *reuse,
 	struct mml_reuse_array *reuses, u32 reuse_idx, u32 off_idx, u32 value);
 
-
 int tracing_mark_write(char *fmt, ...);
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+
+/* debug parameter to enable dumpsrv */
+extern int mml_dump_srv;
+extern int mml_dump_srv_opt;
+
+/* control dumpsrv function work or stop */
+enum dump_srv_ctrl {
+	DUMPCTRL_DISABLE = 0,
+	DUMPCTRL_PAUSE,
+	DUMPCTRL_ENABLE,
+};
+
+/* bits of mml_dump_srv_opt */
+enum dump_srv_option {
+	DUMPOPT_SRC = 0x1,
+	DUMPOPT_DEST = 0x2,
+	DUMPOPT_ALL = 0x3,
+	DUMPOPT_SRC_ASYNC = 0x4,
+	DUMPOPT_DEST_ASYNC = 0x8,
+	DUMPOPT_ONCE = 0x10,
+};
+
+/* mml_dump_buf - wakeup dump service to dump buffer into file
+ *
+ * @task:	mml task to dump
+ * @data:	frame data related to buffer, src or one of dest
+ * @width:	buffer width
+ * @height:	buffer height
+ * @prefix:	string insert into file name
+ * @fmt:	formating string
+ * @buf:	mml buffer to dump
+ * @buf_type:	buffer type, source or destination
+ * @async:	set true to force config thread wait dump complete before next task
+ */
+void mml_dump_buf(struct mml_task *task, struct mml_frame_data *data,
+	u32 width, u32 height, const char *prefix,
+	char *fmt, struct mml_file_buf *buf, enum mml_dump_buf_t buf_type, bool async);
+
+/* mml_dump_wait - wait the dump finish of last call to mml_dump_buf
+ *
+ * @task:	mml task to dump
+ * @buf_type:	buffer type, source or destination
+ */
+void mml_dump_wait(struct mml_task *task, enum mml_dump_buf_t buf_type);
+
+#endif	/* CONFIG_MTK_MML_DEBUG */
 
 #endif	/* __MTK_MML_CORE_H__ */

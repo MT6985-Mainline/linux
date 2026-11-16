@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/atomic.h>
 #include <linux/component.h>
@@ -22,6 +23,7 @@
 #include <linux/soc/mediatek/mtk-cmdq-ext.h>
 #include <slbc_ops.h>
 
+#include "mtk-mml-dle-adaptor.h"
 #include "mtk-mml-driver.h"
 #include "mtk-mml-core.h"
 #include "mtk-mml-pq-core.h"
@@ -32,27 +34,51 @@
 struct mml_record {
 	u32 jobid;
 
-	u64 src_iova[MML_MAX_PLANES];
-	u64 dest_iova[MML_MAX_PLANES];
+	u64 src_iova;
+	u64 dest_iova;
 
-	u32 src_size[MML_MAX_PLANES];
-	u32 dest_size[MML_MAX_PLANES];
+	u32 src_size;
+	u32 dest_size;
 
-	u32 src_plane_offset[MML_MAX_PLANES];
-	u32 dest_plane_offset[MML_MAX_PLANES];
+	u32 src_plane_offset;
+	u32 dest_plane_offset;
 
 	u64 src_iova_map_time;
 	u64 dest_iova_map_time;
 	u64 src_iova_unmap_time;
 	u64 dest_iova_unmap_time;
+
+	u64 config_pipe_time[MML_PIPE_CNT];
+	u64 bw_time[MML_PIPE_CNT];
+	u64 freq_time[MML_PIPE_CNT];
+	u64 wait_fence_time[MML_PIPE_CNT];
+	u64 flush_time[MML_PIPE_CNT];
+
+	u32 cfg_jobid;
+	u32 task;
+	u8 state;
+	u8 err;
+	u8 ref;
+
+	u32 src_crc[MML_PIPE_CNT];
+	u32 dest_crc[MML_PIPE_CNT];
 };
 
 /* 512 records
  * note that (MML_RECORD_NUM - 1) will use as mask during track,
  * so change this variable by 1 << N
  */
-#define MML_RECORD_NUM		(1 << 9)
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+#define MML_RECORD_NUM		(1 << 10)
+#else
+#define MML_RECORD_NUM		(1 << 8)
+#endif
 #define MML_RECORD_NUM_MASK	(MML_RECORD_NUM - 1)
+
+int mml_pipe0_dest_crc;
+module_param(mml_pipe0_dest_crc, int, 0644);
+int mml_pipe1_dest_crc;
+module_param(mml_pipe1_dest_crc, int, 0644);
 
 struct mml_dev {
 	struct platform_device *pdev;
@@ -69,6 +95,7 @@ struct mml_dev {
 	struct mml_topology_cache *topology;
 	struct mutex ctx_mutex;
 	struct mutex clock_mutex;
+	u32 current_volt;
 
 	/* sram operation */
 	bool racing_en;
@@ -81,6 +108,7 @@ struct mml_dev {
 	u16 event_mml_ready;
 	u16 event_disp_ready;
 	u16 event_mml_stop;
+	u16 event_mml_target;
 
 	/* wack lock to prevent system off */
 	struct wakeup_source *wake_lock;
@@ -93,6 +121,9 @@ struct mml_dev {
 	struct mutex record_mutex;
 	u16 record_idx;
 };
+
+int mml_racing_bw;
+module_param(mml_racing_bw, int, 0644);
 
 struct platform_device *mml_get_plat_device(struct platform_device *pdev)
 {
@@ -117,58 +148,52 @@ struct platform_device *mml_get_plat_device(struct platform_device *pdev)
 }
 EXPORT_SYMBOL_GPL(mml_get_plat_device);
 
-static void mml_qos_init(struct mml_dev *mml)
+static int mml_qos_init(struct mml_dev *mml, struct mml_topology_cache *tp)
 {
 	struct device *dev = &mml->pdev->dev;
-	struct mml_topology_cache *tp = mml_topology_get_cache(mml);
 	struct dev_pm_opp *opp;
-	int num;
 	unsigned long freq = 0;
+	int num, ret;
 	u32 i;
 
-	if (!tp) {
-		mml_err("%s topology fail so stop qos", __func__);
-		return;
-	}
-
 	mutex_init(&tp->qos_mutex);
+	ret = devm_pm_opp_of_add_table(dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "MML OPP table unavailable\n");
 
-	/* Create opp table from dts */
-	dev_pm_opp_of_add_table(dev);
-
-	/* Get regulator instance by name. */
-	tp->reg = devm_regulator_get(dev, "dvfsrc-vcore");
+	tp->reg = devm_regulator_get_optional(dev, "mmdvfs-dvfsrc-vcore");
 	if (IS_ERR(tp->reg)) {
-		mml_log("%s not support dvfs %d", __func__, (int)PTR_ERR(tp->reg));
+		ret = PTR_ERR(tp->reg);
+		if (ret != -ENODEV && ret != -ENOENT)
+			return dev_err_probe(dev, ret, "MML Vcore unavailable\n");
 		tp->reg = NULL;
-		return;
+		tp->dvfs_clk = devm_clk_get(dev, "mmdvfs_clk");
+		if (IS_ERR(tp->dvfs_clk))
+			return dev_err_probe(dev, PTR_ERR(tp->dvfs_clk),
+					     "MML DVFS clock unavailable\n");
 	}
 
-	num = dev_pm_opp_get_opp_count(dev); /* number of available opp */
-	if (num <= 0) {
-		mml_err("%s no available opp table %d", __func__, num);
-		return;
-	}
+	num = dev_pm_opp_get_opp_count(dev);
+	if (num <= 0)
+		return num < 0 ? num : -ENODEV;
+	if (num > ARRAY_SIZE(tp->opp_speeds))
+		return -E2BIG;
 
-	tp->opp_cnt = (u32)num;
-	if (tp->opp_cnt > ARRAY_SIZE(tp->opp_speeds)) {
-		mml_err("%s opp num more than table size %u %u",
-			__func__, tp->opp_cnt, (u32)ARRAY_SIZE(tp->opp_speeds));
-		tp->opp_cnt = ARRAY_SIZE(tp->opp_speeds);
-	}
-
-	i = 0;
-	while (!IS_ERR(opp = dev_pm_opp_find_freq_ceil(dev, &freq))) {
-		/* available freq from table, store in MHz */
-		tp->opp_speeds[i] = (u32)div_u64(freq, 1000000);
+	for (i = 0; i < num; i++) {
+		opp = dev_pm_opp_find_freq_ceil(dev, &freq);
+		if (IS_ERR(opp))
+			return PTR_ERR(opp);
+		/* Keep the stock five-MHz throughput margin. */
+		tp->opp_speeds[i] = (u32)div_u64(freq, 1000000) - 5;
 		tp->opp_volts[i] = dev_pm_opp_get_voltage(opp);
 		tp->freq_max = tp->opp_speeds[i];
-		mml_log("mml opp %u: %uMHz\t%d",
+		dev_pm_opp_put(opp);
+		mml_log("mml opp %u: %uMHz voltage %u",
 			i, tp->opp_speeds[i], tp->opp_volts[i]);
 		freq++;
-		i++;
-		dev_pm_opp_put(opp);
 	}
+	tp->opp_cnt = num;
+	return 0;
 }
 
 u32 mml_qos_update_tput(struct mml_dev *mml)
@@ -186,30 +211,73 @@ u32 mml_qos_update_tput(struct mml_dev *mml)
 	}
 
 	for (i = 0; i < tp->opp_cnt; i++) {
-		if (tput <= tp->opp_speeds[i])
+		if (tput < tp->opp_speeds[i])
 			break;
 	}
 	i = min(i, tp->opp_cnt - 1);
 	volt = tp->opp_volts[i];
-	ret = regulator_set_voltage(tp->reg, volt, INT_MAX);
-	if (ret)
-		mml_err("%s fail to set volt %d", __func__, volt);
-	else
-		mml_msg("%s volt %d (%u) tput %u", __func__, volt, i, tput);
+	if (mml->current_volt == volt)	/* skip for better performance */
+		goto done;
 
+	mml_msg_qos("%s dvfs update %u to %u(%u)",
+		__func__, mml->current_volt, volt, tp->opp_speeds[i]);
+	mml->current_volt = volt;
+	mml_trace_begin("mml_volt_%u", volt);
+	if (tp->reg) {
+		ret = regulator_set_voltage(tp->reg, volt, INT_MAX);
+		if (ret)
+			mml_err("%s fail to set volt %d", __func__, volt);
+		else
+			mml_msg("%s volt %d (%u) tput %u", __func__, volt, i, tput);
+	} else if (tp->dvfs_clk) {
+		/* set dvfs clock rate by unit Hz */
+		ret = clk_set_rate(tp->dvfs_clk, tp->opp_speeds[i] * 1000000);
+		if (ret)
+			mml_err("%s fail to set rate %uMHz error %d",
+				__func__, tp->opp_speeds[i], ret);
+		else
+			mml_msg("%s rate %uMHz (%u) tput %u",
+				__func__, tp->opp_speeds[i], i, tput);
+	}
+	mml_trace_end();
+
+#if IS_ENABLED(CONFIG_MTK_MML_DEBUG)
+	mml_update_freq_status(tp->opp_speeds[i]);
+#endif
+
+done:
 	return tp->opp_speeds[i];
 }
 
-static void create_dev_topology_locked(struct mml_dev *mml)
+static int create_dev_topology_locked(struct mml_dev *mml)
 {
-	/* make sure topology ready before client can use mml */
-	if (!mml->topology) {
-		mml->topology = mml_topology_create(mml, mml->pdev,
-			mml->cmdq_clts, mml->cmdq_clt_cnt);
-		mml_qos_init(mml);
+	struct device *dev = &mml->pdev->dev;
+	struct mml_topology_cache *tp;
+	void *group;
+	int ret;
+
+	if (mml->topology)
+		return 0;
+	group = devres_open_group(dev, NULL, GFP_KERNEL);
+	if (!group)
+		return -ENOMEM;
+	tp = mml_topology_create(mml, mml->pdev, mml->cmdq_clts,
+				 mml->cmdq_clt_cnt);
+	if (IS_ERR(tp)) {
+		ret = PTR_ERR(tp);
+		goto release;
 	}
-	if (IS_ERR(mml->topology))
-		mml_err("topology create fail %ld", PTR_ERR(mml->topology));
+	ret = mml_qos_init(mml, tp);
+	if (ret)
+		goto release;
+	mml->topology = tp;
+	devres_close_group(dev, group);
+	devres_remove_group(dev, group);
+	return 0;
+
+release:
+	devres_release_group(dev, group);
+	return ret;
 }
 
 struct mml_drm_ctx *mml_dev_get_drm_ctx(struct mml_dev *mml,
@@ -218,17 +286,26 @@ struct mml_drm_ctx *mml_dev_get_drm_ctx(struct mml_dev *mml,
 	struct mml_drm_param *disp))
 {
 	struct mml_drm_ctx *ctx;
+	int ret;
 
 	mutex_lock(&mml->ctx_mutex);
 
-	create_dev_topology_locked(mml);
-	if (IS_ERR(mml->topology)) {
-		ctx = ERR_CAST(mml->topology);
+	ret = create_dev_topology_locked(mml);
+	if (ret) {
+		ctx = ERR_PTR(ret);
 		goto exit;
 	}
-
-	if (atomic_inc_return(&mml->drm_cnt) == 1)
-		mml->drm_ctx = ctx_create(mml, disp);
+	if (!atomic_read(&mml->drm_cnt)) {
+		ctx = ctx_create(mml, disp);
+		if (IS_ERR(ctx))
+			goto exit;
+		if (!ctx) {
+			ctx = ERR_PTR(-ENOMEM);
+			goto exit;
+		}
+		mml->drm_ctx = ctx;
+	}
+	atomic_inc(&mml->drm_cnt);
 	ctx = mml->drm_ctx;
 
 exit:
@@ -256,22 +333,31 @@ void mml_dev_put_drm_ctx(struct mml_dev *mml,
 
 struct mml_dle_ctx *mml_dev_get_dle_ctx(struct mml_dev *mml,
 	struct mml_dle_param *dl,
-	struct mml_dle_ctx *(*ctx_create)(struct mml_dev *mml,
-	struct mml_dle_param *dl))
+	void (*ctx_setup)(struct mml_dle_ctx *ctx, struct mml_dle_param *dl))
 {
 	struct mml_dle_ctx *ctx;
+	int ret;
 
 	mutex_lock(&mml->ctx_mutex);
 
-	create_dev_topology_locked(mml);
-	if (IS_ERR(mml->topology)) {
-		ctx = ERR_CAST(mml->topology);
+	ret = create_dev_topology_locked(mml);
+	if (ret) {
+		ctx = ERR_PTR(ret);
 		goto exit;
 	}
 
-	if (atomic_inc_return(&mml->dle_cnt) == 1)
-		mml->dle_ctx = ctx_create(mml, dl);
+	if (!mml->dle_ctx) {
+		mml->dle_ctx = mml_dle_ctx_create(mml);
+		if (IS_ERR(mml->dle_ctx)) {
+			ctx = mml->dle_ctx;
+			mml->dle_ctx = NULL;
+			goto exit;
+		}
+	}
 	ctx = mml->dle_ctx;
+
+	if (atomic_inc_return(&mml->dle_cnt) == 1)
+		ctx_setup(ctx, dl);
 
 exit:
 	mutex_unlock(&mml->ctx_mutex);
@@ -346,7 +432,7 @@ static inline int of_mml_read_comp_count(const struct device_node *np,
 static int comp_master_init(struct device *dev, struct mml_dev *mml)
 {
 	struct component_match *match = NULL;
-	u32 comp_count;
+	u32 comp_count = 0;
 	ulong i;
 	int ret;
 
@@ -389,6 +475,8 @@ static s32 comp_init(struct platform_device *pdev, struct mml_comp *comp,
 	const char *clkname;
 	int i, ret;
 
+	mml_msg("%s comp id %u %s (%s)", __func__, comp->id, comp->name, clkpropname);
+
 	comp->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (!res) {
 		dev_err(dev, "failed to get resource\n");
@@ -413,9 +501,9 @@ static s32 comp_init(struct platform_device *pdev, struct mml_comp *comp,
 			}
 			comp->clks[i] = of_clk_get_by_name(node, clkname);
 			if (IS_ERR(comp->clks[i])) {
-				dev_err(dev, "failed to get clk %s in %s\n",
-					clkname, node->full_name);
-				ret = PTR_ERR(comp->clks[i]);
+				dev_err(dev, "failed to get clk %s in %s err %d\n",
+					clkname, node->full_name,
+					PTR_ERR(comp->clks[i]));
 			} else {
 				i++;
 			}
@@ -492,11 +580,22 @@ s32 mml_subcomp_init(struct platform_device *comp_pdev,
 }
 EXPORT_SYMBOL_GPL(mml_subcomp_init);
 
+static void mml_release_larb_device(void *dev)
+{
+	put_device(dev);
+}
+
+static void mml_release_icc_path(void *path)
+{
+	mtk_icc_put(path);
+}
+
 s32 mml_comp_init_larb(struct mml_comp *comp, struct device *dev)
 {
 	struct platform_device *larb_pdev;
 	struct of_phandle_args larb_args;
 	struct resource res;
+	int ret;
 
 	/* parse larb node and port from dts */
 	if (of_parse_phandle_with_fixed_args(dev->of_node, "mediatek,larb",
@@ -516,20 +615,35 @@ s32 mml_comp_init_larb(struct mml_comp *comp, struct device *dev)
 	}
 	/* larb dev for smi api */
 	comp->larb_dev = &larb_pdev->dev;
+	ret = devm_add_action_or_reset(dev, mml_release_larb_device, comp->larb_dev);
+	if (ret) {
+		comp->larb_dev = NULL;
+		return ret;
+	}
 
 	/* also do mmqos and mmdvfs since dma component do init here */
-	comp->icc_path = of_mtk_icc_get(dev, "mml_dma");
-	if (IS_ERR_OR_NULL(comp->icc_path)) {
-		mml_err("%s not support qos", __func__);
-		comp->icc_path = NULL;
+#ifndef MML_FPGA
+	if (of_property_match_string(dev->of_node, "interconnect-names", "mml_dma") >= 0) {
+		comp->icc_path = of_mtk_icc_get(dev, "mml_dma");
+		if (IS_ERR_OR_NULL(comp->icc_path)) {
+			ret = comp->icc_path ? PTR_ERR(comp->icc_path) : -ENODEV;
+			comp->icc_path = NULL;
+			return dev_err_probe(dev, ret, "MML DMA bandwidth provider is unavailable\n");
+		}
+		ret = devm_add_action_or_reset(dev, mml_release_icc_path, comp->icc_path);
+		if (ret) {
+			comp->icc_path = NULL;
+			return ret;
+		}
 	}
+#endif
 
 	return 0;
 }
 
 s32 mml_comp_pw_enable(struct mml_comp *comp)
 {
-	int ret;
+	int ret = 0;
 
 	comp->pw_cnt++;
 	if (comp->pw_cnt > 1)
@@ -545,10 +659,12 @@ s32 mml_comp_pw_enable(struct mml_comp *comp)
 		return 0;
 	}
 
+#ifndef MML_FPGA
 	ret = mtk_smi_larb_get(comp->larb_dev);
-
 	if (ret)
 		mml_err("%s enable fail ret:%d", __func__, ret);
+#endif
+
 	return ret;
 }
 
@@ -568,7 +684,9 @@ s32 mml_comp_pw_disable(struct mml_comp *comp)
 		return 0;
 	}
 
+#ifndef MML_FPGA
 	mtk_smi_larb_put(comp->larb_dev);
+#endif
 
 	return 0;
 }
@@ -576,6 +694,7 @@ s32 mml_comp_pw_disable(struct mml_comp *comp)
 s32 mml_comp_clk_enable(struct mml_comp *comp)
 {
 	u32 i;
+	int ret;
 
 	comp->clk_cnt++;
 	if (comp->clk_cnt > 1)
@@ -587,9 +706,11 @@ s32 mml_comp_clk_enable(struct mml_comp *comp)
 	}
 
 	for (i = 0; i < ARRAY_SIZE(comp->clks); i++) {
-		if (IS_ERR(comp->clks[i]))
+		if (IS_ERR_OR_NULL(comp->clks[i]))
 			break;
-		clk_prepare_enable(comp->clks[i]);
+		ret = clk_prepare_enable(comp->clks[i]);
+		if (ret)
+			mml_err("%s clk_prepare_enable fail %d", __func__, ret);
 	}
 
 	return 0;
@@ -615,7 +736,7 @@ s32 mml_comp_clk_disable(struct mml_comp *comp)
 	call_hw_op(comp, qos_clear);
 
 	for (i = 0; i < ARRAY_SIZE(comp->clks); i++) {
-		if (IS_ERR(comp->clks[i]))
+		if (IS_ERR_OR_NULL(comp->clks[i]))
 			break;
 		clk_disable_unprepare(comp->clks[i]);
 	}
@@ -646,15 +767,15 @@ static u32 mml_calc_bw(u64 data, u32 pixel, u64 throughput)
 
 static u32 mml_calc_bw_racing(u32 datasize)
 {
-	/* hrt bw: width * height * bpp * fps * 1.25 * 1.33 = HRT MB/s
+	/* hrt bw: width * height * bpp * fps * 1.25 * 1.75 = HRT MB/s
 	 *
 	 * width * height * bpp = datasize in bytes
 	 * the 1.25 (v-blanking) separate to * 10 / 8
-	 * the 1.33 (occupy bandwidth) separate to * 4 / 3
+	 * the 1.75 (occupy bandwidth for IR) separate to * 7 / 4
 	 *
-	 * so div_u64((u64)(datasize * 120 * 10 * 4) >> 3, 3 * 1000000)
+	 * so div_u64((u64)(datasize * 120 * 10 * 7) >> 3, 4 * 1000000)
 	 */
-	return (u32)div_u64((u64)datasize, 5000);
+	return (u32)div_u64((u64)datasize * 21, 80000);
 }
 
 void mml_comp_qos_set(struct mml_comp *comp, struct mml_task *task,
@@ -666,22 +787,42 @@ void mml_comp_qos_set(struct mml_comp *comp, struct mml_task *task,
 	bool hrt;
 
 	datasize = comp->hw_ops->qos_datasize_get(task, ccfg);
-	if (cfg->info.mode == MML_MODE_RACING) {
+	if (!datasize) {
+		hrt = false;
+		bandwidth = 0;
+		hrt_bw = 0;
+	} else if (cfg->info.mode == MML_MODE_RACING) {
 		hrt = true;
 		bandwidth = mml_calc_bw_racing(datasize);
-		if (unlikely(mml_racing_urgent))
-			bandwidth = U32_MAX;
 		hrt_bw = cfg->disp_hrt;
+		if (unlikely(mml_racing_bw)) {
+			bandwidth = mml_racing_bw;
+			hrt_bw = mml_racing_bw * 1000;
+		}
 	} else {
 		hrt = false;
 		bandwidth = mml_calc_bw(datasize, cache->max_pixel, throughput);
+		if (unlikely(mml_qos)) {
+			u32 qos = mml_qos >> 16;
+
+			if (qos)
+				bandwidth = qos;
+		}
 		hrt_bw = 0;
 	}
 
 	/* store for debug log */
 	task->pipe[ccfg->pipe].bandwidth = max(bandwidth,
 		task->pipe[ccfg->pipe].bandwidth);
-	mtk_icc_set_bw(comp->icc_path, MBps_to_icc(bandwidth), hrt_bw);
+	if (comp->cur_bw != bandwidth || comp->cur_peak != hrt_bw) {
+		mml_trace_begin("mml_bw_%u_%u", bandwidth, hrt_bw);
+#ifndef MML_FPGA
+		mtk_icc_set_bw(comp->icc_path, MBps_to_icc(bandwidth), hrt_bw);
+#endif
+		comp->cur_bw = bandwidth;
+		comp->cur_peak = hrt_bw;
+		mml_trace_end();
+	}
 
 	mml_msg_qos("%s comp %u %s qos bw %u(%u) by throughput %u pixel %u size %u%s",
 		__func__, comp->id, comp->name, bandwidth, hrt_bw / 1000,
@@ -691,7 +832,12 @@ void mml_comp_qos_set(struct mml_comp *comp, struct mml_task *task,
 
 void mml_comp_qos_clear(struct mml_comp *comp)
 {
+#ifndef MML_FPGA
 	mtk_icc_set_bw(comp->icc_path, 0, 0);
+#endif
+	comp->cur_bw = 0;
+	comp->cur_peak = 0;
+
 	mml_msg_qos("%s comp %u %s qos bw clear", __func__, comp->id, comp->name);
 }
 
@@ -702,6 +848,7 @@ static const struct mml_comp_hw_ops mml_hw_ops = {
 
 void __iomem *mml_sram_get(struct mml_dev *mml)
 {
+#ifndef MML_FPGA
 	int ret;
 	void __iomem *sram = NULL;
 
@@ -729,10 +876,14 @@ void __iomem *mml_sram_get(struct mml_dev *mml)
 done:
 	mutex_unlock(&mml->sram_mutex);
 	return sram;
+#else
+	return NULL;
+#endif
 }
 
 void mml_sram_put(struct mml_dev *mml)
 {
+#ifndef MML_FPGA
 	mutex_lock(&mml->sram_mutex);
 
 	mml->sram_cnt--;
@@ -747,6 +898,7 @@ void mml_sram_put(struct mml_dev *mml)
 
 done:
 	mutex_unlock(&mml->sram_mutex);
+#endif
 }
 
 bool mml_racing_enable(struct mml_dev *mml)
@@ -773,6 +925,11 @@ u16 mml_ir_get_disp_ready_event(struct mml_dev *mml)
 u16 mml_ir_get_mml_stop_event(struct mml_dev *mml)
 {
 	return mml->event_mml_stop;
+}
+
+u16 mml_ir_get_target_event(struct mml_dev *mml)
+{
+	return mml->event_mml_target;
 }
 
 void mml_dump_thread(struct mml_dev *mml)
@@ -853,20 +1010,35 @@ void mml_record_track(struct mml_dev *mml, struct mml_task *task)
 	record = &mml->records[mml->record_idx];
 
 	record->jobid = task->job.jobid;
-	for (i = 0; i < MML_MAX_PLANES; i++) {
-		buf = &task->buf;
-
-		record->src_iova[i] = buf->src.dma[i].iova;
-		record->dest_iova[i] = buf->dest[0].dma[i].iova;
-		record->src_size[i] = buf->src.size[i];
-		record->dest_size[i] = buf->dest[0].size[i];
-		record->src_plane_offset[i] = cfg->info.src.plane_offset[i];
-		record->dest_plane_offset[i] = cfg->info.dest[0].data.plane_offset[i];
-	}
+	record->src_iova = buf->src.dma[0].iova;
+	record->dest_iova = buf->dest[0].dma[0].iova;
+	record->src_size = buf->src.size[0];
+	record->dest_size = buf->dest[0].size[0];
+	record->src_plane_offset = cfg->info.src.plane_offset[0];
+	record->dest_plane_offset = cfg->info.dest[0].data.plane_offset[0];
 	record->src_iova_map_time = buf->src.map_time;
 	record->dest_iova_map_time = buf->dest[0].map_time;
 	record->src_iova_unmap_time = buf->src.unmap_time;
 	record->dest_iova_unmap_time = buf->dest[0].unmap_time;
+	record->cfg_jobid = cfg->job_id;
+	record->task = (u32)(unsigned long)task;
+	record->state = task->state;
+	record->err = task->err;
+	record->ref = kref_read(&task->ref);
+
+	for (i = 0; i < MML_PIPE_CNT; i++) {
+		record->config_pipe_time[i] = task->config_pipe_time[i];
+		record->bw_time[i] = task->bw_time[i];
+		record->freq_time[i] = task->freq_time[i];
+		record->wait_fence_time[i] = task->wait_fence_time[i];
+		record->flush_time[i] = task->flush_time[i];
+		record->src_crc[i] = task->src_crc[i];
+		record->dest_crc[i] = task->dest_crc[i];
+	}
+
+	mml_pipe0_dest_crc = task->dest_crc[0];
+	if (MML_PIPE_CNT > 1)
+		mml_pipe1_dest_crc = task->dest_crc[1];
 
 	mml->record_idx = (mml->record_idx + 1) & MML_RECORD_NUM_MASK;
 
@@ -874,8 +1046,12 @@ void mml_record_track(struct mml_dev *mml, struct mml_task *task)
 }
 
 #define REC_TITLE "Index,Job ID," \
-	"src map time,src unmap time,src,src size,plane 0,plane 1, plane 2," \
-	"dest map time,dest unmap time,dest,dest size,plane 0,plane 1, plane 2"
+	"src map time,src unmap time,src,src size,plane 0," \
+	"dest map time,dest unmap time,dest,dest size,plane 0," \
+	"config job,task inst," \
+	"PIPE0 stamp config,bw,freq,fence,flush,PIPE1 stamp config,bw,freq,fence,flush," \
+	"state,ref,error," \
+	"src_crc_pipe0,dest_crc_pipe0,src_crc_pipe1,dest_crc_pipe1"
 
 static int mml_record_print(struct seq_file *seq, void *data)
 {
@@ -893,23 +1069,44 @@ static int mml_record_print(struct seq_file *seq, void *data)
 	seq_puts(seq, REC_TITLE ",\n");
 	for (i = 0; i < ARRAY_SIZE(mml->records); i++) {
 		record = &mml->records[idx];
-		seq_printf(seq, "%u,%u,%llu,%llu,%#llx,%u,%u,%u,%u,%llu,%llu,%#llx,%u,%u,%u,%u,\n",
+		seq_printf(seq,
+			/* idx to task */
+			"%u,%u,%llu,%llu,%#llx,%u,%u,%llu,%llu,%#llx,%u,%u,%u,%#x,"
+			/* config_pipe_time to flush_time */
+			"%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+			/* state to dest crc */
+			"%u,%u,%s,%#010x,%#010x,%#010x,%#010x\n",
 			idx,
 			record->jobid,
 			record->src_iova_map_time,
 			record->src_iova_unmap_time,
-			record->src_iova[0],
-			record->src_size[0],
-			record->src_plane_offset[0],
-			record->src_plane_offset[1],
-			record->src_plane_offset[2],
+			record->src_iova,
+			record->src_size,
+			record->src_plane_offset,
 			record->dest_iova_map_time,
 			record->dest_iova_unmap_time,
-			record->dest_iova[0],
-			record->dest_size[0],
-			record->dest_plane_offset[0],
-			record->dest_plane_offset[1],
-			record->dest_plane_offset[2]);
+			record->dest_iova,
+			record->dest_size,
+			record->dest_plane_offset,
+			record->cfg_jobid,
+			record->task,
+			record->config_pipe_time[0],
+			record->bw_time[0],
+			record->freq_time[0],
+			record->wait_fence_time[0],
+			record->flush_time[0],
+			record->config_pipe_time[1],
+			record->bw_time[1],
+			record->freq_time[1],
+			record->wait_fence_time[1],
+			record->flush_time[1],
+			record->state,
+			record->ref,
+			record->err ? "error" : "",
+			record->src_crc[0],
+			record->dest_crc[0],
+			record->src_crc[1],
+			record->dest_crc[1]);
 		idx = (idx + 1) & MML_RECORD_NUM_MASK;
 	}
 
@@ -933,23 +1130,23 @@ void mml_record_dump(struct mml_dev *mml)
 	mml_err(REC_TITLE);
 	for (i = 0; i < dump_count; i++) {
 		record = &mml->records[idx];
-		mml_err("%u,%u,%llu,%llu,%#llx,%u,%u,%u,%u,%llu,%llu,%#llx,%u,%u,%u,%u",
+		mml_err("%u,%u,%llu,%llu,%#llx,%u,%u,%llu,%llu,%#llx,%u,%u,%#010x,%#010x,%#010x,%#010x",
 			idx,
 			record->jobid,
 			record->src_iova_map_time,
 			record->src_iova_unmap_time,
-			record->src_iova[0],
-			record->src_size[0],
-			record->src_plane_offset[0],
-			record->src_plane_offset[1],
-			record->src_plane_offset[2],
+			record->src_iova,
+			record->src_size,
+			record->src_plane_offset,
 			record->dest_iova_map_time,
 			record->dest_iova_unmap_time,
-			record->dest_iova[0],
-			record->dest_size[0],
-			record->dest_plane_offset[0],
-			record->dest_plane_offset[1],
-			record->dest_plane_offset[2]);
+			record->dest_iova,
+			record->dest_size,
+			record->dest_plane_offset,
+			record->src_crc[0],
+			record->dest_crc[0],
+			record->src_crc[1],
+			record->dest_crc[1]);
 		idx = (idx + 1) & MML_RECORD_NUM_MASK;
 	}
 }
@@ -994,6 +1191,8 @@ static void mml_record_init(struct mml_dev *mml)
 
 	if (exists)
 		dput(dir);
+
+	mml_log("%s done with size %zu", __func__, sizeof(mml->records));
 }
 
 static int sys_bind(struct device *dev, struct device *master, void *data)
@@ -1025,6 +1224,7 @@ static int mml_probe(struct platform_device *pdev)
 	u32 i;
 	int ret, thread_cnt;
 
+	mml_log("%s with dev %p mml size %zu", __func__, dev, sizeof(struct mml_dev));
 	mml = devm_kzalloc(dev, sizeof(*mml), GFP_KERNEL);
 	if (!mml)
 		return -ENOMEM;
@@ -1058,25 +1258,26 @@ static int mml_probe(struct platform_device *pdev)
 		thread_cnt = MML_MAX_CMDQ_CLTS;
 
 	mml->racing_en = of_property_read_bool(dev->of_node, "racing-enable");
-	if (mml->racing_en)
-		mml_log("racing mode enable");
 
-	if (of_property_read_u8(dev->of_node, "racing_height", &mml->racing_height))
+	if (of_property_read_u8(dev->of_node, "racing-height", &mml->racing_height))
 		mml->racing_height = 64;	/* default height 64px */
 
-	if (!of_property_read_u16(dev->of_node, "event_ir_mml_ready", &mml->event_mml_ready))
-		mml_log("racing event event_mml_ready %hu", mml->event_mml_ready);
+	if (!of_property_read_u16(dev->of_node, "event-ir-mml-ready", &mml->event_mml_ready))
+		mml_log("racing event event_mml_ready %u", mml->event_mml_ready);
 
-	if (!of_property_read_u16(dev->of_node, "event_ir_disp_ready", &mml->event_disp_ready))
-		mml_log("racing event event_disp_ready %hu", mml->event_disp_ready);
+	if (!of_property_read_u16(dev->of_node, "event-ir-disp-ready", &mml->event_disp_ready))
+		mml_log("racing event event_disp_ready %u", mml->event_disp_ready);
 
-	if (!of_property_read_u16(dev->of_node, "event_ir_mml_stop", &mml->event_mml_stop))
-		mml_log("racing event event_mml_stop %hu", mml->event_mml_stop);
+	if (!of_property_read_u16(dev->of_node, "event-ir-mml-stop", &mml->event_mml_stop))
+		mml_log("racing event event_mml_stop %u", mml->event_mml_stop);
+
+	if (!of_property_read_u16(dev->of_node, "event-ir-eof", &mml->event_mml_target))
+		mml_log("racing event event_mml_target %u", mml->event_mml_target);
 
 	mml->cmdq_base = cmdq_register_device(dev);
 	for (i = 0; i < thread_cnt; i++) {
 		mml->cmdq_clts[i] = cmdq_mbox_create(dev, i);
-		if (IS_ERR(mml->cmdq_clts[i])) {
+		if (IS_ERR_OR_NULL(mml->cmdq_clts[i])) {
 			ret = PTR_ERR(mml->cmdq_clts[i]);
 			dev_err(dev, "unable to create cmdq mbox on %p:%d err %d",
 				dev, i, ret);
@@ -1094,6 +1295,14 @@ static int mml_probe(struct platform_device *pdev)
 
 	mml->wake_lock = wakeup_source_register(dev, "mml_pm_lock");
 	mml_record_init(mml);
+
+	/* for inline rotate dle context, avoid blocking dle addon flow */
+	if (mml->racing_en) {
+		mml_log("racing mode enable");
+		mml->dle_ctx = mml_dle_ctx_create(mml);
+	}
+
+	mml_msg("%s success end", __func__);
 	return 0;
 
 err_mbox_create:
@@ -1175,6 +1384,8 @@ static struct platform_driver *mml_drivers[] = {
 	&mml_mutex_driver,
 	&mml_rdma_driver,
 	&mml_rsz_driver,
+	&mml_pq_rdma_driver,
+	&mml_pq_birsz_driver,
 	&mml_tcc_driver,
 	&mml_tdshp_driver,
 	&mml_wrot_driver,
@@ -1188,28 +1399,24 @@ static int __init mml_driver_init(void)
 {
 	int ret;
 
-	ret = platform_register_drivers(mml_drivers, ARRAY_SIZE(mml_drivers));
-	if (ret) {
-		mml_err("failed to register mml core drivers: %d", ret);
-		return ret;
-	}
-
 	mml_mmp_init();
-
 	ret = mml_pq_core_init();
 	if (ret)
-		mml_err("failed to init mml pq core: %d", ret);
-
-	/* register pm notifier */
-
-	return ret;
+		return ret;
+	/* Driver registration can synchronously trigger the first DRM commit. */
+	ret = platform_register_drivers(mml_drivers, ARRAY_SIZE(mml_drivers));
+	if (ret) {
+		mml_pq_core_uninit();
+		return ret;
+	}
+	return 0;
 }
 module_init(mml_driver_init);
 
 static void __exit mml_driver_exit(void)
 {
-	mml_pq_core_uninit();
 	platform_unregister_drivers(mml_drivers, ARRAY_SIZE(mml_drivers));
+	mml_pq_core_uninit();
 }
 module_exit(mml_driver_exit);
 

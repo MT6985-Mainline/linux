@@ -21,7 +21,9 @@
 	 ((SWAP_ENABLE)	<< 5)  | \
 	 ((UNIQUEID)	<< 0))
 
-#define MML_FMT_COMPRESS(c)		((0x20000000 & (c)) >> 29)
+#define MML_FMT_COMPRESS(c)		((0x60000000 & (c)) >> 29)
+#define MML_FMT_AFBC(c)			(((0x60000000 & (c)) >> 29) == 1)
+#define MML_FMT_HYFBC(c)		(((0x60000000 & (c)) >> 29) == 2)
 #define MML_FMT_10BIT_PACKED(c)		((0x10000000 & (c)) >> 28)
 #define MML_FMT_10BIT(c)		((0x18000000 & (c)) >> 27)
 #define MML_FMT_10BIT_LOOSE(c)		(MML_FMT_10BIT(c) == 1)
@@ -48,11 +50,8 @@
 #define MML_FMT_AUO(c)			(MML_FMT_10BIT_JUMP(c))
 #define MML_FMT_IS_ARGB(c)		(MML_FMT_HW_FORMAT(c) == 2 || \
 					 MML_FMT_HW_FORMAT(c) == 3)
-
-#define MML_FMT_ARGB_COMPRESS(c)	(MML_FMT_COMPRESS(c) && \
-					 MML_FMT_IS_ARGB(c))
-#define MML_FMT_YUV_COMPRESS(c)		(MML_FMT_COMPRESS(c) && \
-					 MML_FMT_IS_YUV(c))
+#define MML_FMT_ARGB_COMPRESS(c)	(MML_FMT_AFBC(c) && MML_FMT_IS_ARGB(c))
+#define MML_FMT_YUV_COMPRESS(c)		(MML_FMT_AFBC(c) && MML_FMT_IS_YUV(c))
 
 enum mml_color {
 	MML_FMT_UNKNOWN		= 0,
@@ -141,6 +140,11 @@ enum mml_color {
 	MML_FMT_YVU420_AFBC	= MML_FMT(1, 0, 0, 0, 1, 1, 1, 12, 1, 1, 12),
 	MML_FMT_YUV420_10P_AFBC	= MML_FMT(1, 1, 0, 0, 1, 1, 1, 16, 1, 0, 12),
 	MML_FMT_YVU420_10P_AFBC	= MML_FMT(1, 1, 0, 0, 1, 1, 1, 16, 1, 1, 12),
+
+	/* HyFBC format YUV420 with compress, align size 32x16 */
+	MML_FMT_NV12_HYFBC	= MML_FMT(2, 0, 0, 0, 1, 1, 1, 12, 1, 0, 12),
+	/* HyFBC format YUV420 10bit with compress, align size 32x16 */
+	MML_FMT_P010_HYFBC	= MML_FMT(2, 1, 0, 0, 1, 1, 1, 18, 1, 0, 12),
 };
 
 /* Combine colorspace, xfer_func, ycbcr_encoding, and quantization */
@@ -175,11 +179,13 @@ static inline u32 mml_color_get_min_uv_stride(enum mml_color c, u32 width)
 
 	if (MML_FMT_PLANE(c) == 1)
 		return 0;
-	min_stride = mml_color_get_min_y_stride(c, width) >>
-		MML_FMT_H_SUBSAMPLE(c);
+
+	min_stride = mml_color_get_min_y_stride(c, width);
+
 	if (MML_FMT_UV_COPLANE(c) && !MML_FMT_BLOCK(c))
-		min_stride = min_stride * 2;
-	return min_stride;
+		return min_stride;
+
+	return min_stride >> MML_FMT_H_SUBSAMPLE(c);
 }
 
 /* Minimum Y plane size that is necessary in buffer */
@@ -201,3 +207,4 @@ static inline u32 mml_color_get_min_uv_size(enum mml_color c,
 }
 
 #endif	/* __MTK_MML_COLOR_H__ */
+
