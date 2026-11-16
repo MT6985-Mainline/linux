@@ -45,7 +45,7 @@ int mtk_dprec_logger_pr(unsigned int type, char *fmt, ...);
 			break;                                                 \
 		mtk_dprec_logger_pr(DPREC_LOGGER_DEBUG, fmt, ##arg);           \
 		if (g_mobile_log)                                              \
-			pr_debug("[DISP]" pr_fmt(fmt), ##arg);     \
+			pr_info("[DISP]" pr_fmt(fmt), ##arg);     \
 	} while (0)
 
 #define DDP_PROFILE(fmt, arg...)                                               \
@@ -60,7 +60,7 @@ int mtk_dprec_logger_pr(unsigned int type, char *fmt, ...);
 #define DDPMSG(fmt, arg...)                                                    \
 	do {                                                                   \
 		mtk_dprec_logger_pr(DPREC_LOGGER_DEBUG, fmt, ##arg);           \
-		pr_debug("[DISP]" pr_fmt(fmt), ##arg);             \
+		pr_info("[DISP]" pr_fmt(fmt), ##arg);             \
 	} while (0)
 
 #define DDPDUMP(fmt, arg...)                                                   \
@@ -138,11 +138,26 @@ int mtk_dprec_logger_pr(unsigned int type, char *fmt, ...);
 		if (r < 0) {	\
 			pr_err("snprintf error\n");	\
 		}	\
-		aee_kernel_exception_api(__FILE__, __LINE__,                     \
+		aee_kernel_warning_api(__FILE__, __LINE__,                     \
 				       DB_OPT_DEFAULT |                        \
 					       DB_OPT_MMPROFILE_BUFFER,        \
 				       str, string, ##args);                   \
 		DDPPR_ERR("[DDP Error]" string, ##args);                       \
+	} while (0)
+
+#define DDPAEE_FATAL(string, args...)                                          \
+	do {										\
+		char str[200];								\
+		int r;	\
+		r = snprintf(str, 199, "DDP:" string, ##args);				\
+		if (r < 0) {	\
+			pr_err("snprintf error\n"); \
+		}	\
+		aee_kernel_fatal_api(__FILE__, __LINE__,					\
+					DB_OPT_DEFAULT |					\
+					DB_OPT_MMPROFILE_BUFFER,		\
+					str, string, ##args);			\
+		DDPPR_ERR("[DDP Fatal Error]" string, ##args);			\
 	} while (0)
 #else /* !CONFIG_MTK_AEE_FEATURE */
 #define DDPAEE(string, args...)                                                \
@@ -155,6 +170,17 @@ int mtk_dprec_logger_pr(unsigned int type, char *fmt, ...);
 		}	\
 		pr_err("[DDP Error]" string, ##args);                          \
 	} while (0)
+
+#define DDPAEE_FATAL(string, args...)                                          \
+	do {										\
+		char str[200];								\
+		int r;	\
+		r = snprintf(str, 199, "DDP:" string, ##args);				\
+		if (r < 0) {	\
+			pr_err("snprintf error\n"); \
+		}	\
+		pr_err("[DDP Fatal Error]" string, ##args);				\
+	} while (0)
 #endif /* CONFIG_MTK_AEE_FEATURE */
 
 extern bool g_mobile_log;
@@ -162,5 +188,8 @@ extern bool g_msync_debug;
 extern bool g_fence_log;
 extern bool g_irq_log;
 extern bool g_detail_log;
+extern bool g_gpuc_direct_push;
+extern bool g_ovl_bwm_debug;
+extern bool g_vidle_apsrc_debug;
 extern bool g_profile_log;
 #endif

@@ -6,7 +6,6 @@
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/of_device.h>
-#include <linux/of_platform.h>
 #include <linux/of_irq.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -27,9 +26,8 @@
 #define CONFIG_LEDS_BRIGHTNESS_CHANGED
 #include <linux/leds-mtk.h>
 #else
-#define mtk_leds_brightness_set(x, y) do { } while (0)
+#define mtk_leds_brightness_set(...) do { } while (0)
 #endif
-#define MT65XX_LED_MODE_NONE (0)
 #define MT65XX_LED_MODE_CUST_LCM (4)
 
 #include "mtk_drm_crtc.h"
@@ -41,6 +39,7 @@
 #include "mtk_disp_aal.h"
 #include "mtk_disp_color.h"
 #include "mtk_drm_mmp.h"
+#include "platform/mtk_drm_platform.h"
 
 #undef pr_fmt
 #define pr_fmt(fmt) "[disp_aal]" fmt
@@ -75,6 +74,7 @@ static struct DISP_AAL_HIST g_aal_hist_db;
 //static ddp_module_notify g_ddp_notify;
 static atomic_t g_aal0_hist_available = ATOMIC_INIT(0);
 static atomic_t g_aal1_hist_available = ATOMIC_INIT(0);
+static atomic_t g_aal_hist_wait_dualpipe = ATOMIC_INIT(0);
 static atomic_t g_aal0_dre20_hist_is_ready = ATOMIC_INIT(0);
 static atomic_t g_aal1_dre20_hist_is_ready = ATOMIC_INIT(0);
 static atomic_t g_aal_sof_irq_available = ATOMIC_INIT(0);
@@ -83,18 +83,21 @@ static atomic_t g_aal_backlight_notified = ATOMIC_INIT(1023);
 static atomic_t g_aal_initialed = ATOMIC_INIT(0);
 static atomic_t g_aal_allowPartial = ATOMIC_INIT(0);
 static atomic_t g_aal_force_enable_irq = ATOMIC_INIT(0);
-static atomic_t g_led_mode = ATOMIC_INIT(MT65XX_LED_MODE_NONE);
 static atomic_t g_aal_force_relay = ATOMIC_INIT(0);
 static atomic_t g_aal_eof_irq = ATOMIC_INIT(0);
 static atomic_t g_aal1_eof_irq = ATOMIC_INIT(0);
 static atomic_t g_aal_first_frame = ATOMIC_INIT(1);
 static atomic_t g_aal1_first_frame = ATOMIC_INIT(1);
 static atomic_t g_aal_dre30_write = ATOMIC_INIT(1);
-static atomic_t g_aal_interrupt_enabled = ATOMIC_INIT(1);
-static atomic_t g_aal_idle_eof_available = ATOMIC_INIT(0);
+static atomic_t g_aal_interrupt_enabled = ATOMIC_INIT(0);
+// g_force_delay_check_trig: 0: non-delay 1: delay 2: default setting
+//                           3: not check trigger
+static atomic_t g_force_delay_check_trig = ATOMIC_INIT(2);
 static struct workqueue_struct *aal_flip_wq;
 static struct workqueue_struct *aal_refresh_wq;
 
+static int g_aal_backlight_set;
+static int g_ori_aal_backlight_notified = 0;
 enum AAL_UPDATE_HIST {
 	UPDATE_NONE = 0,
 	UPDATE_SINGLE,
@@ -146,7 +149,8 @@ enum AAL_IOCTL_CMD {
 	INIT_REG = 0,
 	SET_PARAM,
 	FLIP_SRAM,
-	BYPASS_AAL
+	BYPASS_AAL,
+	SET_CLARITY_REG
 };
 
 struct dre3_node {
@@ -167,6 +171,17 @@ struct mtk_disp_aal {
 	struct work_struct aal_refresh_task;
 };
 
+struct mtk_disp_aal_tile_overhead {
+	unsigned int left_in_width;
+	unsigned int left_overhead;
+	unsigned int left_comp_overhead;
+	unsigned int right_in_width;
+	unsigned int right_overhead;
+	unsigned int right_comp_overhead;
+};
+
+struct mtk_disp_aal_tile_overhead aal_tile_overhead = { 0 };
+
 struct mtk_aal_feature_option {
 	unsigned int mtk_aal_support;
 	unsigned int mtk_dre30_support;
@@ -176,6 +191,16 @@ static struct mtk_disp_aal *g_aal_data;
 static struct mtk_disp_aal *g_aal1_data;
 static struct mtk_aal_feature_option *g_aal_fo;
 static DEFINE_MUTEX(g_aal_sram_lock);
+static bool gDre30Enabled;
+static bool gPrvDre30Enabled;
+static unsigned int g_aal_dre30_en;
+
+// for Display Clarity
+static int g_aal_clarity_support;
+static int g_tdshp_clarity_support;
+int g_disp_clarity_support;
+static struct DISP_CLARITY_REG *g_disp_clarity_regs;
+static DEFINE_MUTEX(g_clarity_lock);
 
 static inline struct mtk_disp_aal *comp_to_aal(struct mtk_ddp_comp *comp)
 {
@@ -235,6 +260,12 @@ static bool debug_irq_log;
 		pr_notice("[IRQ]%s:" fmt, __func__, ##arg); \
 	} while (0)
 
+static bool debug_dump_clarity_regs;
+#define AALCRT_LOG(fmt, arg...) do { \
+	if (debug_dump_clarity_regs) \
+		pr_notice("[Clarity Debug]%s:" fmt, __func__, ##arg); \
+	} while (0)
+
 /* config register which might have extra DRE3 aal hw */
 static inline s32 basic_cmdq_write(struct cmdq_pkt *handle,
 	struct mtk_ddp_comp *comp, u32 offset, u32 value, u32 mask)
@@ -261,37 +292,6 @@ static inline s32 basic_cmdq_write(struct cmdq_pkt *handle,
 			comp->regs_pa + offset, value, mask);
 	}
 }
-
-static int disp_aal_get_cust_led(void)
-{
-	struct device_node *led_node = NULL;
-	int ret = 0;
-	int led_mode;
-	int pwm_config[5] = { 0 };
-
-	led_node = of_find_compatible_node(NULL, NULL,
-	"mediatek,lcd-backlight");
-	if (!led_node) {
-		ret = -1;
-		pr_notice("Cannot find LED node from dts\n");
-	} else {
-		ret = of_property_read_u32(led_node, "led_mode", &led_mode);
-		if (!ret)
-			atomic_set(&g_led_mode, led_mode);
-		else
-			pr_notice("led dts can not get led mode data.\n");
-
-		ret = of_property_read_u32_array(led_node,
-	    "pwm_config", pwm_config, ARRAY_SIZE(pwm_config));
-	}
-
-	if (ret)
-		pr_notice("get pwm cust info fail\n");
-	pr_notice("%s mode=%u\n", __func__, atomic_read(&g_led_mode));
-
-	return ret;
-}
-
 
 #define LOG_INTERVAL_TH 200
 #define LOG_BUFFER_SIZE 4
@@ -322,32 +322,21 @@ static void disp_aal_set_interrupt(struct mtk_ddp_comp *comp, int enable)
 	}
 
 	if (enable && (atomic_read(&g_aal_force_relay) != 1 ||
-		m_new_pq_persist_property[DISP_PQ_CCORR_SILKY_BRIGHTNESS] ||
-		m_new_pq_persist_property[DISP_PQ_GAMMA_SILKY_BRIGHTNESS])) {
+		m_new_pq_persist_property[DISP_PQ_CCORR_SILKY_BRIGHTNESS])) {
 		/* Enable output frame end interrupt */
-		if (comp == NULL) {
-			if (isDualPQ) {
-				writel(0x2, default_comp->regs + DISP_AAL_INTEN);
-				writel(0x2, aal1_default_comp->regs + DISP_AAL_INTEN);
-			} else
-				writel(0x2, default_comp->regs + DISP_AAL_INTEN);
-		} else
+		if (comp == NULL)
+			writel(0x2, default_comp->regs + DISP_AAL_INTEN);
+		else
 			writel(0x2, comp->regs + DISP_AAL_INTEN);
 
 		atomic_set(&g_aal_interrupt_enabled, 1);
 		AALIRQ_LOG("interrupt enabled\n");
 	} else if (!enable) {
 		if (atomic_read(&aal_data->dirty_frame_retrieved) == 1) {
-			if (comp == NULL) {
-				if (isDualPQ) {
-					writel(0x0, default_comp->regs + DISP_AAL_INTEN);
-					writel(0x0, aal1_default_comp->regs + DISP_AAL_INTEN);
-				} else {
-					writel(0x0, default_comp->regs + DISP_AAL_INTEN);
-				}
-			} else {
+			if (comp == NULL)
+				writel(0x0, default_comp->regs + DISP_AAL_INTEN);
+			else
 				writel(0x0, comp->regs + DISP_AAL_INTEN);
-			}
 
 			atomic_set(&g_aal_interrupt_enabled, 0);
 			AALIRQ_LOG("interrupt disabled");
@@ -435,12 +424,20 @@ void disp_aal_refresh_by_kernel(void)
 			AALFLOW_LOG("aal1 clock is off\n");
 		else
 			disp_aal_set_interrupt(NULL, true);
-
 		spin_unlock_irqrestore(&g_aal_clock_lock, clockflags);
 
 		spin_unlock_irqrestore(&g_aal_irq_en_lock, flags);
 		/* Backlight or Kernel API latency should be smallest */
-		mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+		if (atomic_read(&g_force_delay_check_trig) == 0)
+		        mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 1)
+		        mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 2)
+			mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 3)
+			DDPINFO("%s: not check trigger\n", __func__);
+		else
+			DDPINFO("%s: value is not support!\n", __func__);
 	}
 }
 
@@ -449,6 +446,11 @@ void disp_aal_notify_backlight_changed(int trans_backlight, int max_backlight)
 	unsigned long flags;
 	unsigned int service_flags;
 	int prev_backlight;
+
+	if (default_comp == NULL || default_comp->mtk_crtc == NULL) {
+		AALERR("%s null pointer!\n", __func__);
+		return;
+	}
 
 	AALAPI_LOG("%d/%d\n", trans_backlight, max_backlight);
 	disp_aal_notify_backlight_log(trans_backlight);
@@ -463,28 +465,38 @@ void disp_aal_notify_backlight_changed(int trans_backlight, int max_backlight)
 
 	prev_backlight = atomic_read(&g_aal_backlight_notified);
 	atomic_set(&g_aal_backlight_notified, trans_backlight);
+	CRTC_MMP_MARK(0, notify_backlight, trans_backlight, prev_backlight);
 
 	service_flags = 0;
 	if ((prev_backlight == 0) && (prev_backlight != trans_backlight))
 		service_flags = AAL_SERVICE_FORCE_UPDATE;
 
 	if (trans_backlight == 0) {
-		mtk_leds_brightness_set("lcd-backlight", 0);
+		g_aal_backlight_set = trans_backlight;
+		mtk_leds_brightness_set("lcd-backlight", 0, 0, (0X1<<SET_BACKLIGHT_LEVEL));
 		/* set backlight = 0 may be not from AAL, */
 		/* we have to let AALService can turn on backlight */
 		/* on phone resumption */
 		service_flags = AAL_SERVICE_FORCE_UPDATE;
 	} else if (atomic_read(&g_aal_is_init_regs_valid) == 0 ||
 		(atomic_read(&g_aal_force_relay) == 1 &&
-		!m_new_pq_persist_property[DISP_PQ_CCORR_SILKY_BRIGHTNESS] &&
-		!m_new_pq_persist_property[DISP_PQ_GAMMA_SILKY_BRIGHTNESS])) {
+		!m_new_pq_persist_property[DISP_PQ_CCORR_SILKY_BRIGHTNESS])) {
 		/* AAL Service is not running */
 
-		mtk_leds_brightness_set("lcd-backlight", trans_backlight);
+		mtk_leds_brightness_set("lcd-backlight", trans_backlight,
+					0, (0X1<<SET_BACKLIGHT_LEVEL));
 	}
 
 	spin_lock_irqsave(&g_aal_hist_lock, flags);
-	g_aal_hist.backlight = trans_backlight;
+
+	if (m_new_pq_persist_property[DISP_PQ_GAMMA_SILKY_BRIGHTNESS] &&
+		(atomic_read(&g_aal_force_relay) == 1)) {
+		g_aal_hist.backlight = g_ori_aal_backlight_notified;
+	} else
+		g_aal_hist.backlight = trans_backlight;
+
+	AALAPI_LOG("%d backup relay brightness : %d(%d), \n",
+		__LINE__, trans_backlight, g_aal_hist.backlight);
 	g_aal_hist.serviceFlags |= service_flags;
 	spin_unlock_irqrestore(&g_aal_hist_lock, flags);
 	// always notify aal service for LED changed
@@ -494,6 +506,28 @@ void disp_aal_notify_backlight_changed(int trans_backlight, int max_backlight)
 }
 
 #ifdef CONFIG_LEDS_BRIGHTNESS_CHANGED
+static bool is_led_need_aal(int connector_id)
+{
+	unsigned int crtc0_connector_id = 0;
+	struct mtk_ddp_comp *output_comp = NULL;
+
+	if (connector_id <= 0) {
+		AALFLOW_LOG("%s: invalid connector id\n", __func__);
+		return true;
+	}
+	if (default_comp == NULL || default_comp->mtk_crtc == NULL) {
+		AALERR("%s: null pointer!\n", __func__);
+		return false;
+	}
+	output_comp = mtk_ddp_comp_request_output(default_comp->mtk_crtc);
+	if (output_comp == NULL) {
+		AALERR("%s: output_comp is null!\n", __func__);
+		return false;
+	}
+	mtk_ddp_comp_io_cmd(output_comp, NULL, GET_CRTC0_CONNECTOR_ID, &crtc0_connector_id);
+	return (connector_id == crtc0_connector_id);
+}
+
 int led_brightness_changed_event_to_aal(struct notifier_block *nb, unsigned long event,
 	void *v)
 {
@@ -501,10 +535,17 @@ int led_brightness_changed_event_to_aal(struct notifier_block *nb, unsigned long
 	struct led_conf_info *led_conf;
 
 	led_conf = (struct led_conf_info *)v;
+	g_ori_aal_backlight_notified = led_conf->cdev.brightness;
 
 	switch (event) {
 	case LED_BRIGHTNESS_CHANGED:
-		if (m_new_pq_persist_property[DISP_PQ_GAMMA_SILKY_BRIGHTNESS]) {
+		if (!is_led_need_aal(led_conf->connector_id)) {
+			AALFLOW_LOG("connector id %d no need aal\n", led_conf->connector_id);
+			led_conf->aal_enable = 0;
+			break;
+		}
+		if (m_new_pq_persist_property[DISP_PQ_GAMMA_SILKY_BRIGHTNESS] &&
+			(atomic_read(&g_aal_force_relay) != 1)) {
 			trans_level = led_conf->cdev.brightness;
 
 			disp_aal_notify_backlight_changed(trans_level,
@@ -523,8 +564,6 @@ int led_brightness_changed_event_to_aal(struct notifier_block *nb, unsigned long
 				led_conf->max_hw_brightness);
 		}
 
-		AALAPI_LOG("brightness changed: %d(%d)\n",
-			trans_level, led_conf->cdev.brightness);
 		led_conf->aal_enable = 1;
 		break;
 	case LED_STATUS_SHUTDOWN:
@@ -564,7 +603,17 @@ int mtk_drm_ioctl_aal_eventctl(struct drm_device *dev, void *data,
 	if (*enabled) {
 		mtk_drm_idlemgr_kick(__func__,
 				&default_comp->mtk_crtc->base, 1);
-		mtk_crtc_check_trigger(comp->mtk_crtc, true, true);
+
+		if (atomic_read(&g_force_delay_check_trig) == 0)
+		        mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 1)
+		        mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 2)
+			mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 3)
+			DDPINFO("%s: not check trigger\n", __func__);
+		else
+			DDPINFO("%s: value is not support!\n", __func__);;
 
 		while ((atomic_read(&aal_data->is_clock_on) != 1) && (retry != 0)) {
 			usleep_range(500, 1000);
@@ -598,13 +647,12 @@ int mtk_drm_ioctl_aal_eventctl(struct drm_device *dev, void *data,
  *		}
  *	}
  */
-/*
- *	if (*enabled) {
+/*	if (*enabled) {
  *		mtk_drm_idlemgr_kick(__func__,
  *			&default_comp->mtk_crtc->base, 1);
  *		mtk_crtc_check_trigger(comp->mtk_crtc, true, true);
  *	}
-*/
+ */
 
 	return ret;
 }
@@ -618,7 +666,16 @@ static void mtk_disp_aal_refresh_trigger(struct work_struct *work_item)
 {
 	AALFLOW_LOG("start");
 
-	mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+	if (atomic_read(&g_force_delay_check_trig) == 0)
+	        mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+	else if (atomic_read(&g_force_delay_check_trig) == 1)
+	        mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+	else if (atomic_read(&g_force_delay_check_trig) == 2)
+		mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+	else if (atomic_read(&g_force_delay_check_trig) == 3)
+		DDPINFO("%s: not check trigger\n", __func__);
+	else
+		DDPINFO("%s: value is not support!\n", __func__);
 }
 
 void disp_aal_flip_sram(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
@@ -627,7 +684,7 @@ void disp_aal_flip_sram(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 	u32 hist_apb = 0, hist_int = 0, sram_cfg = 0;
 	phys_addr_t dre3_pa = mtk_aal_dre3_pa(comp);
 
-	if (!g_aal_fo->mtk_dre30_support)
+	if (!g_aal_fo->mtk_dre30_support || !gDre30Enabled)
 		return;
 
 	if (aal_sram_method != AAL_SRAM_SOF)
@@ -713,10 +770,6 @@ static void mtk_aal_init(struct mtk_ddp_comp *comp,
 			comp->regs_pa + DISP_AAL_CFG, 0x0 << 1, (0x3 << 1));
 	}
 
-	/* get lcd-backlight mode from dts */
-	if (atomic_read(&g_led_mode) == MT65XX_LED_MODE_NONE)
-		disp_aal_get_cust_led();
-
 	if (comp->mtk_crtc->is_dual_pipe) {
 		if (comp->id == DDP_COMPONENT_AAL0) {
 			atomic_set(&g_aal0_hist_available, 0);
@@ -733,29 +786,66 @@ static void mtk_aal_init(struct mtk_ddp_comp *comp,
 	atomic_set(&g_aal_eof_irq, 0);
 	atomic_set(&g_aal1_eof_irq, 0);
 	atomic_set(&aal_data->dirty_frame_retrieved, 1);
-	AALFLOW_LOG("led mode: %d-\n", atomic_read(&g_led_mode));
+}
+
+static void mtk_disp_aal_config_overhead(struct mtk_ddp_comp *comp,
+	struct mtk_ddp_config *cfg)
+{
+	DDPINFO("line: %d\n", __LINE__);
+
+	if (cfg->tile_overhead.is_support) {
+		/*set component overhead*/
+		if (comp->id == DDP_COMPONENT_AAL0) {
+			aal_tile_overhead.left_comp_overhead = 8;
+			/*add component overhead on total overhead*/
+			cfg->tile_overhead.left_overhead += aal_tile_overhead.left_comp_overhead;
+			cfg->tile_overhead.left_in_width += aal_tile_overhead.left_comp_overhead;
+			/*copy from total overhead info*/
+			aal_tile_overhead.left_in_width = cfg->tile_overhead.left_in_width;
+			aal_tile_overhead.left_overhead = cfg->tile_overhead.left_overhead;
+		}
+		if (comp->id == DDP_COMPONENT_AAL1) {
+			aal_tile_overhead.right_comp_overhead = 8;
+			/*add component overhead on total overhead*/
+			cfg->tile_overhead.right_overhead += aal_tile_overhead.right_comp_overhead;
+			cfg->tile_overhead.right_in_width += aal_tile_overhead.right_comp_overhead;
+			/*copy from total overhead info*/
+			aal_tile_overhead.right_in_width = cfg->tile_overhead.right_in_width;
+			aal_tile_overhead.right_overhead = cfg->tile_overhead.right_overhead;
+		}
+	}
 }
 
 static bool debug_bypass_alg_mode;
 static void mtk_aal_config(struct mtk_ddp_comp *comp,
 	struct mtk_ddp_config *cfg, struct cmdq_pkt *handle)
 {
-	unsigned int val = 0;
+	unsigned int val = 0, out_val = 0;
 	int width = cfg->w, height = cfg->h;
+	int out_width = cfg->w;
 
-	if (comp->mtk_crtc->is_dual_pipe) {
+	if (comp->mtk_crtc->is_dual_pipe)
 		isDualPQ = true;
-		width = cfg->w / 2;
-	} else {
+	else
 		isDualPQ = false;
-		width = cfg->w;
+
+	if (comp->mtk_crtc->is_dual_pipe && cfg->tile_overhead.is_support) {
+		width = aal_tile_overhead.left_in_width;
+		out_width = width - aal_tile_overhead.left_comp_overhead;
+	} else {
+		if (comp->mtk_crtc->is_dual_pipe)
+			width = cfg->w / 2;
+		else
+			width = cfg->w;
+
+		out_width = width;
 	}
 
 	AALFLOW_LOG("(w,h)=(%d,%d)+, %d\n",
 		width, height, g_aal_get_size_available);
 
 	g_aal_size.height = height;
-	g_aal_size.width = width;
+	g_aal_size.width = cfg->w;
 	g_dual_aal_size.height = height;
 	g_dual_aal_size.width = cfg->w;
 	g_aal_size.isdualpipe = isDualPQ;
@@ -766,13 +856,50 @@ static void mtk_aal_config(struct mtk_ddp_comp *comp,
 		AALFLOW_LOG("size available: (w,h)=(%d,%d)+\n", width, height);
 	}
 	val = (width << 16) | (height);
+	out_val = (out_width << 16) | height;
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		comp->regs_pa + DISP_AAL_SIZE, val, ~0);
 	cmdq_pkt_write(handle, comp->cmdq_base,
-		comp->regs_pa + DISP_AAL_OUTPUT_SIZE, val, ~0);
-	cmdq_pkt_write(handle, comp->cmdq_base,
-		comp->regs_pa + DISP_AAL_OUTPUT_OFFSET,
-		(0 << 16) | 0, ~0);
+		comp->regs_pa + DISP_AAL_OUTPUT_SIZE, out_val, ~0);
+
+
+	if (comp->mtk_crtc->is_dual_pipe && cfg->tile_overhead.is_support) {
+		if (comp->id == DDP_COMPONENT_AAL0) {
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa + DISP_AAL_OUTPUT_OFFSET, 0x0, ~0);
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa + DISP_AAL_DRE_BLOCK_INFO_00,
+				(g_aal_size.width/2 - 1) << 13, ~0);
+		} else {
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa + DISP_AAL_OUTPUT_OFFSET,
+				(aal_tile_overhead.right_comp_overhead << 16) | 0, ~0);
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa + DISP_AAL_DRE_BLOCK_INFO_00,
+				((g_aal_size.width/2 + aal_tile_overhead.right_overhead - 1) << 13)
+				| aal_tile_overhead.right_overhead, ~0);
+		}
+
+		g_dual_aal_size.aaloverhead = aal_tile_overhead.left_overhead;
+	} else if (comp->mtk_crtc->is_dual_pipe) {
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DISP_AAL_OUTPUT_OFFSET,
+			(0 << 16) | 0, ~0);
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DISP_AAL_DRE_BLOCK_INFO_00,
+			(g_aal_size.width/2 - 1) << 13, ~0);
+
+		g_dual_aal_size.aaloverhead = 0;
+	} else {
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DISP_AAL_OUTPUT_OFFSET,
+			(0 << 16) | 0, ~0);
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DISP_AAL_DRE_BLOCK_INFO_00,
+			(g_aal_size.width - 1) << 13, ~0);
+
+		g_aal_size.aaloverhead = 0;
+	}
 
 	if (cfg->source_bpc == 8)
 		cmdq_pkt_write(handle, comp->cmdq_base,
@@ -793,6 +920,15 @@ static void mtk_aal_config(struct mtk_ddp_comp *comp,
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			comp->regs_pa + DISP_AAL_CFG, 0, 1);
 	}
+
+	if (g_aal_fo->mtk_dre30_support && g_disp_clarity_support) {
+		phys_addr_t dre3_pa = mtk_aal_dre3_pa(comp);
+
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			dre3_pa + MDP_AAL_DRE_BILATERAL_STATUS_CTRL,
+			0x3 << 1, 0x3 << 1);
+	}
+
 	mtk_aal_init(comp, cfg, handle);
 	//disp_aal_flip_sram(comp, handle, __func__);
 
@@ -806,12 +942,15 @@ static void disp_aal_wait_hist(void)
 
 	if (isDualPQ) {
 		if ((atomic_read(&g_aal0_hist_available) == 0) ||
-				(atomic_read(&g_aal1_hist_available) == 0))
+				(atomic_read(&g_aal1_hist_available) == 0)) {
+			atomic_set(&g_aal_hist_wait_dualpipe, 1);
 			ret = wait_event_interruptible(g_aal_hist_wq,
 					(atomic_read(&g_aal0_hist_available) == 1) &&
 					(atomic_read(&g_aal1_hist_available) == 1));
+		}
 		AALFLOW_LOG("aal0 and aal1 hist_available = 1, waken up, ret = %d", ret);
 	} else if (atomic_read(&g_aal0_hist_available) == 0) {
+		atomic_set(&g_aal_hist_wait_dualpipe, 0);
 		AALFLOW_LOG("wait_event_interruptible\n");
 		ret = wait_event_interruptible(g_aal_hist_wq,
 				atomic_read(&g_aal0_hist_available) == 1);
@@ -820,10 +959,53 @@ static void disp_aal_wait_hist(void)
 		AALFLOW_LOG("hist_available = 0");
 }
 
+static void disp_aal_dump_clarity_regs(uint32_t pipe)
+{
+	if (debug_dump_clarity_regs && (pipe == 0)) {
+		DDPMSG("%s(aal0): clarity readback: [%d, %d, %d, %d, %d, %d, %d]\n",
+			__func__,
+			g_aal_hist.aal0_clarity[0], g_aal_hist.aal0_clarity[1],
+			g_aal_hist.aal0_clarity[2], g_aal_hist.aal0_clarity[3],
+			g_aal_hist.aal0_clarity[4], g_aal_hist.aal0_clarity[5],
+			g_aal_hist.aal0_clarity[6]);
+		DDPMSG("%s(tdshp0): clarity readback: [%d, %d, %d, %d, %d, %d, %d]\n",
+			__func__,
+			g_aal_hist.tdshp0_clarity[0], g_aal_hist.tdshp0_clarity[2],
+			g_aal_hist.tdshp0_clarity[4], g_aal_hist.tdshp0_clarity[6],
+			g_aal_hist.tdshp0_clarity[8], g_aal_hist.tdshp0_clarity[10],
+			g_aal_hist.tdshp0_clarity[11]);
+	} else if (debug_dump_clarity_regs && (pipe == 1)) {
+		DDPMSG("%s(aal1): clarity readback: [%d, %d, %d, %d, %d, %d, %d]\n",
+			__func__,
+			g_aal_hist.aal1_clarity[0], g_aal_hist.aal1_clarity[1],
+			g_aal_hist.aal1_clarity[2], g_aal_hist.aal1_clarity[3],
+			g_aal_hist.aal1_clarity[4], g_aal_hist.aal1_clarity[5],
+			g_aal_hist.aal1_clarity[6]);
+		DDPMSG("%s(tdshp2): clarity readback: [%d, %d, %d, %d, %d, %d, %d]\n",
+			__func__,
+			g_aal_hist.tdshp1_clarity[0], g_aal_hist.tdshp1_clarity[2],
+			g_aal_hist.tdshp1_clarity[4], g_aal_hist.tdshp1_clarity[6],
+			g_aal_hist.tdshp1_clarity[8], g_aal_hist.tdshp1_clarity[10],
+			g_aal_hist.tdshp1_clarity[11]);
+	}
+}
+
 static bool disp_aal_read_single_hist(struct mtk_ddp_comp *comp)
 {
 	bool read_success = true;
 	int i;
+	struct mtk_ddp_comp *disp_tdshp;
+
+	void __iomem *dre3_va = mtk_aal_dre3_va(comp);
+	// get disp_tdshp component
+	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+	struct drm_crtc *crtc = &mtk_crtc->base;
+	struct mtk_drm_private *priv = crtc->dev->dev_private;
+
+	if (comp->id == DDP_COMPONENT_AAL0)
+		disp_tdshp = priv->ddp_comp[DDP_COMPONENT_TDSHP0];
+	else
+		disp_tdshp = priv->ddp_comp[DDP_COMPONENT_TDSHP2];
 
 	if (((comp->id == DDP_COMPONENT_AAL0) && (atomic_read(&g_aal_eof_irq) == 0)) ||
 		((comp->id == DDP_COMPONENT_AAL1) && (atomic_read(&g_aal1_eof_irq) == 0)))
@@ -841,6 +1023,21 @@ static bool disp_aal_read_single_hist(struct mtk_ddp_comp *comp)
 			}
 			read_success = disp_color_reg_get(comp, DISP_COLOR_TWO_D_W1_RESULT,
 					&g_aal_hist.aal0_colorHist);
+
+			// for Display Clarity
+			if (g_disp_clarity_support) {
+				for (i = 0; i < MDP_AAL_CLARITY_READBACK_NUM; i++) {
+					g_aal_hist.aal0_clarity[i] = readl(dre3_va +
+						MDP_AAL_DRE_BILATERAL_STATUS_00 + (i << 2));
+				}
+
+				for (i = 0; i < DISP_TDSHP_CLARITY_READBACK_NUM; i++) {
+					g_aal_hist.tdshp0_clarity[i] = readl(disp_tdshp->regs +
+						MDP_TDSHP_STATUS_00 + (i << 2));
+				}
+
+				disp_aal_dump_clarity_regs(0);
+			}
 		} else if (comp->id == DDP_COMPONENT_AAL1) {
 			for (i = 0; i < AAL_HIST_BIN; i++) {
 				g_aal_hist.aal1_maxHist[i] = readl(comp->regs +
@@ -852,6 +1049,21 @@ static bool disp_aal_read_single_hist(struct mtk_ddp_comp *comp)
 			}
 			read_success = disp_color_reg_get(comp, DISP_COLOR_TWO_D_W1_RESULT,
 					&g_aal_hist.aal1_colorHist);
+
+			// for Display Clarity
+			if (g_disp_clarity_support) {
+				for (i = 0; i < MDP_AAL_CLARITY_READBACK_NUM; i++) {
+					g_aal_hist.aal1_clarity[i] = readl(dre3_va +
+						MDP_AAL_DRE_BILATERAL_STATUS_00 + (i << 2));
+				}
+
+				for (i = 0; i < DISP_TDSHP_CLARITY_READBACK_NUM; i++) {
+					g_aal_hist.tdshp1_clarity[i] = readl(disp_tdshp->regs +
+						MDP_TDSHP_STATUS_00 + (i << 2));
+				}
+
+				disp_aal_dump_clarity_regs(1);
+			}
 		}
 	} else {
 		for (i = 0; i < AAL_HIST_BIN; i++) {
@@ -864,6 +1076,21 @@ static bool disp_aal_read_single_hist(struct mtk_ddp_comp *comp)
 		}
 		read_success = disp_color_reg_get(comp, DISP_COLOR_TWO_D_W1_RESULT,
 				&g_aal_hist.aal0_colorHist);
+
+		// for Display Clarity
+		if (g_disp_clarity_support) {
+			for (i = 0; i < MDP_AAL_CLARITY_READBACK_NUM; i++) {
+				g_aal_hist.aal0_clarity[i] = readl(dre3_va +
+					MDP_AAL_DRE_BILATERAL_STATUS_00 + (i << 2));
+			}
+
+			for (i = 0; i < DISP_TDSHP_CLARITY_READBACK_NUM; i++) {
+				g_aal_hist.tdshp0_clarity[i] = readl(disp_tdshp->regs +
+					MDP_TDSHP_STATUS_00 + (i << 2));
+			}
+
+			disp_aal_dump_clarity_regs(0);
+		}
 	}
 
 	if (comp->id == DDP_COMPONENT_AAL0)
@@ -887,7 +1114,7 @@ static int disp_aal_copy_hist_to_user(struct DISP_AAL_HIST *hist)
 	/* We assume only one thread will call this function */
 	spin_lock_irqsave(&g_aal_hist_lock, flags);
 
-	if (g_aal_fo->mtk_dre30_support)
+	if (g_aal_fo->mtk_dre30_support && gDre30Enabled)
 		memcpy(&g_aal_dre30_hist_db, &g_aal_dre30_hist,
 			sizeof(g_aal_dre30_hist));
 
@@ -907,22 +1134,23 @@ static int disp_aal_copy_hist_to_user(struct DISP_AAL_HIST *hist)
 	}
 
 	memcpy(&g_aal_hist_db, &g_aal_hist, sizeof(g_aal_hist));
+
+	spin_unlock_irqrestore(&g_aal_hist_lock, flags);
+
+	if (g_aal_fo->mtk_dre30_support && gDre30Enabled)
+		g_aal_hist_db.dre30_hist = g_aal_init_dre30.dre30_hist_addr;
+
+	memcpy(hist, &g_aal_hist_db, sizeof(g_aal_hist_db));
+
+	if (g_aal_fo->mtk_dre30_support && gDre30Enabled)
+		ret = copy_to_user(AAL_U32_PTR(g_aal_init_dre30.dre30_hist_addr),
+			&g_aal_dre30_hist_db, sizeof(g_aal_dre30_hist_db));
+
 	g_aal_hist.serviceFlags = 0;
 	atomic_set(&g_aal0_hist_available, 0);
 	atomic_set(&g_aal1_hist_available, 0);
 	atomic_set(&g_aal0_dre20_hist_is_ready, 0);
 	atomic_set(&g_aal1_dre20_hist_is_ready, 0);
-
-	spin_unlock_irqrestore(&g_aal_hist_lock, flags);
-
-	if (g_aal_fo->mtk_dre30_support)
-		g_aal_hist_db.dre30_hist = g_aal_init_dre30.dre30_hist_addr;
-
-	memcpy(hist, &g_aal_hist_db, sizeof(g_aal_hist_db));
-
-	if (g_aal_fo->mtk_dre30_support)
-		ret = copy_to_user(AAL_U32_PTR(g_aal_init_dre30.dre30_hist_addr),
-			&g_aal_dre30_hist_db, sizeof(g_aal_dre30_hist_db));
 
 	AALFLOW_LOG("%s set g_aal_force_enable_irq to 0 +\n", __func__);
 	atomic_set(&g_aal_force_enable_irq, 0);
@@ -1012,9 +1240,7 @@ static void disp_aal_dre3_config(struct mtk_ddp_comp *comp,
 	int dre_alg_mode = 1;
 
 	AALFLOW_LOG("start, bitShift: %d  compId%d\n", aal_data->data->bitShift, comp->id);
-	cmdq_pkt_write(handle, comp->cmdq_base,
-		dre3_pa + DISP_AAL_DRE_BLOCK_INFO_00,
-		(g_aal_size.width - 1) << (aal_data->data->bitShift), ~0);
+
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		dre3_pa + DISP_AAL_DRE_BLOCK_INFO_01,
 		(init_regs->dre_blk_y_num << 5) | init_regs->dre_blk_x_num,
@@ -1075,6 +1301,15 @@ static void disp_aal_dre3_config(struct mtk_ddp_comp *comp,
 				(init_regs->dre0_blk_num_x_start << 10) |
 				(init_regs->blk_num_y_end << 5) |
 				init_regs->blk_num_y_start, ~0);
+
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				dre3_pa + MDP_AAL_TILE_01,
+				(init_regs->dre0_blk_cnt_x_end << (aal_data->data->bitShift)) |
+				init_regs->dre0_blk_cnt_x_start, ~0);
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				dre3_pa + DISP_AAL_DRE_BLOCK_INFO_00,
+				(init_regs->dre0_act_win_x_end << (aal_data->data->bitShift)) |
+				init_regs->dre0_act_win_x_start, ~0);
 		} else if (comp->id == DDP_COMPONENT_AAL1) {
 			cmdq_pkt_write(handle, comp->cmdq_base,
 				dre3_pa + MDP_AAL_TILE_00,
@@ -1084,6 +1319,15 @@ static void disp_aal_dre3_config(struct mtk_ddp_comp *comp,
 				(init_regs->dre1_blk_num_x_start << 10) |
 				(init_regs->blk_num_y_end << 5) |
 				init_regs->blk_num_y_start, ~0);
+
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				dre3_pa + MDP_AAL_TILE_01,
+				(init_regs->dre1_blk_cnt_x_end << (aal_data->data->bitShift)) |
+				init_regs->dre1_blk_cnt_x_start << 0, ~0);
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				dre3_pa + DISP_AAL_DRE_BLOCK_INFO_00,
+				(init_regs->dre1_act_win_x_end << (aal_data->data->bitShift)) |
+				init_regs->dre1_act_win_x_start, ~0);
 		}
 	} else {
 		cmdq_pkt_write(handle, comp->cmdq_base,
@@ -1093,12 +1337,16 @@ static void disp_aal_dre3_config(struct mtk_ddp_comp *comp,
 			(init_regs->blk_num_x_start << 10) |
 			(init_regs->blk_num_y_end << 5) |
 			init_regs->blk_num_y_start, ~0);
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			dre3_pa + MDP_AAL_TILE_01,
+			(init_regs->blk_cnt_x_end << (aal_data->data->bitShift)) |
+			init_regs->blk_cnt_x_start << 0, ~0);
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			dre3_pa + DISP_AAL_DRE_BLOCK_INFO_00,
+			(init_regs->act_win_x_end << (aal_data->data->bitShift)) |
+			init_regs->act_win_x_start, ~0);
 	}
 
-	cmdq_pkt_write(handle, comp->cmdq_base,
-		dre3_pa + MDP_AAL_TILE_01,
-		(init_regs->blk_cnt_x_end << (aal_data->data->bitShift)) |
-		init_regs->blk_cnt_x_start, ~0);
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		dre3_pa + MDP_AAL_TILE_02,
 		(init_regs->blk_cnt_y_end << (aal_data->data->bitShift)) |
@@ -1109,7 +1357,7 @@ static void disp_aal_dre3_config(struct mtk_ddp_comp *comp,
 		dre_alg_mode = 0;
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		dre3_pa + DISP_AAL_CFG_MAIN,
-		dre_alg_mode << 4, 1 << 4);
+		(0x0 << 3) | (dre_alg_mode << 4), (1 << 3) | (1 << 4));
 
 if (comp->mtk_crtc->is_dual_pipe) {
 	if (comp->id == DDP_COMPONENT_AAL0)
@@ -1190,6 +1438,16 @@ void dump_init_reg(struct DISP_AAL_INITREG *data)
 	PRINT_INIT_REG(blk_num_y_end);
 	PRINT_INIT_REG(blk_cnt_y_start);
 	PRINT_INIT_REG(blk_cnt_y_end);
+	PRINT_INIT_REG(dre0_blk_cnt_x_start);
+	PRINT_INIT_REG(dre0_blk_cnt_x_end);
+	PRINT_INIT_REG(dre1_blk_cnt_x_start);
+	PRINT_INIT_REG(dre1_blk_cnt_x_end);
+	PRINT_INIT_REG(act_win_x_start);
+	PRINT_INIT_REG(act_win_x_end);
+	PRINT_INIT_REG(dre0_act_win_x_start);
+	PRINT_INIT_REG(dre0_act_win_x_end);
+	PRINT_INIT_REG(dre1_act_win_x_start);
+	PRINT_INIT_REG(dre1_act_win_x_end);
 }
 
 static bool debug_dump_init_reg = true;
@@ -1233,12 +1491,14 @@ int mtk_drm_ioctl_aal_init_reg(struct drm_device *dev, void *data,
 	struct mtk_drm_private *private = dev->dev_private;
 	struct mtk_ddp_comp *comp = private->ddp_comp[DDP_COMPONENT_AAL0];
 	struct drm_crtc *crtc = private->crtc[0];
+
 	g_aal_data->crtc = crtc;
 
 	return mtk_crtc_user_cmd(crtc, comp, INIT_REG, data);
 }
 
 static struct DISP_AAL_PARAM g_aal_param;
+struct DISP_AAL_ESS20_SPECT_PARAM g_aal_ess20_spect_param = {0, 0, (0x01<<SET_BACKLIGHT_LEVEL)};
 
 #define DRE_REG_2(v0, off0, v1, off1) (((v1) << (off1)) | \
 	((v0) << (off0)))
@@ -1273,6 +1533,8 @@ static int disp_aal_write_dre_to_reg(struct mtk_ddp_comp *comp,
 	const int *gain;
 
 	gain = param->DREGainFltStatus;
+	if (g_aal_ess20_spect_param.flag & 0x3)
+		CRTC_MMP_MARK(0, aal_ess20_curve, comp->id, 0);
 
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		comp->regs_pa + DISP_AAL_DRE_FLT_FORCE(0),
@@ -1324,11 +1586,7 @@ static int disp_aal_write_cabc_to_reg(struct mtk_ddp_comp *comp,
 	AALFLOW_LOG("\n");
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		comp->regs_pa + DISP_AAL_CABC_00,
-#ifdef CONFIG_MI_DISP_CABC_REG_OFF
-		0 << 31, 1 << 31);
-#else
 		1 << 31, 1 << 31);
-#endif
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		comp->regs_pa + DISP_AAL_CABC_02,
 		param->cabc_fltgain_force, 0x3ff);
@@ -1351,7 +1609,7 @@ static int disp_aal_write_param_to_reg(struct mtk_ddp_comp *comp,
 // controlled by DREGainFltStatus, not cabc_gainlmt, so need to
 // set DREGainFltStatus to hw whether DRE3.5 or 2.5
 	disp_aal_write_dre_to_reg(comp, handle, param);
-	if (g_aal_fo->mtk_dre30_support) {
+	if (g_aal_fo->mtk_dre30_support && gDre30Enabled) {
 		disp_aal_write_dre3_to_reg(comp, handle, param);
 		disp_aal_write_cabc_to_reg(comp, handle, param);
 	} else {
@@ -1460,12 +1718,12 @@ int disp_aal_set_param(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 }
 
 #define PRINT_AAL_REG(x1, x2, x3, x4) \
-	pr_notice("[2] AAL_DUMP 0x%x=0x%x 0x%x=0x%x 0x%x=0x%x 0x%x=0x%x\n", \
+	pr_notice("[2]0x%x=0x%x 0x%x=0x%x 0x%x=0x%x 0x%x=0x%x\n", \
 		x1, readl(comp->regs + x1), x2, readl(comp->regs + x2), \
 		x3, readl(comp->regs + x3), x4, readl(comp->regs + x4))
 
 #define PRINT_AAL3_REG(x1, x2, x3, x4) \
-	pr_notice("[3] AAL_DUMP 0x%x=0x%x 0x%x=0x%x 0x%x=0x%x 0x%x=0x%x\n", \
+	pr_notice("[3]0x%x=0x%x 0x%x=0x%x 0x%x=0x%x 0x%x=0x%x\n", \
 		x1, readl(dre3_va + x1), x2, readl(dre3_va + x2), \
 		x3, readl(dre3_va + x3), x4, readl(dre3_va + x4))
 bool dump_reg(struct mtk_ddp_comp *comp, bool locked)
@@ -1483,6 +1741,7 @@ bool dump_reg(struct mtk_ddp_comp *comp, bool locked)
 			PRINT_AAL_REG(0x4DC, 0x500, 0x224, 0x504);
 			if (g_aal_fo->mtk_dre30_support) {
 				void __iomem *dre3_va = mtk_aal_dre3_va(comp);
+
 				PRINT_AAL3_REG(0x0, 0x8, 0x10, 0x20);
 				PRINT_AAL3_REG(0x30, 0x34, 0x38, 0xC4);
 				PRINT_AAL3_REG(0xC8, 0xF4, 0xF8, 0x200);
@@ -1503,6 +1762,24 @@ bool dump_reg(struct mtk_ddp_comp *comp, bool locked)
 	return dump_success;
 }
 
+int mtk_drm_ioctl_aal_set_ess20_spect_param(struct drm_device *dev, void *data,
+	struct drm_file *file_priv)
+{
+	int ret = 0;
+	unsigned int flag = 0;
+	struct DISP_AAL_ESS20_SPECT_PARAM *param = (struct DISP_AAL_ESS20_SPECT_PARAM *) data;
+
+	memcpy(&g_aal_ess20_spect_param, param, sizeof(*param));
+	AALAPI_LOG("[aal_kernel]ELVSSPN = %d, flag = %d",
+		g_aal_ess20_spect_param.ELVSSPN, g_aal_ess20_spect_param.flag);
+	if (g_aal_ess20_spect_param.flag & (1 << ENABLE_DYN_ELVSS)) {
+		AALAPI_LOG("[aal_kernel]enable dyn elvss  flag = %d", g_aal_ess20_spect_param.flag);
+		flag = 1 << ENABLE_DYN_ELVSS;
+		mtk_leds_brightness_set("lcd-backlight", 0, 0, flag);
+	}
+	return ret;
+}
+
 static bool debug_skip_set_param;
 int mtk_drm_ioctl_aal_set_param(struct drm_device *dev, void *data,
 	struct drm_file *file_priv)
@@ -1511,33 +1788,20 @@ int mtk_drm_ioctl_aal_set_param(struct drm_device *dev, void *data,
 	struct mtk_drm_private *private = dev->dev_private;
 	struct mtk_ddp_comp *comp = private->ddp_comp[DDP_COMPONENT_AAL0];
 	struct drm_crtc *crtc = private->crtc[0];
-	int backlight_value = 0;
+	int prev_backlight = 0;
 	struct DISP_AAL_PARAM *param = (struct DISP_AAL_PARAM *) data;
 	bool delay_refresh = false;
-#ifdef CONFIG_MI_DISP_SILKY_BRIGHTNESS_CRC
-	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
-	struct mtk_ddp_comp *out_comp = mtk_ddp_comp_request_output(mtk_crtc);
-	struct mi_dc_crc_config *crc_config = kmalloc(sizeof(struct mi_dc_crc_config), GFP_KERNEL);
-	static bool dc_status = false;
-	static bool hbmBypassCRC = false;
-	bool en_dimming;
-#endif
 
 	if (debug_skip_set_param) {
 		pr_notice("skip_set_param for debug\n");
-#ifdef CONFIG_MI_DISP_SILKY_BRIGHTNESS_CRC
-		kfree(crc_config);
-#endif
 		return ret;
 	}
 	/* Not need to protect g_aal_param, */
 	/* since only AALService can set AAL parameters. */
 	memcpy(&g_aal_param, param, sizeof(*param));
-	backlight_value = g_aal_param.FinalBacklight;
-	/* set cabc gain zero when detect backlight */
-	/* setting equal to zero */
-	if (backlight_value == 0)
-		g_aal_param.cabc_fltgain_force = 0;
+
+	prev_backlight = g_aal_backlight_set;
+	g_aal_backlight_set = g_aal_param.FinalBacklight;
 
 	mutex_lock(&g_aal_sram_lock);
 	ret = mtk_crtc_user_cmd(crtc, comp, SET_PARAM, data);
@@ -1546,53 +1810,56 @@ int mtk_drm_ioctl_aal_set_param(struct drm_device *dev, void *data,
 	atomic_set(&g_aal_allowPartial, g_aal_param.allowPartial);
 
 	if (atomic_read(&g_aal_backlight_notified) == 0)
-		backlight_value = 0;
+		g_aal_backlight_set = 0;
+
+	if (prev_backlight == g_aal_backlight_set)
+		g_aal_ess20_spect_param.flag &= (~(1 << SET_BACKLIGHT_LEVEL));
+	else
+		g_aal_ess20_spect_param.flag |= (1 << SET_BACKLIGHT_LEVEL);
 
 	if (m_new_pq_persist_property[DISP_PQ_CCORR_SILKY_BRIGHTNESS]) {
 		if (g_aal_param.silky_bright_flag == 0) {
-			AALAPI_LOG("backlight_value = %d, silky_bright_flag = %d",
-				backlight_value, g_aal_param.silky_bright_flag);
-#ifdef CONFIG_MI_DISP_SILKY_BRIGHTNESS_CRC
-			dc_status = mtk_ddp_comp_io_cmd(out_comp, NULL, MI_GET_DC_STATUS, NULL);
-			crc_config->brightness = backlight_value;
-			if (dc_status && hbmBypassCRC) {
-				pr_info("%s silky_bright_flag = %d, hbmBypassCRC = %d, clear dc crc\n",
-					__func__, g_aal_param.silky_bright_flag, hbmBypassCRC);
-				en_dimming = false;
-				mtk_ddp_comp_io_cmd(out_comp, NULL, MI_SET_BACKLIGHT_DIMMING, &en_dimming);
-				usleep_range(17000, 18000);
-				mtk_ddp_comp_io_cmd(out_comp, NULL, MI_SET_DC_BACKLIGHT, crc_config);
-				mtk_ddp_comp_io_cmd(out_comp, NULL, MI_SET_DC_CRC_OFF, NULL);
-				usleep_range(34000, 35000);
-				en_dimming = true;
-				mtk_ddp_comp_io_cmd(out_comp, NULL, MI_SET_BACKLIGHT_DIMMING, &en_dimming);
-				hbmBypassCRC = false;
-			}
-#endif
-			mtk_leds_brightness_set("lcd-backlight", backlight_value);
+			AALAPI_LOG("bl = %d, silky_bright_flag = %d, ELVSSPN = %u, flag = %u",
+				g_aal_backlight_set, g_aal_param.silky_bright_flag,
+				g_aal_ess20_spect_param.ELVSSPN, g_aal_ess20_spect_param.flag);
+
+			mtk_leds_brightness_set("lcd-backlight", g_aal_backlight_set,
+					g_aal_ess20_spect_param.ELVSSPN,
+					g_aal_ess20_spect_param.flag);
 		}
-#ifdef CONFIG_MI_DISP_SILKY_BRIGHTNESS_CRC
-		else if (g_aal_param.silky_bright_flag == 1 && !hbmBypassCRC) {
-			hbmBypassCRC = true;
-		}
-#endif
 	} else if (m_new_pq_persist_property[DISP_PQ_GAMMA_SILKY_BRIGHTNESS]) {
 		//if (pre_bl != cur_bl)
-		AALAPI_LOG("gian = %d, backlight = %d",
-			g_aal_param.silky_bright_gain[0], backlight_value);
+		AALAPI_LOG("gain = %u, backlight = %d, ELVSSPN = %u, flag = %u, silky_bl = %d",
+			g_aal_param.silky_bright_gain[0], g_aal_backlight_set,
+			g_aal_ess20_spect_param.ELVSSPN, g_aal_ess20_spect_param.flag,
+			g_aal_hist.backlight);
+
 		mtk_trans_gain_to_gamma(crtc, &g_aal_param.silky_bright_gain[0],
-			backlight_value);
+			g_aal_backlight_set, (void *)&g_aal_ess20_spect_param);
 	} else {
-		AALAPI_LOG("%d", backlight_value);
-		mtk_leds_brightness_set("lcd-backlight", backlight_value);
+
+		AALAPI_LOG("pre_bl=%d, bl=%d, pn=%u, flag=%u", prev_backlight, g_aal_backlight_set,
+			g_aal_ess20_spect_param.ELVSSPN, g_aal_ess20_spect_param.flag);
+		mtk_leds_brightness_set("lcd-backlight", g_aal_backlight_set,
+					g_aal_ess20_spect_param.ELVSSPN,
+					g_aal_ess20_spect_param.flag);
 	}
+
 	AALFLOW_LOG("delay refresh: %d", g_aal_param.refreshLatency);
 	if (g_aal_param.refreshLatency == 33)
 		delay_refresh = true;
-	mtk_crtc_check_trigger(comp->mtk_crtc, delay_refresh, true);
-#ifdef CONFIG_MI_DISP_SILKY_BRIGHTNESS_CRC
-	kfree(crc_config);
-#endif
+
+	if (atomic_read(&g_force_delay_check_trig) == 0)
+	        mtk_crtc_check_trigger(comp->mtk_crtc, false, true);
+	else if (atomic_read(&g_force_delay_check_trig) == 1)
+	        mtk_crtc_check_trigger(comp->mtk_crtc, true, true);
+	else if (atomic_read(&g_force_delay_check_trig) == 2)
+		mtk_crtc_check_trigger(comp->mtk_crtc, delay_refresh, true);
+	else if (atomic_read(&g_force_delay_check_trig) == 3)
+		DDPINFO("%s: not check trigger\n", __func__);
+	else
+		DDPINFO("%s: value is not support!\n", __func__);
+
 	return ret;
 }
 
@@ -1686,14 +1953,6 @@ static bool disp_aal_read_dre3(struct mtk_ddp_comp *comp,
 	if (disp_aal_read_single_hist(comp) != true)
 		return false;
 
-	writel(aal_data->data->aal_dre_hist_start,
-		dre3_va + DISP_AAL_SRAM_RW_IF_2);
-	if (disp_aal_reg_poll(comp, DISP_AAL_SRAM_STATUS,
-		(0x1 << 17), (0x1 << 17)) != true) {
-		AALERR("DISP_AAL_SRAM_STATUS ERROR\n");
-		return false;
-	}
-
 	AALIRQ_LOG("start\n");
 	if (dump_blk_x >= 0 && dump_blk_x < 16
 		&& dump_blk_y >= 0 && dump_blk_y < 8)
@@ -1704,6 +1963,7 @@ static bool disp_aal_read_dre3(struct mtk_ddp_comp *comp,
 		hist_offset <= aal_data->data->aal_dre_hist_end;
 			hist_offset += 4) {
 
+		writel(hist_offset, dre3_va + DISP_AAL_SRAM_RW_IF_2);
 		read_value = readl(dre3_va + DISP_AAL_SRAM_RW_IF_3);
 
 		if (arry_offset >= AAL_DRE30_HIST_REGISTER_NUM)
@@ -1732,7 +1992,6 @@ static bool disp_aal_read_dre3(struct mtk_ddp_comp *comp,
 				g_aal_hist.MaxHis_denominator_pipe0[j+i] = readl(dre3_va +
 					MDP_AAL_DUAL_PIPE08 + (j << 2));
 			}
-
 		} else if (comp->id == DDP_COMPONENT_AAL1) {
 			for (i = 0; i < 8; i++) {
 				g_aal_hist.MaxHis_denominator_pipe1[i] = readl(dre3_va +
@@ -1744,6 +2003,7 @@ static bool disp_aal_read_dre3(struct mtk_ddp_comp *comp,
 			}
 		}
 	}
+
 	if (dump_start >= 0)
 		pr_notice("[DRE3][HIST][%d-%d] %08x %08x %08x %08x %08x %08x\n",
 			dump_blk_x, dump_blk_y,
@@ -1763,7 +2023,6 @@ static bool disp_aal_write_dre3(struct mtk_ddp_comp *comp)
 
 	/* Write Local Gain Curve for DRE 3 */
 	AALIRQ_LOG("start\n");
-
 	writel(aal_data->data->aal_dre_gain_start,
 		dre3_va + DISP_AAL_SRAM_RW_IF_0);
 	if (disp_aal_reg_poll(comp, DISP_AAL_SRAM_STATUS,
@@ -1771,7 +2030,6 @@ static bool disp_aal_write_dre3(struct mtk_ddp_comp *comp)
 		AALERR("DISP_AAL_SRAM_STATUS ERROR\n");
 		return false;
 	}
-
 	for (gain_offset = aal_data->data->aal_dre_gain_start;
 		gain_offset <= aal_data->data->aal_dre_gain_end;
 			gain_offset += 4) {
@@ -1781,21 +2039,7 @@ static bool disp_aal_write_dre3(struct mtk_ddp_comp *comp)
 		writel(gain_offset, dre3_va + DISP_AAL_SRAM_RW_IF_0);
 		writel(write_value, dre3_va + DISP_AAL_SRAM_RW_IF_1);
 	}
-
 	return true;
-}
-
-static void ddp_dre3_restore_blk_num(struct mtk_ddp_comp *comp)
-{
-	if (g_aal_fo->mtk_dre30_support) {
-		struct mtk_disp_aal *aal_data = comp_to_aal(comp);
-		int dre_blk_x_num = g_aal_init_regs.dre_blk_x_num;
-		int dre_blk_y_num = g_aal_init_regs.dre_blk_y_num;
-
-		mtk_aal_write_mask(aal_data->dre3_hw.va + DISP_AAL_DRE_BLOCK_INFO_01,
-			(dre_blk_y_num << 5) | dre_blk_x_num, ~0);
-		AALIRQ_LOG("end");
-	}
 }
 
 static void disp_aal_update_dre3_sram(struct mtk_ddp_comp *comp,
@@ -1813,6 +2057,17 @@ static void disp_aal_update_dre3_sram(struct mtk_ddp_comp *comp,
 			atomic_read(&g_aal0_hist_available));
 	AALIRQ_LOG("[g_aal_eof_irq = %d", atomic_read(&g_aal_eof_irq));
 	AALIRQ_LOG("[g_aal1_eof_irq = %d", atomic_read(&g_aal1_eof_irq));
+
+	// reset g_aal_eof_irq to 0 when first frame,
+	// to avoid timing issue
+	if ((comp->id == DDP_COMPONENT_AAL0) &&
+		(atomic_read(&g_aal_first_frame) == 1))
+		atomic_set(&g_aal_eof_irq, 0);
+
+	if ((comp->id == DDP_COMPONENT_AAL1) &&
+		(atomic_read(&g_aal1_first_frame) == 1))
+		atomic_set(&g_aal1_eof_irq, 0);
+
 	CRTC_MMP_EVENT_START(0, aal_dre30_rw, comp->id, 0);
 	if (check_sram) {
 		read_value = readl(dre3_va + DISP_AAL_SRAM_CFG);
@@ -1838,22 +2093,6 @@ static void disp_aal_update_dre3_sram(struct mtk_ddp_comp *comp,
 	dre_blk_x_num = aal_min(AAL_DRE_BLK_NUM, read_value & 0x1F);
 	dre_blk_y_num =	aal_min(AAL_BLK_MAX_ALLOWED_NUM/dre_blk_x_num,
 		    (read_value >> 5) & 0x1F);
-	AALIRQ_LOG("read_value = 0x%08x", read_value);
-	AALIRQ_LOG("dre_blk_x_num = %d dre_blk_y_num = %d comp_id[%d]",
-				dre_blk_x_num, dre_blk_y_num, comp->id);
-	if (atomic_read(&g_aal_is_init_regs_valid) == 1) {
-		if (dre_blk_x_num != g_aal_init_regs.dre_blk_x_num
-			|| dre_blk_y_num != g_aal_init_regs.dre_blk_y_num) {
-			dre_blk_x_num = g_aal_init_regs.dre_blk_x_num;
-			dre_blk_y_num = g_aal_init_regs.dre_blk_y_num;
-			ddp_dre3_restore_blk_num(comp);
-			AALIRQ_LOG("reset dre_blk_x_num = %d dre_blk_y_num = %d comp_id[%d]",
-					dre_blk_x_num, dre_blk_y_num, comp->id);
-		}
-	} else {
-		AALERR("g_aal_is_init_regs_valid is not init");
-	}
-
 	if (spin_trylock_irqsave(&g_aal_hist_lock, flags)) {
 		result = disp_aal_read_dre3(comp,
 			dre_blk_x_num, dre_blk_y_num);
@@ -1865,8 +2104,11 @@ static void disp_aal_update_dre3_sram(struct mtk_ddp_comp *comp,
 					atomic_set(&g_aal0_hist_available, 1);
 				else if (comp->id == DDP_COMPONENT_AAL1)
 					atomic_set(&g_aal1_hist_available, 1);
-			} else
+			} else {
 				atomic_set(&g_aal0_hist_available, 1);
+				if (atomic_read(&g_aal_hist_wait_dualpipe) == 1)
+					atomic_set(&g_aal1_hist_available, 1);
+			}
 		}
 		spin_unlock_irqrestore(&g_aal_hist_lock, flags);
 		if (result) {
@@ -1907,7 +2149,7 @@ static void disp_aal_dre3_irq_handle(struct mtk_ddp_comp *comp)
 		return;
 
 	if (debug_dump_reg_irq)
-		dump_reg(comp, true);
+		debug_dump_reg_irq = !dump_reg(comp, true);
 
 	if (debug_skip_dre3_irq) {
 		pr_notice("skip dre3 irq for debug\n");
@@ -1948,27 +2190,10 @@ static void disp_aal_dre3_irq_handle(struct mtk_ddp_comp *comp)
 		disp_aal_update_dre3_sram(comp, false);
 		atomic_set(&g_aal_dre_halt, 0);
 	} else if (aal_sram_method == AAL_SRAM_SOF) {
-		struct drm_crtc *crtc = &comp->mtk_crtc->base;
-
-		if (mtk_drm_is_idle(&(comp->mtk_crtc->base)) &&
-			(!mtk_crtc_is_frame_trigger_mode(crtc)) &&
-			(comp->id == DDP_COMPONENT_AAL0)) {
+		if (mtk_drm_is_idle(&(comp->mtk_crtc->base))) {
 			AALIRQ_LOG("[SRAM] when idle, operate SRAM in (EOF) comp id:%d ", comp->id);
-			//disp_aal_update_dre3_sram(comp, false);
-			if (!atomic_read(&g_aal_sof_irq_available)) {
-				atomic_set(&g_aal_sof_irq_available, 1);
-				atomic_set(&g_aal_idle_eof_available, 1);
-				wake_up_interruptible(&g_aal_sof_irq_wq);
-			}
+			disp_aal_update_dre3_sram(comp, false);
 		}
-		AALIRQ_LOG("[SRAM] clean dre_config in (EOF)  comp->id = %d", comp->id);
-		if (comp->mtk_crtc->is_dual_pipe) {
-			if (comp->id == DDP_COMPONENT_AAL0)
-				atomic_set(&g_aal_dre_config, 0);
-			else if (comp->id == DDP_COMPONENT_AAL1)
-				atomic_set(&g_aal1_dre_config, 0);
-		} else
-			atomic_set(&g_aal_dre_config, 0);
 	}
 }
 
@@ -2145,6 +2370,22 @@ static void disp_aal_single_pipe_hist_update(struct mtk_ddp_comp *comp)
 					atomic_set(&g_aal0_dre20_hist_is_ready, 1);
 					AALIRQ_LOG("DDP_COMPONENT_AAL0 read_success = %d\n",
 						read_success);
+
+					if (comp->mtk_crtc->is_dual_pipe) {
+						if ((atomic_read(&g_aal_first_frame) == 1) &&
+							(atomic_read(&g_aal1_first_frame) == 1)) {
+							atomic_set(&g_aal_first_frame, 0);
+							atomic_set(&g_aal1_first_frame, 0);
+							queue_work(aal_refresh_wq,
+								&g_aal_data->aal_refresh_task);
+						}
+					} else {
+						if (atomic_read(&g_aal_first_frame) == 1) {
+							atomic_set(&g_aal_first_frame, 0);
+							queue_work(aal_refresh_wq,
+								&g_aal_data->aal_refresh_task);
+						}
+					}
 				}
 				if (comp->id == DDP_COMPONENT_AAL1) {
 					atomic_set(&g_aal1_dre20_hist_is_ready, 1);
@@ -2220,12 +2461,746 @@ int mtk_drm_ioctl_aal_get_size(struct drm_device *dev, void *data,
 
 	AALFLOW_LOG("\n");
 	disp_aal_wait_size(60);
+
+	if (comp == NULL || comp->mtk_crtc == NULL) {
+		AALERR("%s null pointer!\n", __func__);
+		return -1;
+	}
+
 	if (comp->mtk_crtc->is_dual_pipe)
 		memcpy(dst, &g_dual_aal_size, sizeof(g_dual_aal_size));
 	else
 		memcpy(dst, &g_aal_size, sizeof(g_aal_size));
 
 	return 0;
+}
+
+int mtk_drm_ioctl_clarity_set_reg(struct drm_device *dev, void *data,
+		struct drm_file *file_priv)
+{
+	struct mtk_drm_private *private = dev->dev_private;
+	struct mtk_ddp_comp *comp = private->ddp_comp[DDP_COMPONENT_AAL0];
+	struct drm_crtc *crtc = private->crtc[0];
+
+	AALCRT_LOG(": enter set clarity regs\n");
+
+	return mtk_crtc_user_cmd(crtc, comp, SET_CLARITY_REG, data);
+}
+
+static void dumpAlgAALClarityRegOutput(struct DISP_CLARITY_REG clarityHWReg)
+{
+	AALCRT_LOG("bilateral_impulse_noise_en[%d] dre_bilateral_detect_en[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_impulse_noise_en,
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_detect_en);
+
+	AALCRT_LOG("have_bilateral_filter[%d] dre_output_mode[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.have_bilateral_filter,
+		clarityHWReg.mdp_aal_clarity_regs.dre_output_mode);
+
+	AALCRT_LOG("bilateral_range_flt_slope[%d] dre_bilateral_activate_blending_A[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_range_flt_slope,
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_activate_blending_A);
+
+	AALCRT_LOG("dre_bilateral_activate_blending_B[%d] dre_bilateral_activate_blending_C[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_activate_blending_B,
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_activate_blending_C);
+
+	AALCRT_LOG("dre_bilateral_activate_blending_D[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_activate_blending_D);
+	AALCRT_LOG("dre_bilateral_activate_blending_wgt_gain[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_activate_blending_wgt_gain);
+
+	AALCRT_LOG("dre_bilateral_blending_en[%d] dre_bilateral_blending_wgt[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_blending_en,
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_blending_wgt);
+
+	AALCRT_LOG("dre_bilateral_blending_wgt_mode[%d] dre_bilateral_size_blending_wgt[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_blending_wgt_mode,
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_size_blending_wgt);
+
+	AALCRT_LOG("bilateral_custom_range_flt1 [0_0 ~ 0_4] = [%d, %d, %d, %d, %d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_0,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_1,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_2,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_3,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_4);
+
+	AALCRT_LOG("bilateral_custom_range_flt1 [1_0 ~ 1_4] = [%d, %d, %d, %d, %d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_0,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_1,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_2,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_3,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_4);
+
+	AALCRT_LOG("bilateral_custom_range_flt1 [2_0 ~ 2_4] = [%d, %d, %d, %d, %d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_0,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_1,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_2,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_3,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_4);
+
+	AALCRT_LOG("bilateral_custom_range_flt2 [0_0 ~ 0_4] = [%d, %d, %d, %d, %d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_0,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_1,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_2,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_3,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_4);
+
+	AALCRT_LOG("bilateral_custom_range_flt2 [1_0 ~ 1_4] = [%d, %d, %d, %d, %d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_0,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_1,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_2,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_3,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_4);
+
+	AALCRT_LOG("bilateral_custom_range_flt2 [2_0 ~ 2_4] = [%d, %d, %d, %d, %d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_0,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_1,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_2,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_3,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_4);
+
+	AALCRT_LOG("bilateral_contrary_blending_wgt[%d] bilateral_custom_range_flt_gain[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_contrary_blending_wgt,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt_gain);
+
+	AALCRT_LOG("bilateral_custom_range_flt_slope[%d] bilateral_range_flt_gain[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt_slope,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_range_flt_gain);
+
+	AALCRT_LOG("bilateral_size_blending_wgt[%d] bilateral_contrary_blending_out_wgt[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_size_blending_wgt,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_contrary_blending_out_wgt);
+
+	AALCRT_LOG("bilateral_custom_range_flt1_out_wgt[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt1_out_wgt);
+	AALCRT_LOG("bilateral_custom_range_flt2_out_wgt[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_custom_range_flt2_out_wgt);
+
+	AALCRT_LOG("bilateral_range_flt_out_wgt[%d] bilateral_size_blending_out_wgt[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_range_flt_out_wgt,
+		clarityHWReg.mdp_aal_clarity_regs.bilateral_size_blending_out_wgt);
+
+	AALCRT_LOG("dre_bilateral_blending_region_protection_en[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_blending_region_protection_en);
+	AALCRT_LOG("dre_bilateral_region_protection_activate_A[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_region_protection_activate_A);
+
+	AALCRT_LOG("dre_bilateral_region_protection_activate_B[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_region_protection_activate_B);
+	AALCRT_LOG("dre_bilateral_region_protection_activate_C[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_region_protection_activate_C);
+
+	AALCRT_LOG("dre_bilateral_region_protection_activate_D[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_region_protection_activate_D);
+	AALCRT_LOG("dre_bilateral_region_protection_input_shift_bit[%d]\n",
+		clarityHWReg.mdp_aal_clarity_regs.dre_bilateral_region_protection_input_shift_bit);
+}
+
+static void dumpAlgTDSHPRegOutput(struct DISP_CLARITY_REG clarityHWReg)
+{
+	AALCRT_LOG("tdshp_gain_high[%d] tdshp_gain_mid[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.tdshp_gain_high,
+		clarityHWReg.disp_tdshp_clarity_regs.tdshp_gain_mid);
+
+	AALCRT_LOG("mid_coef_v_custom_range_flt [0_0 ~ 0_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_0,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_1,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_2,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_3,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_4);
+
+	AALCRT_LOG("mid_coef_v_custom_range_flt [1_0 ~ 1_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_0,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_1,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_2,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_3,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_4);
+
+	AALCRT_LOG("mid_coef_v_custom_range_flt [2_0 ~ 2_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_0,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_1,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_2,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_3,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_4);
+
+	AALCRT_LOG("mid_coef_h_custom_range_flt [0_0 ~ 0_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_0,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_1,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_2,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_3,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_4);
+
+	AALCRT_LOG("mid_coef_h_custom_range_flt [1_0 ~ 1_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_0,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_1,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_2,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_3,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_4);
+
+	AALCRT_LOG("mid_coef_h_custom_range_flt [2_0 ~ 2_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_0,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_1,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_2,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_3,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_4);
+
+	AALCRT_LOG("high_coef_v_custom_range_flt [0_0 ~ 0_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_4);
+
+	AALCRT_LOG("high_coef_v_custom_range_flt [1_0 ~ 1_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_4);
+
+	AALCRT_LOG("high_coef_v_custom_range_flt [2_0 ~ 2_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_4);
+
+	AALCRT_LOG("high_coef_h_custom_range_flt [0_0 ~ 0_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_4);
+
+	AALCRT_LOG("high_coef_h_custom_range_flt [1_0 ~ 1_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_4);
+
+	AALCRT_LOG("high_coef_h_custom_range_flt [2_0 ~ 2_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_4);
+
+	AALCRT_LOG("high_coef_rd_custom_range_flt [0_0 ~ 0_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_4);
+
+	AALCRT_LOG("high_coef_rd_custom_range_flt [1_0 ~ 1_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_4);
+
+	AALCRT_LOG("high_coef_rd_custom_range_flt [2_0 ~ 2_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_4);
+
+	AALCRT_LOG("high_coef_ld_custom_range_flt [0_0 ~ 0_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_4);
+
+	AALCRT_LOG("high_coef_ld_custom_range_flt [1_0 ~ 1_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_4);
+
+	AALCRT_LOG("high_coef_ld_custom_range_flt [2_0 ~ 2_4] = [%d, %d, %d, %d, %d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_0,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_1,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_2,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_3,
+		clarityHWReg.disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_4);
+
+	AALCRT_LOG("mid_negative_offset[%d] mid_positive_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.mid_negative_offset,
+		clarityHWReg.disp_tdshp_clarity_regs.mid_positive_offset);
+	AALCRT_LOG("high_negative_offset[%d] high_positive_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_negative_offset,
+		clarityHWReg.disp_tdshp_clarity_regs.high_positive_offset);
+
+	AALCRT_LOG("D_active_parameter_N_gain[%d] D_active_parameter_N_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.D_active_parameter_N_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.D_active_parameter_N_offset);
+	AALCRT_LOG("D_active_parameter_P_gain[%d] D_active_parameter_P_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.D_active_parameter_P_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.D_active_parameter_P_offset);
+
+	AALCRT_LOG("High_active_parameter_N_gain[%d] High_active_parameter_N_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.High_active_parameter_N_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.High_active_parameter_N_offset);
+	AALCRT_LOG("High_active_parameter_P_gain[%d] High_active_parameter_P_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.High_active_parameter_P_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.High_active_parameter_P_offset);
+
+	AALCRT_LOG("L_active_parameter_N_gain[%d] L_active_parameter_N_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.L_active_parameter_N_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.L_active_parameter_N_offset);
+	AALCRT_LOG("L_active_parameter_P_gain[%d] L_active_parameter_P_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.L_active_parameter_P_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.L_active_parameter_P_offset);
+
+	AALCRT_LOG("Mid_active_parameter_N_gain[%d] Mid_active_parameter_N_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_active_parameter_N_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_active_parameter_N_offset);
+	AALCRT_LOG("Mid_active_parameter_P_gain[%d] Mid_active_parameter_P_offset[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_active_parameter_P_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_active_parameter_P_offset);
+
+	AALCRT_LOG("SIZE_PARA_BIG_HUGE[%d] SIZE_PARA_MEDIUM_BIG[%d] SIZE_PARA_SMALL_MEDIUM[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.SIZE_PARA_BIG_HUGE,
+		clarityHWReg.disp_tdshp_clarity_regs.SIZE_PARA_MEDIUM_BIG,
+		clarityHWReg.disp_tdshp_clarity_regs.SIZE_PARA_SMALL_MEDIUM);
+
+	AALCRT_LOG("high_auto_adaptive_weight_HUGE[%d] high_size_adaptive_weight_HUGE[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_auto_adaptive_weight_HUGE,
+		clarityHWReg.disp_tdshp_clarity_regs.high_size_adaptive_weight_HUGE);
+	AALCRT_LOG("Mid_auto_adaptive_weight_HUGE[%d] Mid_size_adaptive_weight_HUGE[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_auto_adaptive_weight_HUGE,
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_size_adaptive_weight_HUGE);
+
+	AALCRT_LOG("high_auto_adaptive_weight_BIG[%d] high_size_adaptive_weight_BIG[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_auto_adaptive_weight_BIG,
+		clarityHWReg.disp_tdshp_clarity_regs.high_size_adaptive_weight_BIG);
+	AALCRT_LOG("Mid_auto_adaptive_weight_BIG[%d] Mid_size_adaptive_weight_BIG[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_auto_adaptive_weight_BIG,
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_size_adaptive_weight_BIG);
+
+	AALCRT_LOG("high_auto_adaptive_weight_MEDIUM[%d]high_size_adaptive_weight_MEDIUM[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_auto_adaptive_weight_MEDIUM,
+		clarityHWReg.disp_tdshp_clarity_regs.high_size_adaptive_weight_MEDIUM);
+	AALCRT_LOG("Mid_auto_adaptive_weight_MEDIUM[%d] Mid_size_adaptive_weight_MEDIUM[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_auto_adaptive_weight_MEDIUM,
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_size_adaptive_weight_MEDIUM);
+
+	AALCRT_LOG("high_auto_adaptive_weight_SMALL[%d] high_size_adaptive_weight_SMALL[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.high_auto_adaptive_weight_SMALL,
+		clarityHWReg.disp_tdshp_clarity_regs.high_size_adaptive_weight_SMALL);
+	AALCRT_LOG("Mid_auto_adaptive_weight_SMALL[%d] Mid_size_adaptive_weight_SMALL[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_auto_adaptive_weight_SMALL,
+		clarityHWReg.disp_tdshp_clarity_regs.Mid_size_adaptive_weight_SMALL);
+
+	AALCRT_LOG("FILTER_HIST_EN[%d] FREQ_EXTRACT_ENHANCE[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.FILTER_HIST_EN,
+		clarityHWReg.disp_tdshp_clarity_regs.FREQ_EXTRACT_ENHANCE);
+	AALCRT_LOG("freq_D_weighting[%d] freq_H_weighting[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.freq_D_weighting,
+		clarityHWReg.disp_tdshp_clarity_regs.freq_H_weighting);
+
+	AALCRT_LOG("freq_L_weighting[%d] freq_M_weighting[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.freq_L_weighting,
+		clarityHWReg.disp_tdshp_clarity_regs.freq_M_weighting);
+	AALCRT_LOG("freq_D_final_weighting[%d] freq_L_final_weighting[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.freq_D_final_weighting,
+		clarityHWReg.disp_tdshp_clarity_regs.freq_L_final_weighting);
+
+	AALCRT_LOG("freq_M_final_weighting[%d] freq_WH_final_weighting[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.freq_M_final_weighting,
+		clarityHWReg.disp_tdshp_clarity_regs.freq_WH_final_weighting);
+	AALCRT_LOG("SIZE_PARAMETER[%d] chroma_high_gain[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.SIZE_PARAMETER,
+		clarityHWReg.disp_tdshp_clarity_regs.chroma_high_gain);
+
+	AALCRT_LOG("chroma_high_index[%d] chroma_low_gain[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.chroma_high_index,
+		clarityHWReg.disp_tdshp_clarity_regs.chroma_low_gain);
+	AALCRT_LOG("chroma_low_index[%d] luma_high_gain[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.chroma_low_index,
+		clarityHWReg.disp_tdshp_clarity_regs.luma_high_gain);
+
+	AALCRT_LOG("luma_high_index[%d] luma_low_gain[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.luma_high_index,
+		clarityHWReg.disp_tdshp_clarity_regs.luma_low_gain);
+	AALCRT_LOG("luma_low_index[%d] Chroma_adaptive_mode[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.luma_low_index,
+		clarityHWReg.disp_tdshp_clarity_regs.Chroma_adaptive_mode);
+
+	AALCRT_LOG("Chroma_shift[%d] Luma_adaptive_mode[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.Chroma_shift,
+		clarityHWReg.disp_tdshp_clarity_regs.Luma_adaptive_mode);
+	AALCRT_LOG("Luma_shift[%d] class_0_positive_gain[%d] class_0_negative_gain[%d]",
+		clarityHWReg.disp_tdshp_clarity_regs.Luma_shift,
+		clarityHWReg.disp_tdshp_clarity_regs.class_0_positive_gain,
+		clarityHWReg.disp_tdshp_clarity_regs.class_0_negative_gain);
+}
+
+static int mtk_disp_clarity_set_reg(struct mtk_ddp_comp *comp,
+	struct cmdq_pkt *handle, struct DISP_CLARITY_REG *clarity_regs)
+{
+	int ret = 0;
+	struct mtk_ddp_comp *comp_tdshp;
+
+	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+	struct drm_crtc *crtc = &mtk_crtc->base;
+	struct mtk_drm_private *priv = crtc->dev->dev_private;
+	phys_addr_t dre3_pa = mtk_aal_dre3_pa(comp);
+
+	if (comp->id == DDP_COMPONENT_AAL0)
+		comp_tdshp = priv->ddp_comp[DDP_COMPONENT_TDSHP0];
+	else
+		comp_tdshp = priv->ddp_comp[DDP_COMPONENT_TDSHP2];
+
+	if (clarity_regs == NULL)
+		return -1;
+
+	// aal clarity set registers
+	CRTC_MMP_MARK(0, clarity_set_regs, comp->id, 1);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATEAL,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_impulse_noise_en << 9 |
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_detect_en << 8 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_range_flt_slope << 4 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_flt_en << 1 |
+		clarity_regs->mdp_aal_clarity_regs.have_bilateral_filter << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + DISP_AAL_CFG_MAIN,
+		clarity_regs->mdp_aal_clarity_regs.dre_output_mode, 0x1 << 5);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_Blending_00,
+		(clarity_regs->mdp_aal_clarity_regs.dre_bilateral_activate_blending_D << 27 |
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_activate_blending_C << 23 |
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_activate_blending_B << 19 |
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_activate_blending_A << 15 |
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_activate_blending_wgt_gain << 11 |
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_blending_wgt_mode << 9 |
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_blending_wgt << 4 |
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_blending_en << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_Blending_01,
+		clarity_regs->mdp_aal_clarity_regs.dre_bilateral_size_blending_wgt << 0, ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_CUST_FLT1_00,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_4 << 24 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_3 << 18 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_2 << 12 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_1 << 6 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_0_0 << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_CUST_FLT1_01,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_4 << 24 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_3 << 18 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_2 << 12 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_1 << 6 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_1_0 << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_CUST_FLT1_02,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_4 << 24 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_3 << 18 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_2 << 12 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_1 << 6 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_2_0 << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_CUST_FLT2_00,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_4 << 24 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_3 << 18 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_2 << 12 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_1 << 6 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_0_0 << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_CUST_FLT2_01,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_4 << 24 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_3 << 18 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_2 << 12 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_1 << 6 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_1_0 << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_CUST_FLT2_02,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_4 << 24 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_3 << 18 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_2 << 12 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_1 << 6 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_2_0 << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_FLT_CONFIG,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_size_blending_wgt << 12 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_contrary_blending_wgt << 10 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt_slope << 6 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt_gain << 3 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_range_flt_gain << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_FREQ_BLENDING,
+		(clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt2_out_wgt << 20 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_custom_range_flt1_out_wgt << 15 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_range_flt_out_wgt << 10 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_size_blending_out_wgt << 5 |
+		clarity_regs->mdp_aal_clarity_regs.bilateral_contrary_blending_out_wgt << 0), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, dre3_pa + MDP_AAL_DRE_BILATERAL_REGION_PROTECTION,
+	(clarity_regs->mdp_aal_clarity_regs.dre_bilateral_region_protection_input_shift_bit << 25 |
+	clarity_regs->mdp_aal_clarity_regs.dre_bilateral_region_protection_activate_D << 21 |
+	clarity_regs->mdp_aal_clarity_regs.dre_bilateral_region_protection_activate_C << 13 |
+	clarity_regs->mdp_aal_clarity_regs.dre_bilateral_region_protection_activate_B << 5 |
+	clarity_regs->mdp_aal_clarity_regs.dre_bilateral_region_protection_activate_A << 1 |
+	clarity_regs->mdp_aal_clarity_regs.dre_bilateral_blending_region_protection_en << 0), ~0);
+
+	// tdshp clarity set registers
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MDP_TDSHP_00,
+		(clarity_regs->disp_tdshp_clarity_regs.tdshp_gain_high << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.tdshp_gain_mid << 16), 0xFFFF << 8);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MIDBAND_COEF_V_CUST_FLT1_00,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_0 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_1 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_2 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_3 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MIDBAND_COEF_V_CUST_FLT1_01,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_0_4 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_0 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_1 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_2 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MIDBAND_COEF_V_CUST_FLT1_02,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_3 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_1_4 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_0 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_1 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MIDBAND_COEF_V_CUST_FLT1_03,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_2 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_3 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_v_custom_range_flt_2_4 << 16), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MIDBAND_COEF_H_CUST_FLT1_00,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_0 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_1 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_2 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_3 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MIDBAND_COEF_H_CUST_FLT1_01,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_0_4 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_0 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_1 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_2 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MIDBAND_COEF_H_CUST_FLT1_02,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_3 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_1_4 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_0 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_1 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MIDBAND_COEF_H_CUST_FLT1_03,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_2 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_3 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_coef_h_custom_range_flt_2_4 << 16), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_V_CUST_FLT1_00,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_0 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_1 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_2 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_3 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_V_CUST_FLT1_01,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_0_4 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_0 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_1 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_2 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_V_CUST_FLT1_02,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_3 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_1_4 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_0 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_1 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_V_CUST_FLT1_03,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_2 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_3 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_v_custom_range_flt_2_4 << 16), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_H_CUST_FLT1_00,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_0 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_1 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_2 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_3 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_H_CUST_FLT1_01,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_0_4 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_0 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_1 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_2 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_H_CUST_FLT1_02,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_3 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_1_4 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_0 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_1 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_H_CUST_FLT1_03,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_2 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_3 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_h_custom_range_flt_2_4 << 16), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_RD_CUST_FLT1_00,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_0 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_1 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_2 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_3 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_RD_CUST_FLT1_01,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_0_4 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_0 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_1 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_2 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_RD_CUST_FLT1_02,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_3 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_1_4 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_0 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_1 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_RD_CUST_FLT1_03,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_2 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_3 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_rd_custom_range_flt_2_4 << 16), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_LD_CUST_FLT1_00,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_0 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_1 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_2 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_3 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_LD_CUST_FLT1_01,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_0_4 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_0 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_1 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_2 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_LD_CUST_FLT1_02,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_3 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_1_4 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_0 << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_1 << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + HIGHBAND_COEF_LD_CUST_FLT1_03,
+		(clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_2 << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_3 << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_coef_ld_custom_range_flt_2_4 << 16), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + ACTIVE_PARA,
+		(clarity_regs->disp_tdshp_clarity_regs.mid_negative_offset << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.mid_positive_offset << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.high_negative_offset << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.high_positive_offset << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + ACTIVE_PARA_FREQ_D,
+		(clarity_regs->disp_tdshp_clarity_regs.D_active_parameter_N_gain << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.D_active_parameter_N_offset << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.D_active_parameter_P_offset << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.D_active_parameter_P_gain << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + ACTIVE_PARA_FREQ_H,
+		(clarity_regs->disp_tdshp_clarity_regs.High_active_parameter_N_gain << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.High_active_parameter_N_offset << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.High_active_parameter_P_offset << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.High_active_parameter_P_gain << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + ACTIVE_PARA_FREQ_L,
+		(clarity_regs->disp_tdshp_clarity_regs.L_active_parameter_N_gain << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.L_active_parameter_N_offset << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.L_active_parameter_P_offset << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.L_active_parameter_P_gain << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + ACTIVE_PARA_FREQ_M,
+		(clarity_regs->disp_tdshp_clarity_regs.Mid_active_parameter_N_gain << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.Mid_active_parameter_N_offset << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.Mid_active_parameter_P_offset << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.Mid_active_parameter_P_gain << 24), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MDP_TDSHP_SIZE_PARA,
+		(clarity_regs->disp_tdshp_clarity_regs.SIZE_PARA_SMALL_MEDIUM << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.SIZE_PARA_MEDIUM_BIG << 6 |
+		clarity_regs->disp_tdshp_clarity_regs.SIZE_PARA_BIG_HUGE << 12), 0x3FFFF);
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		comp_tdshp->regs_pa + FINAL_SIZE_ADAPTIVE_WEIGHT_HUGE,
+		(clarity_regs->disp_tdshp_clarity_regs.Mid_size_adaptive_weight_HUGE << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.Mid_auto_adaptive_weight_HUGE << 5 |
+		clarity_regs->disp_tdshp_clarity_regs.high_size_adaptive_weight_HUGE << 10 |
+		clarity_regs->disp_tdshp_clarity_regs.high_auto_adaptive_weight_HUGE << 15), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		comp_tdshp->regs_pa + FINAL_SIZE_ADAPTIVE_WEIGHT_BIG,
+		(clarity_regs->disp_tdshp_clarity_regs.Mid_size_adaptive_weight_BIG << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.Mid_auto_adaptive_weight_BIG << 5 |
+		clarity_regs->disp_tdshp_clarity_regs.high_size_adaptive_weight_BIG << 10 |
+		clarity_regs->disp_tdshp_clarity_regs.high_auto_adaptive_weight_BIG << 15), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		comp_tdshp->regs_pa + FINAL_SIZE_ADAPTIVE_WEIGHT_MEDIUM,
+		(clarity_regs->disp_tdshp_clarity_regs.Mid_size_adaptive_weight_MEDIUM << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.Mid_auto_adaptive_weight_MEDIUM << 5 |
+		clarity_regs->disp_tdshp_clarity_regs.high_size_adaptive_weight_MEDIUM << 10 |
+		clarity_regs->disp_tdshp_clarity_regs.high_auto_adaptive_weight_MEDIUM << 15), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		comp_tdshp->regs_pa + FINAL_SIZE_ADAPTIVE_WEIGHT_SMALL,
+		(clarity_regs->disp_tdshp_clarity_regs.Mid_size_adaptive_weight_SMALL << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.Mid_auto_adaptive_weight_SMALL << 5 |
+		clarity_regs->disp_tdshp_clarity_regs.high_size_adaptive_weight_SMALL << 10 |
+		clarity_regs->disp_tdshp_clarity_regs.high_auto_adaptive_weight_SMALL << 15), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MDP_TDSHP_CFG,
+		(clarity_regs->disp_tdshp_clarity_regs.FREQ_EXTRACT_ENHANCE << 12 |
+		clarity_regs->disp_tdshp_clarity_regs.FILTER_HIST_EN << 16),
+		((0x1 << 16) | (0x1 << 12)));
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + MDP_TDSHP_FREQUENCY_WEIGHTING,
+		(clarity_regs->disp_tdshp_clarity_regs.freq_M_weighting << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.freq_H_weighting << 4 |
+		clarity_regs->disp_tdshp_clarity_regs.freq_D_weighting << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.freq_L_weighting << 12), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		comp_tdshp->regs_pa + MDP_TDSHP_FREQUENCY_WEIGHTING_FINAL,
+		(clarity_regs->disp_tdshp_clarity_regs.freq_M_final_weighting << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.freq_D_final_weighting << 5 |
+		clarity_regs->disp_tdshp_clarity_regs.freq_L_final_weighting << 10 |
+		clarity_regs->disp_tdshp_clarity_regs.freq_WH_final_weighting << 15), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + LUMA_CHROMA_PARAMETER,
+		(clarity_regs->disp_tdshp_clarity_regs.luma_low_gain << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.luma_low_index << 3 |
+		clarity_regs->disp_tdshp_clarity_regs.luma_high_index << 8 |
+		clarity_regs->disp_tdshp_clarity_regs.luma_high_gain << 13 |
+		clarity_regs->disp_tdshp_clarity_regs.chroma_low_gain << 16 |
+		clarity_regs->disp_tdshp_clarity_regs.chroma_low_index << 19 |
+		clarity_regs->disp_tdshp_clarity_regs.chroma_high_index << 24 |
+		clarity_regs->disp_tdshp_clarity_regs.chroma_high_gain << 29), ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		comp_tdshp->regs_pa + SIZE_PARAMETER_MODE_SEGMENTATION_LENGTH,
+		(clarity_regs->disp_tdshp_clarity_regs.Luma_adaptive_mode << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.Chroma_adaptive_mode << 1 |
+		clarity_regs->disp_tdshp_clarity_regs.SIZE_PARAMETER << 2 |
+		clarity_regs->disp_tdshp_clarity_regs.Luma_shift << 12 |
+		clarity_regs->disp_tdshp_clarity_regs.Chroma_shift << 15),
+		(0x7 << 15) | (0x7 << 12) | (0x1F << 2) | (1 << 1) | (1 << 0));
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp_tdshp->regs_pa + CLASS_0_2_GAIN,
+		(clarity_regs->disp_tdshp_clarity_regs.class_0_positive_gain << 0 |
+		clarity_regs->disp_tdshp_clarity_regs.class_0_negative_gain << 5),
+		0x3FF);
+
+	CRTC_MMP_MARK(0, clarity_set_regs, comp->id, 2);
+
+	return ret;
 }
 
 static void mtk_aal_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
@@ -2240,10 +3215,17 @@ static void mtk_aal_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 			dre_alg_mode = 0;
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			dre3_pa + DISP_AAL_CFG_MAIN,
-			dre_alg_mode << 4, 1 << 4);
+			(0x0 << 3) | (dre_alg_mode << 4), (1 << 3) | (1 << 4));
 	}
 	AALFLOW_LOG("\n");
 	basic_cmdq_write(handle, comp, DISP_AAL_EN, 0x1, ~0);
+
+	// for Display Clarity
+	if (g_disp_clarity_regs != NULL) {
+		mutex_lock(&g_clarity_lock);
+		mtk_disp_clarity_set_reg(comp, handle, g_disp_clarity_regs);
+		mutex_unlock(&g_clarity_lock);
+	}
 }
 
 static void mtk_aal_stop(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
@@ -2254,15 +3236,19 @@ static void mtk_aal_stop(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 static void mtk_aal_bypass(struct mtk_ddp_comp *comp, int bypass,
 	struct cmdq_pkt *handle)
 {
-	AALFLOW_LOG("bypass = %d\n", bypass);
+	AALFLOW_LOG("bypass: %d\n", bypass);
 	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_AAL_CFG,
 		bypass, 0x1);
 	atomic_set(&g_aal_force_relay, bypass);
+
 	if (bypass == 0) // Enable AAL Histogram
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			comp->regs_pa + DISP_AAL_CFG, 0x3 << 1, (0x3 << 1));
+
 }
 
+extern void mtk_dmdp_aal_bypass(struct mtk_ddp_comp *comp, int bypass,
+	struct cmdq_pkt *handle);
 static int mtk_aal_user_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 	unsigned int cmd, void *data)
 {
@@ -2295,9 +3281,19 @@ static int mtk_aal_user_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 		break;
 	case BYPASS_AAL:
 	{
+
 		int *value = data;
 
 		mtk_aal_bypass(comp, *value, handle);
+		if (g_aal_fo->mtk_dre30_support) {
+			struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+			struct drm_crtc *crtc = &mtk_crtc->base;
+			struct mtk_drm_private *priv = crtc->dev->dev_private;
+			struct mtk_ddp_comp *comp_dmdp_aal0 = priv->ddp_comp[DDP_COMPONENT_DMDP_AAL0];
+
+			mtk_dmdp_aal_bypass(comp_dmdp_aal0, *value, handle);
+		}
+
 		if (comp->mtk_crtc->is_dual_pipe) {
 			struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
 			struct drm_crtc *crtc = &mtk_crtc->base;
@@ -2305,8 +3301,72 @@ static int mtk_aal_user_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 			struct mtk_ddp_comp *comp_aal1 = priv->ddp_comp[DDP_COMPONENT_AAL1];
 
 			mtk_aal_bypass(comp_aal1, *value, handle);
+			if (g_aal_fo->mtk_dre30_support) {
+				struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+				struct drm_crtc *crtc = &mtk_crtc->base;
+				struct mtk_drm_private *priv = crtc->dev->dev_private;
+				struct mtk_ddp_comp *comp_dmdp_aal1 = priv->ddp_comp[DDP_COMPONENT_DMDP_AAL1];
+
+				mtk_dmdp_aal_bypass(comp_dmdp_aal1, *value, handle);
+			}
 		}
 
+	}
+		break;
+	case SET_CLARITY_REG:
+	{
+		if (!g_disp_clarity_regs) {
+			g_disp_clarity_regs = kmalloc(sizeof(struct DISP_CLARITY_REG), GFP_KERNEL);
+			if (g_disp_clarity_regs == NULL) {
+				DDPMSG("%s: no memory\n", __func__);
+				return -EFAULT;
+			}
+		}
+
+		if (data == NULL)
+			return -EFAULT;
+
+		mutex_lock(&g_clarity_lock);
+		memcpy(g_disp_clarity_regs, (struct DISP_CLARITY_REG *)data,
+			sizeof(struct DISP_CLARITY_REG));
+
+		dumpAlgAALClarityRegOutput(*g_disp_clarity_regs);
+		dumpAlgTDSHPRegOutput(*g_disp_clarity_regs);
+
+		CRTC_MMP_EVENT_START(0, clarity_set_regs, 0, 0);
+		if (mtk_disp_clarity_set_reg(comp, handle, g_disp_clarity_regs) < 0) {
+			DDPMSG("[Pipe0] %s: clarity_set_reg failed\n", __func__);
+			mutex_unlock(&g_clarity_lock);
+
+			return -EFAULT;
+		}
+		if (comp->mtk_crtc->is_dual_pipe) {
+			struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+			struct drm_crtc *crtc = &mtk_crtc->base;
+			struct mtk_drm_private *priv = crtc->dev->dev_private;
+			struct mtk_ddp_comp *comp_aal1 = priv->ddp_comp[DDP_COMPONENT_AAL1];
+
+			if (mtk_disp_clarity_set_reg(comp_aal1, handle,
+					g_disp_clarity_regs) < 0) {
+				DDPMSG("[Pipe1] %s: clarity_set_reg failed\n", __func__);
+				mutex_unlock(&g_clarity_lock);
+
+				return -EFAULT;
+			}
+		}
+		CRTC_MMP_EVENT_END(0, clarity_set_regs, 0, 3);
+		mutex_unlock(&g_clarity_lock);
+
+		if (atomic_read(&g_force_delay_check_trig) == 0)
+		        mtk_crtc_check_trigger(default_comp->mtk_crtc, false, false);
+		else if (atomic_read(&g_force_delay_check_trig) == 1)
+		        mtk_crtc_check_trigger(default_comp->mtk_crtc, true, false);
+		else if (atomic_read(&g_force_delay_check_trig) == 2)
+			mtk_crtc_check_trigger(default_comp->mtk_crtc, false, false);
+		else if (atomic_read(&g_force_delay_check_trig) == 3)
+			DDPINFO("%s: not check trigger\n", __func__);
+		else
+			DDPINFO("%s: value is not support!\n", __func__);
 	}
 		break;
 	default:
@@ -2340,6 +3400,7 @@ struct aal_backup { /* structure for backup AAL register value */
 	unsigned int DUAL_PIPE_INFO_01;
 #endif
 	unsigned int AAL_CFG;
+	unsigned int AAL_INTEN;
 };
 static struct aal_backup g_aal_backup;
 
@@ -2407,6 +3468,8 @@ static void ddp_aal_cabc_backup(struct mtk_ddp_comp *comp)
 static void ddp_aal_cfg_backup(struct mtk_ddp_comp *comp)
 {
 	g_aal_backup.AAL_CFG = readl(comp->regs + DISP_AAL_CFG);
+	if (comp->id == DDP_COMPONENT_AAL0)
+		g_aal_backup.AAL_INTEN = readl(comp->regs + DISP_AAL_INTEN);
 }
 
 static void ddp_aal_backup(struct mtk_ddp_comp *comp)
@@ -2454,6 +3517,7 @@ static void ddp_aal_dre3_restore(struct mtk_ddp_comp *comp)
 
 	if (g_aal_fo->mtk_dre30_support) {
 		unsigned long flags;
+
 		spin_lock_irqsave(&g_aal_dre3_gain_lock, flags);
 		ddp_aal_dre3_write_curve_full(comp);
 		spin_unlock_irqrestore(&g_aal_dre3_gain_lock, flags);
@@ -2489,6 +3553,8 @@ static void ddp_aal_cabc_restore(struct mtk_ddp_comp *comp)
 static void ddp_aal_cfg_restore(struct mtk_ddp_comp *comp)
 {
 	writel(g_aal_backup.AAL_CFG, comp->regs + DISP_AAL_CFG);
+	if (comp->id == DDP_COMPONENT_AAL0)
+		writel(g_aal_backup.AAL_INTEN, comp->regs + DISP_AAL_INTEN);
 }
 
 static void ddp_aal_restore(struct mtk_ddp_comp *comp)
@@ -2506,6 +3572,7 @@ static void ddp_aal_restore(struct mtk_ddp_comp *comp)
 static bool debug_skip_first_br;
 static void mtk_aal_prepare(struct mtk_ddp_comp *comp)
 {
+	int ret = 0;
 	struct mtk_disp_aal *aal_data = comp_to_aal(comp);
 	bool first_restore = (atomic_read(&aal_data->is_clock_on) == 0);
 
@@ -2525,8 +3592,11 @@ static void mtk_aal_prepare(struct mtk_ddp_comp *comp)
 			atomic_read(&g_aal_data->is_clock_on));
 
 	if (g_aal_fo->mtk_dre30_support) {
-		if (aal_data->dre3_hw.clk)
-			clk_prepare(aal_data->dre3_hw.clk);
+		if (aal_data->dre3_hw.clk) {
+			ret = clk_prepare(aal_data->dre3_hw.clk);
+			if (ret < 0)
+				DDPPR_ERR("failed to prepare dre3_hw.clk\n");
+		}
 	}
 	if (!first_restore && !debug_skip_first_br)
 		return;
@@ -2590,6 +3660,7 @@ int mtk_aal_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 	      enum mtk_ddp_io_cmd cmd, void *params)
 {
 	unsigned long flags;
+	uint32_t force_delay_trigger;
 	struct mtk_disp_aal *aal_data = comp_to_aal(comp);
 
 	if (cmd == FRAME_DIRTY) {
@@ -2601,6 +3672,9 @@ int mtk_aal_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 				disp_aal_set_interrupt(NULL, true);
 			spin_unlock_irqrestore(&g_aal_clock_lock, flags);
 		}
+	} else if (cmd == FORCE_TRIG_CTL) {
+		force_delay_trigger = *(uint32_t *)params;
+		atomic_set(&g_force_delay_check_trig, force_delay_trigger);
 	}
 	AALFLOW_LOG("end\n");
 	return 0;
@@ -2616,6 +3690,7 @@ static const struct mtk_ddp_comp_funcs mtk_disp_aal_funcs = {
 	.io_cmd = mtk_aal_io_cmd,
 	.prepare = mtk_aal_prepare,
 	.unprepare = mtk_aal_unprepare,
+	.config_overhead = mtk_disp_aal_config_overhead,
 };
 
 static int mtk_disp_aal_bind(struct device *dev, struct device *master,
@@ -2653,25 +3728,45 @@ void mtk_aal_dump(struct mtk_ddp_comp *comp)
 {
 	void __iomem  *baddr = comp->regs;
 
-	DDPDUMP("== %s REGS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
-	mtk_cust_dump_reg(baddr, 0x0, 0x8, 0x10, 0x20);
-	mtk_cust_dump_reg(baddr, 0x30, 0xFC, 0x160, 0x200);
-	mtk_cust_dump_reg(baddr, 0x204, 0x20C, 0x3B4, 0x45C);
-	mtk_cust_dump_reg(baddr, 0x460, 0x464, 0x468, 0x4D8);
-	mtk_cust_dump_reg(baddr, 0x4DC, 0x500, 0x224, 0x504);
-	if (g_aal_fo->mtk_dre30_support) {
-		void __iomem  *dre3_va = mtk_aal_dre3_va(comp);
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return;
+	}
 
-		DDPDUMP("dre30 dump\n");
-		mtk_cust_dump_reg(dre3_va, 0x0, 0x8, 0x10, 0x20);
-		mtk_cust_dump_reg(dre3_va, 0x30, 0x34, 0x38, 0xC4);
-		mtk_cust_dump_reg(dre3_va, 0xC8, 0xF4, 0xF8, 0x200);
-		mtk_cust_dump_reg(dre3_va, 0x204, 0x45C, 0x460, 0x464);
-		mtk_cust_dump_reg(dre3_va, 0x468, 0x46C, 0x470, 0x474);
-		mtk_cust_dump_reg(dre3_va, 0x478, 0x480, 0x484, 0x488);
-		mtk_cust_dump_reg(dre3_va, 0x48C, 0x490, 0x494, 0x498);
-		mtk_cust_dump_reg(dre3_va, 0x49C, 0x4B4, 0x4B8, 0x4BC);
-		mtk_cust_dump_reg(dre3_va, 0x4D4, 0x4EC, 0x4F0, 0x53C);
+	DDPDUMP("== %s REGS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
+	mtk_cust_dump_reg(baddr, 0x0, 0x20, 0x30, 0x4D8);
+	mtk_cust_dump_reg(baddr, 0x24, 0x28, 0x200, 0x10);
+}
+
+void mtk_aal_regdump(void)
+{
+	void __iomem  *baddr = default_comp->regs;
+	int k;
+
+	DDPDUMP("== %s REGS:0x%llx ==\n", mtk_dump_comp_str(default_comp),
+			default_comp->regs_pa);
+	DDPDUMP("[%s REGS Start Dump]\n", mtk_dump_comp_str(default_comp));
+	for (k = 0; k <= 0x580; k += 16) {
+		DDPDUMP("0x%04x: 0x%08x 0x%08x 0x%08x 0x%08x\n", k,
+			readl(baddr + k),
+			readl(baddr + k + 0x4),
+			readl(baddr + k + 0x8),
+			readl(baddr + k + 0xc));
+	}
+	DDPDUMP("[%s REGS End Dump]\n", mtk_dump_comp_str(default_comp));
+	if (isDualPQ && aal1_default_comp) {
+		baddr = aal1_default_comp->regs;
+		DDPDUMP("== %s REGS:0x%llx ==\n", mtk_dump_comp_str(aal1_default_comp),
+				aal1_default_comp->regs_pa);
+		DDPDUMP("[%s REGS Start Dump]\n", mtk_dump_comp_str(aal1_default_comp));
+		for (k = 0; k <= 0x580; k += 16) {
+			DDPDUMP("0x%04x: 0x%08x 0x%08x 0x%08x 0x%08x\n", k,
+				readl(baddr + k),
+				readl(baddr + k + 0x4),
+				readl(baddr + k + 0x8),
+				readl(baddr + k + 0xc));
+		}
+		DDPDUMP("[%s REGS End Dump]\n", mtk_dump_comp_str(aal1_default_comp));
 	}
 }
 
@@ -2690,23 +3785,19 @@ void disp_aal_on_end_of_frame(struct mtk_ddp_comp *comp)
 		return;
 	}
 
-	DRM_MMP_MARK(IRQ, 0, 0);
-
-	if (comp->id == DDP_COMPONENT_AAL0)
-		DRM_MMP_MARK(aal0, 0, 1);
-	else if (comp->id == DDP_COMPONENT_AAL1)
-		DRM_MMP_MARK(aal1, 1, 1);
-
-
-	if (g_aal_fo->mtk_dre30_support)
+	if (g_aal_fo->mtk_dre30_support && gDre30Enabled)
 		disp_aal_dre3_irq_handle(comp);
 	else
 		disp_aal_single_pipe_hist_update(comp);
 
-	if (comp->id == DDP_COMPONENT_AAL0)
-		DRM_MMP_MARK(aal0, 0, 1);
-	else if (comp->id == DDP_COMPONENT_AAL1)
-		DRM_MMP_MARK(aal1, 1, 1);
+	AALIRQ_LOG("[SRAM] clean dre_config in (EOF)  comp->id = %d", comp->id);
+	if (comp->mtk_crtc->is_dual_pipe) {
+		if (comp->id == DDP_COMPONENT_AAL0)
+			atomic_set(&g_aal_dre_config, 0);
+		else if (comp->id == DDP_COMPONENT_AAL1)
+			atomic_set(&g_aal1_dre_config, 0);
+	} else
+		atomic_set(&g_aal_dre_config, 0);
 }
 
 static void disp_aal_wait_sof_irq(void)
@@ -2734,20 +3825,10 @@ static void disp_aal_wait_sof_irq(void)
 			atomic_read(&g_aal_dre_config));
 	mutex_lock(&g_aal_sram_lock);
 	spin_lock_irqsave(&g_aal_clock_lock, flags);
-	if (atomic_read(&g_aal_idle_eof_available) == 1) {
-		disp_aal_update_dre3_sram(default_comp, false);
-		if (!isDualPQ) {
-			atomic_set(&g_aal_idle_eof_available, 0);
-			spin_unlock_irqrestore(&g_aal_clock_lock,flags);
-			mutex_unlock(&g_aal_sram_lock);
-			return;
-		}
-	} else {
-		if (atomic_read(&aal_data->is_clock_on) != 1)
-			AALIRQ_LOG("clock is off\n");
-		else
-			disp_aal_update_dre3_sram(default_comp, true);
-	}
+	if (atomic_read(&aal_data->is_clock_on) != 1)
+		AALIRQ_LOG("clock is off\n");
+	else
+		disp_aal_update_dre3_sram(default_comp, true);
 	spin_unlock_irqrestore(&g_aal_clock_lock,
 			flags);
 	if (!isDualPQ)
@@ -2759,7 +3840,7 @@ static void disp_aal_wait_sof_irq(void)
 
 		AALIRQ_LOG("[SRAM] g_aal1_dre_config(%d) in SOF",
 			atomic_read(&g_aal1_dre_config));
-		while ((!aal_lock) && (retry !=0)) {
+		while ((!aal_lock) && (retry != 0)) {
 			aal_lock = spin_trylock_irqsave(&g_aal_clock_lock, flags);
 			if (!aal_lock) {
 				usleep_range(500, 1000);
@@ -2767,13 +3848,7 @@ static void disp_aal_wait_sof_irq(void)
 			}
 		}
 		if (aal_lock) {
-			if (atomic_read(&g_aal_idle_eof_available) == 1) {
-				disp_aal_update_dre3_sram(aal1_default_comp, false);
-				atomic_set(&g_aal_idle_eof_available, 0);
-				spin_unlock_irqrestore(&g_aal_clock_lock,flags);
-				mutex_unlock(&g_aal_sram_lock);
-				return;
-			} else if (atomic_read(&aal1_data->is_clock_on) != 1)
+			if (atomic_read(&aal1_data->is_clock_on) != 1)
 				AALIRQ_LOG("aal1 clock is off\n");
 			else
 				disp_aal_update_dre3_sram(aal1_default_comp, true);
@@ -2787,16 +3862,42 @@ static void disp_aal_wait_sof_irq(void)
 		if (atomic_read(&g_aal_first_frame) == 1 &&
 			atomic_read(&g_aal1_first_frame) == 1) {
 			mtk_crtc_user_cmd(g_aal_data->crtc, default_comp, FLIP_SRAM, NULL);
-			mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+
+			if (atomic_read(&g_force_delay_check_trig) == 0)
+			        mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+			else if (atomic_read(&g_force_delay_check_trig) == 1)
+			        mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+			else if (atomic_read(&g_force_delay_check_trig) == 2)
+				mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+			else if (atomic_read(&g_force_delay_check_trig) == 3)
+				DDPINFO("%s: not check trigger\n", __func__);
+			else
+				DDPINFO("%s: value is not support!\n", __func__);
+
 			atomic_set(&g_aal_first_frame, 0);
 			atomic_set(&g_aal1_first_frame, 0);
+
+			return;
 		}
 	} else {
 		if (atomic_read(&g_aal_first_frame) == 1) {
 			AALIRQ_LOG("aal_refresh_task");
 			mtk_crtc_user_cmd(g_aal_data->crtc, default_comp, FLIP_SRAM, NULL);
-			mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+
+			if (atomic_read(&g_force_delay_check_trig) == 0)
+			        mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+			else if (atomic_read(&g_force_delay_check_trig) == 1)
+			        mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+			else if (atomic_read(&g_force_delay_check_trig) == 2)
+				mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+			else if (atomic_read(&g_force_delay_check_trig) == 3)
+				DDPINFO("%s: not check trigger\n", __func__);
+			else
+				DDPINFO("%s: value is not support!\n", __func__);
+
 			atomic_set(&g_aal_first_frame, 0);
+
+			return;
 		}
 	}
 
@@ -2812,7 +3913,17 @@ static void disp_aal_wait_sof_irq(void)
 	}
 
 	if (atomic_read(&g_aal_dre30_write) == 1) {
-		mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+		if (atomic_read(&g_force_delay_check_trig) == 0)
+		        mtk_crtc_check_trigger(default_comp->mtk_crtc, false, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 1)
+		        mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 2)
+			mtk_crtc_check_trigger(default_comp->mtk_crtc, true, true);
+		else if (atomic_read(&g_force_delay_check_trig) == 3)
+			DDPINFO("%s: not check trigger\n", __func__);
+		else
+			DDPINFO("%s: value is not support!\n", __func__);
+
 		atomic_set(&g_aal_dre30_write, 0);
 	}
 	CRTC_MMP_EVENT_END(0, aal_sof_thread, 0, 3);
@@ -2823,10 +3934,7 @@ void disp_aal_on_start_of_frame(void)
 	if (!default_comp)
 		return;
 
-	AALIRQ_LOG("%s start\n", __func__);
-
-	if (!g_aal_fo->mtk_dre30_support) {
-
+	if (!g_aal_fo->mtk_dre30_support || !gDre30Enabled) {
 		if (isDualPQ) {
 			if (atomic_read(&g_aal0_dre20_hist_is_ready) &&
 				atomic_read(&g_aal1_dre20_hist_is_ready)) {
@@ -2837,16 +3945,16 @@ void disp_aal_on_start_of_frame(void)
 		} else {
 			if (atomic_read(&g_aal0_dre20_hist_is_ready)) {
 				atomic_set(&g_aal0_hist_available, 1);
+				if (atomic_read(&g_aal_hist_wait_dualpipe) == 1)
+					atomic_set(&g_aal1_hist_available, 1);
 				wake_up_interruptible(&g_aal_hist_wq);
 			}
 		}
-
 		return;
 	}
 
 	if (atomic_read(&g_aal_force_relay) == 1 &&
-		!m_new_pq_persist_property[DISP_PQ_CCORR_SILKY_BRIGHTNESS] &&
-		!m_new_pq_persist_property[DISP_PQ_GAMMA_SILKY_BRIGHTNESS])
+		!m_new_pq_persist_property[DISP_PQ_CCORR_SILKY_BRIGHTNESS])
 		return;
 	if (atomic_read(&g_aal_change_to_dre30) != 0x3)
 		return;
@@ -2861,10 +3969,12 @@ void disp_aal_on_start_of_frame(void)
 
 static int mtk_aal_sof_irq_trigger(void *data)
 {
-	while (1) {
+	while (!kthread_should_stop()) {
 		disp_aal_wait_sof_irq();
 		atomic_set(&g_aal_sof_irq_available, 0);
 	}
+
+	return 0;
 }
 
 static irqreturn_t mtk_disp_aal_irq_handler(int irq, void *dev_id)
@@ -2875,29 +3985,32 @@ static irqreturn_t mtk_disp_aal_irq_handler(int irq, void *dev_id)
 	struct mtk_disp_aal *priv = dev_id;
 	struct mtk_ddp_comp *comp = &priv->ddp_comp;
 	struct mtk_disp_aal *aal_data = comp_to_aal(comp);
+	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
 
-	if(atomic_read(&aal_data->is_clock_on) == 1)
+	if (atomic_read(&aal_data->is_clock_on) == 1)
 		val = readl(comp->regs + DISP_AAL_INTSTA);
 
 	DRM_MMP_MARK(IRQ, irq, val);
-	if (comp->id == DDP_COMPONENT_AAL0)
-		DRM_MMP_MARK(aal0, val, 0);
-	else if (comp->id == DDP_COMPONENT_AAL1)
-		DRM_MMP_MARK(aal1, val, 0);
+	DRM_MMP_MARK(aal0, val, 0);
 
 	spin_lock_irqsave(&g_aal_clock_lock, flags);
 	if (atomic_read(&aal_data->is_clock_on) != 1)
 		AALIRQ_LOG("clock is off\n");
 	else {
 		disp_aal_on_end_of_frame(comp);
+		if (mtk_crtc->is_dual_pipe) {
+			struct drm_crtc *crtc = &mtk_crtc->base;
+			struct mtk_drm_private *dev_priv = crtc->dev->dev_private;
+			struct mtk_ddp_comp *comp1 = dev_priv->ddp_comp[DDP_COMPONENT_AAL1];
+
+			if (comp1)
+				disp_aal_on_end_of_frame(comp1);
+		}
 		ret = IRQ_HANDLED;
 	}
 	spin_unlock_irqrestore(&g_aal_clock_lock, flags);
 
-	if (comp->id == DDP_COMPONENT_AAL0)
-		DRM_MMP_MARK(aal0, val, 1);
-	else if (comp->id == DDP_COMPONENT_AAL1)
-		DRM_MMP_MARK(aal1, val, 1);
+	DRM_MMP_MARK(aal0, val, 1);
 
 	return ret;
 }
@@ -2907,6 +4020,7 @@ static int mtk_disp_aal_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct mtk_disp_aal *priv;
 	enum mtk_ddp_comp_id comp_id;
+	struct device_node *tdshp_node;
 	int ret, irq;
 	struct device_node *dre3_dev_node;
 	struct platform_device *dre3_pdev;
@@ -2941,6 +4055,14 @@ static int mtk_disp_aal_probe(struct platform_device *pdev)
 		if (g_aal_fo == NULL)
 			return -ENOMEM;
 
+		// for Display Clarity
+		tdshp_node = of_find_compatible_node(NULL, NULL, "mediatek,disp_tdshp0");
+		if (!of_property_read_u32(tdshp_node, "mtk-tdshp-clarity-support",
+			&g_tdshp_clarity_support)) {
+			DDPMSG("disp_tdshp: mtk_tdshp_clarity_support = %d\n",
+				g_tdshp_clarity_support);
+		}
+
 		if (of_property_read_u32(dev->of_node, "mtk_aal_support",
 			&g_aal_fo->mtk_aal_support)) {
 			AALERR("comp_id: %d, mtk_aal_support = %d\n",
@@ -2953,6 +4075,27 @@ static int mtk_disp_aal_probe(struct platform_device *pdev)
 			AALERR("comp_id: %d, mtk_dre30_support = %d\n",
 				comp_id, g_aal_fo->mtk_dre30_support);
 			g_aal_fo->mtk_dre30_support = 0;
+		} else {
+			if (g_aal_fo->mtk_dre30_support) {
+				if (of_property_read_u32(dev->of_node, "aal_dre3_en",
+					&g_aal_dre30_en)) {
+					gDre30Enabled = true;
+				} else
+					gDre30Enabled = (g_aal_dre30_en == 1) ? true : false;
+
+				// for Display Clarity
+				if (!of_property_read_u32(dev->of_node, "mtk-aal-clarity-support",
+					&g_aal_clarity_support))
+					DDPMSG("mtk_aal_clarity_support = %d\n",
+						g_aal_clarity_support);
+
+				if ((g_aal_clarity_support == 1)
+						&& (g_tdshp_clarity_support == 1)) {
+					g_disp_clarity_support = 1;
+					DDPMSG("%s: display clarity support = %d\n",
+						__func__, g_disp_clarity_support);
+				}
+			}
 		}
 	}
 
@@ -2972,10 +4115,12 @@ static int mtk_disp_aal_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, priv);
 
-	ret = devm_request_irq(dev, irq, mtk_disp_aal_irq_handler,
-		IRQF_TRIGGER_NONE | IRQF_SHARED, dev_name(dev), priv);
-	if (ret)
-		dev_err(dev, "devm_request_irq fail: %d\n", ret);
+	if (comp_id == DDP_COMPONENT_AAL0) {
+		ret = devm_request_irq(dev, irq, mtk_disp_aal_irq_handler,
+			IRQF_TRIGGER_NONE | IRQF_SHARED, dev_name(dev), priv);
+		if (ret)
+			dev_err(dev, "devm_request_irq fail: %d\n", ret);
+	}
 
 	mtk_ddp_comp_pm_enable(&priv->ddp_comp);
 
@@ -3154,6 +4299,26 @@ static const struct mtk_disp_aal_data mt6855_aal_driver_data = {
 	.bitShift = 16,
 };
 
+static const struct mtk_disp_aal_data mt6985_aal_driver_data = {
+	.support_shadow     = false,
+	.need_bypass_shadow = true,
+	.aal_dre_hist_start = 1536,
+	.aal_dre_hist_end   = 4604,
+	.aal_dre_gain_start = 4608,
+	.aal_dre_gain_end   = 6780,
+	.bitShift = 16,
+};
+
+static const struct mtk_disp_aal_data mt6886_aal_driver_data = {
+	.support_shadow     = false,
+	.need_bypass_shadow = true,
+	.aal_dre_hist_start = 1536,
+	.aal_dre_hist_end   = 4604,
+	.aal_dre_gain_start = 4608,
+	.aal_dre_gain_end   = 6780,
+	.bitShift = 16,
+};
+
 static const struct of_device_id mtk_disp_aal_driver_dt_match[] = {
 	{ .compatible = "mediatek,mt6885-disp-aal",
 	  .data = &mt6885_aal_driver_data},
@@ -3171,6 +4336,12 @@ static const struct of_device_id mtk_disp_aal_driver_dt_match[] = {
 	  .data = &mt6879_aal_driver_data},
 	{ .compatible = "mediatek,mt6855-disp-aal",
 	  .data = &mt6855_aal_driver_data},
+	{ .compatible = "mediatek,mt6985-disp-aal",
+	  .data = &mt6985_aal_driver_data},
+	{ .compatible = "mediatek,mt6886-disp-aal",
+	  .data = &mt6886_aal_driver_data},
+	{ .compatible = "mediatek,mt6835-disp-aal",
+	  .data = &mt6835_aal_driver_data},
 	{},
 };
 
@@ -3273,8 +4444,8 @@ void disp_aal_debug(const char *opt)
 		debug_bypass_alg_mode = strncmp(opt + 12, "bypass", 6) == 0;
 		pr_notice("[debug] bypass_alg_mode=%d\n",
 			debug_bypass_alg_mode);
-	} else if (strncmp(opt, "dumpregirq:", 11) == 0) {
-		debug_dump_reg_irq = strncmp(opt + 11, "1", 1) == 0;
+	} else if (strncmp(opt, "dumpregirq", 10) == 0) {
+		debug_dump_reg_irq = true;
 		pr_notice("[debug] debug_dump_reg_irq=%d\n",
 			debug_dump_reg_irq);
 	} else if (strncmp(opt, "dumpdre3hist:", 13) == 0) {
@@ -3342,6 +4513,10 @@ void disp_aal_debug(const char *opt)
 		} else {
 			pr_notice("[debug] dre30 is not support\n");
 		}
+	} else if (strncmp(opt, "dump_clarity_regs:", 18) == 0) {
+		debug_dump_clarity_regs = strncmp(opt + 18, "1", 1) == 0;
+		pr_notice("[debug] debug_dump_clarity_regs=%d\n",
+			debug_dump_clarity_regs);
 	} else if (strncmp(opt, "debugdump:", 10) == 0) {
 		pr_notice("[debug] skip_set_param=%d\n",
 			debug_skip_set_param);
@@ -3370,16 +4545,70 @@ void disp_aal_debug(const char *opt)
 		pr_notice("[debug] debug_ess_level=%d\n", g_aal_ess_level);
 		pr_notice("[debug] debug_ess_en=%d\n", g_aal_ess_en);
 		pr_notice("[debug] debug_dre_en=%d\n", g_aal_dre_en);
+		pr_notice("[debug] debug_dump_clarity_regs=%d\n", debug_dump_clarity_regs);
 	}
 }
 
-void disp_aal_set_bypass(struct drm_crtc *crtc, int bypass)
+int disp_aal_set_bypass(struct drm_crtc *crtc, int bypass)
 {
-	int ret;
+	int ret = 0;
 
 	if (atomic_read(&g_aal_force_relay) == bypass)
-		return;
+		return ret;
 	ret = mtk_crtc_user_cmd(crtc, default_comp, BYPASS_AAL, &bypass);
-
 	DDPINFO("%s : ret = %d", __func__, ret);
+	return ret;
+}
+
+int mtk_drm_ioctl_aal_set_trigger_state(struct drm_device *dev, void *data,
+	struct drm_file *file_priv)
+{
+	unsigned long flags;
+	unsigned int dre3EnState;
+
+	struct DISP_AAL_TRIG_STATE *trigger_state = (struct DISP_AAL_TRIG_STATE *)data;
+
+	dre3EnState = trigger_state->dre3_en_state;
+
+	AALFLOW_LOG("dre3EnState: 0x%x, trigger_state: %d, ali: %d, aliThres: %d\n",
+			dre3EnState,
+			trigger_state->dre_frm_trigger,
+			trigger_state->curAli, trigger_state->aliThreshold);
+
+	if (dre3EnState & 0x2) {
+		AALFLOW_LOG("dre change to open!\n");
+
+		spin_lock_irqsave(&g_aal_hist_lock, flags);
+		if ((g_aal_fo->mtk_dre30_support) && (!gDre30Enabled)) {
+			gPrvDre30Enabled = gDre30Enabled;
+			gDre30Enabled = true;
+		}
+		spin_unlock_irqrestore(&g_aal_hist_lock, flags);
+
+		if (gPrvDre30Enabled != gDre30Enabled) {
+			// need flip sram to get local histogram
+			mtk_crtc_user_cmd(g_aal_data->crtc, default_comp, FLIP_SRAM, NULL);
+			gPrvDre30Enabled = gDre30Enabled;
+		}
+
+		trigger_state->dre3_krn_flag = gDre30Enabled ? 1 : 0;
+
+		return 0;
+	}
+
+	if (dre3EnState & 0x1) {
+		spin_lock_irqsave(&g_aal_hist_lock, flags);
+		if (trigger_state->dre_frm_trigger == 0) {
+			if ((g_aal_fo->mtk_dre30_support) && gDre30Enabled) {
+				gDre30Enabled = false;
+
+				AALFLOW_LOG("dre change to close!\n");
+			}
+		}
+
+		trigger_state->dre3_krn_flag = gDre30Enabled ? 1 : 0;
+		spin_unlock_irqrestore(&g_aal_hist_lock, flags);
+	}
+
+	return 0;
 }

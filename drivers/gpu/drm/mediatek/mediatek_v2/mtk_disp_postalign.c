@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2021 MediaTek Inc.
- * Ported verbatim from the MT6985 T-OSS drop (corot r235).  The driver
- * itself is a passthrough placeholder: POSTALIGN0's real programming
- * lives in mtk_spr_config_V2() and (bring-up) the r230-proven
- * dispsys 0x14000050/0x14000054 registers.
  */
 
 #include <linux/clk.h>
@@ -53,6 +49,8 @@ static void mtk_postalign_prepare(struct mtk_ddp_comp *comp)
 	DDPINFO("%s prepare\n", mtk_dump_comp_str(comp));
 
 	mtk_ddp_comp_clk_prepare(comp);
+
+	/* Bypass shadow register and read shadow register */
 }
 
 static void mtk_postalign_unprepare(struct mtk_ddp_comp *comp)
@@ -67,6 +65,37 @@ static void mtk_postalign_config(struct mtk_ddp_comp *comp,
 				 struct cmdq_pkt *handle)
 {
 	DDPINFO("%s config\n", mtk_dump_comp_str(comp));
+}
+
+void mtk_postalign_dump(struct mtk_ddp_comp *comp)
+{
+	if (!comp->regs) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return;
+	}
+
+	if (!comp->regs_pa) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return;
+	}
+
+	DDPDUMP("== %s REGS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
+}
+
+int mtk_postalign_analysis(struct mtk_ddp_comp *comp)
+{
+	if (!comp->regs) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return 0;
+	}
+
+	if (!comp->regs_pa) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return 0;
+	}
+
+	DDPDUMP("== %s ANALYSIS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
+	return 0;
 }
 
 static const struct mtk_ddp_comp_funcs mtk_disp_postalign_funcs = {
@@ -115,7 +144,7 @@ static int mtk_disp_postalign_probe(struct platform_device *pdev)
 	enum mtk_ddp_comp_id comp_id;
 	int ret;
 
-	pr_err("COROT r235: postalign probe+\n");
+	DDPINFO("%s+\n", __func__);
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -143,11 +172,10 @@ static int mtk_disp_postalign_probe(struct platform_device *pdev)
 	if (ret != 0) {
 		dev_err(dev, "Failed to add component: %d\n", ret);
 		mtk_ddp_comp_pm_disable(&priv->ddp_comp);
-		return ret;
 	}
 
-	pr_err("COROT r235: postalign probe- ok\n");
-	return 0;
+	DDPINFO("%s-\n", __func__);
+	return ret;
 }
 
 static void mtk_disp_postalign_remove(struct platform_device *pdev)
@@ -156,6 +184,8 @@ static void mtk_disp_postalign_remove(struct platform_device *pdev)
 
 	component_del(&pdev->dev, &mtk_disp_postalign_component_ops);
 	mtk_ddp_comp_pm_disable(&priv->ddp_comp);
+
+	return;
 }
 
 static const struct mtk_disp_postalign_data mt6985_postalign_driver_data = {

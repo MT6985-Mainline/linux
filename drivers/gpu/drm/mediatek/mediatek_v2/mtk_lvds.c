@@ -14,6 +14,7 @@
 #include <linux/mfd/syscon.h>
 #include <linux/of_platform.h>
 #include <linux/of.h>
+#include <linux/of_gpio.h>
 #include <linux/of_graph.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -205,7 +206,10 @@ static void mtk_lvds_bridge_disable(struct drm_bridge *bridge)
 	if (ret < 0)
 		pr_err("Failed to disable power domain: %d\n", ret);
 
-	drm_panel_disable(lvds->panel);
+	if (mtk_drm_panel_disable(lvds->panel)) {
+		pr_err("failed to disable panel\n");
+		return;
+	}
 
 	phy_power_off(lvds->phy);
 	clk_disable_unprepare(lvds->clkts_clk_gate);
@@ -221,7 +225,10 @@ static void mtk_lvds_bridge_post_disable(struct drm_bridge *bridge)
 	if (!lvds->powered)
 		return;
 
-	drm_panel_unprepare(lvds->panel);
+	if (mtk_drm_panel_unprepare(lvds->panel)) {
+		pr_err("failed to unprepare panel\n");
+		return;
+	}
 
 	lvds->powered = false;
 }
@@ -255,7 +262,10 @@ static void mtk_lvds_pre_enable(struct drm_bridge *bridge)
 	if (lvds->powered)
 		return;
 
-	drm_panel_prepare(lvds->panel);
+	if (mtk_drm_panel_prepare(lvds->panel)) {
+		pr_err("failed to prepare panel\n");
+		return;
+	}
 
 	lvds->powered = true;
 }
@@ -304,7 +314,14 @@ static void mtk_lvds_bridge_enable(struct drm_bridge *bridge)
 	       lvds->regs + LVDS_CTRL00);
 	writel(0x102ce4, lvds->regs + LVDS_CTRL02);
 
-	drm_panel_enable(lvds->panel);
+	if (mtk_drm_panel_enable(lvds->panel)) {
+		pr_err("failed to enable panel\n");
+		phy_power_off(lvds->phy);
+		clk_disable_unprepare(lvds->clkts_clk_gate);
+		clk_disable_unprepare(lvds->pix_clk_gate);
+		clk_disable_unprepare(lvds->lvdsdpi_sel);
+		return;
+	}
 
 	lvds->enabled = true;
 }
@@ -454,3 +471,4 @@ struct platform_driver mtk_lvds_driver = {
 		.of_match_table = mtk_drm_lvds_of_ids,
 	},
 };
+

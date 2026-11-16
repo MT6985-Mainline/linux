@@ -7,6 +7,8 @@
 #define _MTK_DRM_GEM_H_
 
 #include <drm/drm_gem.h>
+#include <drm/drm_gem_dma_helper.h>
+#include <linux/iosys-map.h>
 #include <soc/mediatek/smi.h>
 #ifdef IF_ZERO
 #include "mtk_iommu_ext.h"
@@ -28,22 +30,44 @@
  *	user can access the buffer through kms_bo.handle.
  */
 struct mtk_drm_gem_obj {
-	struct drm_gem_object base;
-	void *cookie;
-	void *kvaddr;
-	dma_addr_t dma_addr;
-	size_t size;
-	unsigned long dma_attrs;
-	struct sg_table *sg;
+    /* Vendor names alias the actual mainline GEM DMA object members. */
+    union {
+        struct drm_gem_dma_object dma;
+        struct {
+            struct drm_gem_object base;
+            dma_addr_t dma_addr;
+            union { struct sg_table *sg; struct sg_table *sgt; };
+            union { void *kvaddr; void *vaddr; };
+            bool map_noncoherent;
+        };
+    };
+    void *cookie;
+    size_t size;
+    unsigned long dma_attrs;
 	bool sec;
 	bool is_dumb;
+	struct dma_buf *heap_buf;
+	struct dma_buf_attachment *heap_attach;
+	struct iosys_map heap_map;
+	bool boot_fb;
+	bool boot_reclaim;
+	struct device *boot_dma_dev;
+	phys_addr_t boot_fb_base;
 };
+
+static_assert(offsetof(struct mtk_drm_gem_obj, base) == offsetof(struct drm_gem_dma_object, base));
+static_assert(offsetof(struct mtk_drm_gem_obj, dma_addr) == offsetof(struct drm_gem_dma_object, dma_addr));
+static_assert(offsetof(struct mtk_drm_gem_obj, sg) == offsetof(struct drm_gem_dma_object, sgt));
+static_assert(offsetof(struct mtk_drm_gem_obj, kvaddr) == offsetof(struct drm_gem_dma_object, vaddr));
 
 #define to_mtk_gem_obj(x) container_of(x, struct mtk_drm_gem_obj, base)
 
 void mtk_drm_gem_free_object(struct drm_gem_object *gem);
+int mtk_drm_boot_fb_free_pages(phys_addr_t base, size_t size);
 struct mtk_drm_gem_obj *mtk_drm_gem_create(struct drm_device *dev, size_t size,
 					   bool alloc_kmap);
+struct mtk_drm_gem_obj *mtk_drm_gem_create_from_heap(struct drm_device *dev,
+				       const char *heap, size_t size);
 int mtk_drm_gem_dumb_create(struct drm_file *file_priv, struct drm_device *dev,
 			    struct drm_mode_create_dumb *args);
 int mtk_drm_gem_dumb_map_offset(struct drm_file *file_priv,
@@ -76,8 +100,6 @@ int mtk_gem_map_offset_ioctl(struct drm_device *dev, void *data,
 /* submit buffer and return fence */
 int mtk_gem_submit_ioctl(struct drm_device *dev, void *data,
 			 struct drm_file *file_priv);
-int mtk_drm_sec_hnd_to_gem_hnd(struct drm_device *dev, void *data,
-		struct drm_file *file_priv);
 
 struct mtk_drm_gem_obj *mtk_drm_fb_gem_insert(struct drm_device *dev,
 					      size_t size, phys_addr_t fb_base,
@@ -86,6 +108,8 @@ void mtk_drm_fb_gem_release(struct drm_device *dev);
 int mtk_drm_ioctl_mml_gem_submit(struct drm_device *dev, void *data,
 			 struct drm_file *file_priv);
 
+void print_mml_frame_buffer(struct mml_frame_buffer frame_buf);
 void print_mml_frame_info(struct mml_frame_info info);
+void print_mml_submit(struct mml_submit *args);
 
 #endif

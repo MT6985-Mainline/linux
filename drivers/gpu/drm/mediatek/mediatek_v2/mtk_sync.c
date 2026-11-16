@@ -21,7 +21,7 @@ static struct dma_fence_ops mtk_sync_timeline_fence_ops;
 
 static inline struct sync_timeline *dma_fence_parent(struct dma_fence *fence)
 {
-	return container_of(fence->extern_lock, struct sync_timeline, lock);
+	return container_of(dma_fence_spinlock(fence), struct sync_timeline, lock);
 }
 
 static LIST_HEAD(sync_timeline_list_head);
@@ -159,13 +159,13 @@ static void mtk_sync_timeline_fence_release(struct dma_fence *fence)
 	unsigned long flags;
 
 	if (pt) {
-		dma_fence_lock_irqsave(fence, flags);
+		spin_lock_irqsave(dma_fence_spinlock(fence), flags);
 		if (!list_empty(&pt->link)) {
 			list_del(&pt->link);
 			rb_erase(&pt->node, &parent->pt_tree);
 
 		}
-		dma_fence_unlock_irqrestore(fence, flags);
+		spin_unlock_irqrestore(dma_fence_spinlock(fence), flags);
 	}
 
 	mtk_sync_timeline_put(parent);
@@ -248,7 +248,7 @@ static void mtk_sync_timeline_signal(struct sync_timeline *obj,
 		 * prevent deadlocking on timeline->lock inside
 		 * timeline_fence_release().
 		 */
-		if (0 != time)
+		if (time != 0)
 			dma_fence_signal_timestamp_locked(&pt->base, time);
 		else
 			dma_fence_signal_locked(&pt->base);
@@ -333,5 +333,29 @@ err:
 	return err;
 }
 EXPORT_SYMBOL_GPL(mtk_sync_fence_create);
+
+int mtk_sync_share_fence_create(struct sync_timeline *obj,
+	struct fence_data *data,
+	struct dma_resv *resv)
+{
+	int err;
+	struct sync_pt *pt;
+
+	pt = mtk_sync_pt_create(obj, data->value);
+	if (!pt) {
+		err = -ENOMEM;
+		return err;
+	}
+
+	err = dma_resv_reserve_fences(resv, 1);
+	if (!err)
+		dma_resv_add_fence(resv, &pt->base, DMA_RESV_USAGE_READ);
+	dma_fence_put(&pt->base);
+	if (unlikely(err))
+		return err;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mtk_sync_share_fence_create);
 
 MODULE_LICENSE("GPL");

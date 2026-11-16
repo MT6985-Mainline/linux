@@ -10,11 +10,6 @@
 #include <linux/platform_device.h>
 #include <linux/soc/mediatek/mtk-cmdq-ext.h>
 
-#ifdef DRM_CMDQ_DISABLE
-/* provided by drivers/misc/mediatek/cmdq/mailbox/cmdq-util.c */
-void cmdq_util_prebuilt_init(const u16 mod);
-#endif
-
 #include "mtk_drm_crtc.h"
 #include "mtk_drm_ddp_comp.h"
 #include "mtk_dump.h"
@@ -58,7 +53,7 @@ static void mtk_mmlsys_bypass_addon_config(struct mtk_ddp_comp *comp,
 				 struct cmdq_pkt *handle)
 {
 	DDPINFO("%s +\n", __func__);
-	cmdq_util_prebuilt_init(CMDQ_PREBUILT_MML);
+	//cmdq_util_prebuilt_init(CMDQ_PREBUILT_MML);
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		comp->regs_pa + MDPSYS_CG_SET0,
 		0x00000000, ~0);
@@ -100,6 +95,10 @@ static void mtk_mmlsys_bypass_addon_config(struct mtk_ddp_comp *comp,
 
 void mtk_mmlsys_bypass_dump(struct mtk_ddp_comp *comp)
 {
+	if (!(comp->regs)) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return;
+	}
 	DDPINFO("%s\n", __func__);
 	DDPDUMP("== DISP %s REGS ==\n", mtk_dump_comp_str(comp));
 	DDPDUMP("MDP_DLI0_SEL_IN 0x%08x: 0x%08x\n",

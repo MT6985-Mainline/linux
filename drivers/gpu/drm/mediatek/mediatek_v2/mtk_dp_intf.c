@@ -27,66 +27,70 @@
 #include "mtk_drm_fb.h"
 #include "mtk_dp.h"
 
-#define DP_EN                             0x0000
-	#define DP_CONTROLLER_EN BIT(0)
-	#define CON_FLD_DP_EN		REG_FLD_MSB_LSB(0, 0)
-#define DP_RST                            0x0004
-	#define CON_FLD_DP_RST			REG_FLD_MSB_LSB(0, 0)
-	#define CON_FLD_DP_RST_SEL		REG_FLD_MSB_LSB(16, 16)
-#define DP_INTEN                          0x0008
-	#define INT_TARGET_LINE_EN BIT(3)
-	#define INT_UNDERFLOW_EN BIT(2)
-	#define INT_VDE_EN BIT(1)
-	#define INT_VSYNC_EN BIT(0)
-#define DP_INTSTA                         0x000C
-	#define INTSTA_TARGET_LINE BIT(3)
-	#define INTSTA_UNDERFLOW BIT(2)
-	#define INTSTA_VDE BIT(1)
-	#define INTSTA_VSYNC BIT(0)
-#define DP_CON                            0x0010
-	#define CON_FLD_DP_BG_EN		REG_FLD_MSB_LSB(0, 0)
-	#define CON_FLD_DP_INTL_EN		REG_FLD_MSB_LSB(2, 2)
-#define DP_OUTPUT_SETTING                 0x0014
-	#define RB_SWAP BIT(0)
-#define DP_SIZE                           0x0018
-#define DP_TGEN_HWIDTH                    0x0020
-#define DP_TGEN_HPORCH                    0x0024
-#define DP_TGEN_VWIDTH                    0x0028
-#define DP_TGEN_VPORCH                    0x002C
-#define DP_BG_HCNTL                       0x0030
-#define DP_BG_VCNTL                       0x0034
-#define DP_BG_COLOR                       0x0038
-#define DP_FIFO_CTL                       0x003C
-#define DP_STATUS                         0x0040
-	#define DP_BUSY BIT(24)
-#define DP_DCM                            0x004C
-#define DP_DUMMY                          0x0050
-#define DP_YUV                            0x0054
-	#define YUV_EN BIT(0)
-	#define YUV422_EN BIT(2)
-#define DP_TGEN_VWIDTH_LEVEN              0x0068
-#define DP_TGEN_VPORCH_LEVEN              0x006C
-#define DP_TGEN_VWIDTH_RODD               0x0070
-#define DP_TGEN_VPORCH_RODD               0x0074
-#define DP_TGEN_VWIDTH_REVEN              0x0078
-#define DP_TGEN_VPORCH_REVEN              0x007C
-#define DP_MUTEX_VSYNC_SETTING            0x00E0
-#define DP_SHEUDO_REG_UPDATE              0x00E4
-#define DP_INTERNAL_DCM_DIS               0x00E8
-#define DP_TARGET_LINE                    0x00F0
-#define DP_CHKSUM_EN                      0x0100
-#define DP_CHKSUM0                        0x0104
-#define DP_CHKSUM1                        0x0108
-#define DP_CHKSUM2                        0x010C
-#define DP_CHKSUM3                        0x0110
-#define DP_CHKSUM4                        0x0114
-#define DP_CHKSUM5                        0x0118
-#define DP_CHKSUM6                        0x011C
-#define DP_CHKSUM7                        0x0120
-#define DP_PATTERN_CTRL0                  0x0F00
-    #define DP_PATTERN_EN                 BIT(0)
-    #define DP_PATTERN_COLOR_BAR          BIT(6)
-#define DP_PATTERN_CTRL1                  0x0F04
+#define DP_EN							0x0000
+	#define DP_CONTROLLER_EN				BIT(0)
+	#define CON_FLD_DP_EN					BIT(0)
+#define DP_RST							0x0004
+	#define CON_FLD_DP_RST_SEL				BIT(16)
+	#define CON_FLD_DP_RST					BIT(0)
+#define DP_INTEN						0x0008
+	#define INT_TARGET_LINE_EN				BIT(3)
+	#define INT_UNDERFLOW_EN				BIT(2)
+	#define INT_VDE_EN						BIT(1)
+	#define INT_VSYNC_EN					BIT(0)
+#define DP_INTSTA						0x000C
+	#define INTSTA_TARGET_LINE				BIT(3)
+	#define INTSTA_UNDERFLOW				BIT(2)
+	#define INTSTA_VDE						BIT(1)
+	#define INTSTA_VSYNC					BIT(0)
+#define DP_CON							0x0010
+	#define CON_FLD_DP_INTL_EN				BIT(2)
+	#define CON_FLD_DP_BG_EN				BIT(0)
+#define DP_OUTPUT_SETTING				0x0014
+	#define RB_SWAP							BIT(0)
+#define DP_SIZE							0x0018
+#define DP_TGEN_HWIDTH					0x0020
+#define DP_TGEN_HPORCH					0x0024
+#define DP_TGEN_VWIDTH					0x0028
+#define DP_TGEN_VPORCH					0x002C
+#define DP_BG_HCNTL						0x0030
+#define DP_BG_VCNTL						0x0034
+#define DP_BG_COLOR						0x0038
+#define DP_FIFO_CTL						0x003C
+#define DP_STATUS						0x0040
+	#define DP_BUSY							BIT(24)
+#define DP_DCM							0x004C
+#define DP_DUMMY						0x0050
+#define DP_YUV							0x0054
+	#define YUV422_EN						BIT(2)
+	#define YUV_EN							BIT(0)
+#define DP_TGEN_VWIDTH_LEVEN			0x0068
+#define DP_TGEN_VPORCH_LEVEN			0x006C
+#define DP_TGEN_VWIDTH_RODD				0x0070
+#define DP_TGEN_VPORCH_RODD				0x0074
+#define DP_TGEN_VWIDTH_REVEN			0x0078
+#define DP_TGEN_VPORCH_REVEN			0x007C
+#define DP_MUTEX_VSYNC_SETTING			0x00E0
+#define DP_SHEUDO_REG_UPDATE			0x00E4
+#define DP_INTERNAL_DCM_DIS				0x00E8
+#define DP_TARGET_LINE					0x00F0
+#define DP_CHKSUM_EN					0x0100
+#define DP_CHKSUM0						0x0104
+#define DP_CHKSUM1						0x0108
+#define DP_CHKSUM2						0x010C
+#define DP_CHKSUM3						0x0110
+#define DP_CHKSUM4						0x0114
+#define DP_CHKSUM5						0x0118
+#define DP_CHKSUM6						0x011C
+#define DP_CHKSUM7						0x0120
+#define DP_BUF_CON0						0x0210
+    #define BUF_BUF_EN						BIT(0)
+#define DP_BUF_CON1						0x0214
+#define DP_BUF_RW_TIMES					0x0220
+#define DP_PATTERN_CTRL0				0x0F00
+	#define DP_PATTERN_COLOR_BAR			BIT(6)
+    #define DP_PATTERN_EN					BIT(0)
+#define DP_PATTERN_CTRL1				0x0F04
 
 static const struct of_device_id mtk_dp_intf_driver_dt_match[];
 /**
@@ -208,6 +212,14 @@ static const struct mtk_dp_intf_resolution_cfg mt6983_resolution_cfg[SINK_MAX] =
 					.clksrc = TVDPLL_D16,
 					.con1 = 0x8216D89D
 				},
+	[SINK_1920_1080_120_RB] = {
+					.clksrc = TVDPLL_D8,
+					.con1 = 0x82160000
+				},
+	[SINK_1920_1080_120] = {
+					.clksrc = TVDPLL_D8,
+					.con1 = 0x8216D89D
+				},
 	[SINK_1080_2460] = {
 					.clksrc = TVDPLL_D16,
 					.con1 = 0x821AC941
@@ -242,6 +254,69 @@ static const struct mtk_dp_intf_resolution_cfg mt6983_resolution_cfg[SINK_MAX] =
 				},
 };
 
+static const struct mtk_dp_intf_resolution_cfg mt6985_resolution_cfg[SINK_MAX] = {
+	[SINK_640_480] = {
+					.clksrc = TVDPLL_D16,
+					.con1 = 0x840F81F8
+				},
+	[SINK_800_600] = {
+					.clksrc = 0,
+					.con1 = 0
+				},
+	[SINK_1280_720] = {
+					.clksrc = TVDPLL_D8,
+					.con1 = 0x8416DFB4
+				},
+	[SINK_1280_960] = {
+					.clksrc = 0,
+					.con1 = 0
+				},
+	[SINK_1280_1024] = {
+					.clksrc = 0,
+					.con1 = 0
+				},
+	[SINK_1920_1080] = {
+					.clksrc = TVDPLL_D16,
+					.con1 = 0x8216D89D
+				},
+	[SINK_1920_1080_120] = {
+					.clksrc = TVDPLL_D8,
+					.con1 = 0x8216D89D
+				},
+	[SINK_1080_2460] = {
+					.clksrc = TVDPLL_D16,
+					.con1 = 0x821AC941
+				},
+	[SINK_1920_1200] = {
+					.clksrc = TVDPLL_D16,
+					.con1 = 0x8217B645
+				},
+	[SINK_1920_1440] = {
+					.clksrc = 0,
+					.con1 = 0
+				},
+	[SINK_2560_1440] = {
+					.clksrc = TVDPLL_D8,
+					.con1 = 0x821293B1
+				},
+	[SINK_2560_1600] = {
+					.clksrc = TVDPLL_D8,
+					.con1 = 0x8214A762
+				},
+	[SINK_3840_2160_30] = {
+					.clksrc = TVDPLL_D8,
+					.con1 = 0x8216D89D
+				},
+	[SINK_3840_2160] = {
+					.clksrc = TVDPLL_D4,
+					.con1 = 0x8216D89D
+				}, //htotal = 1500  //con1 = 0x83109D89; //htotal = 1600
+	[SINK_7680_4320] = {
+					.clksrc = 0,
+					.con1 = 0
+				},
+};
+
 struct mtk_dp_intf_video_clock {
 	char	compatible[128];
 	const struct mtk_dp_intf_resolution_cfg *resolution_cfg;
@@ -259,6 +334,13 @@ static const struct mtk_dp_intf_video_clock mt6895_dp_intf_video_clock = {
 static const struct mtk_dp_intf_video_clock mt6983_dp_intf_video_clock = {
 	.compatible = "mediatek,mt6983-apmixedsys",
 	.resolution_cfg = mt6983_resolution_cfg,
+	.con0_reg = 0x248,
+	.con1_reg = 0x24C
+};
+
+static const struct mtk_dp_intf_video_clock mt6985_dp_intf_video_clock = {
+	.compatible = "mediatek,mt6985-apmixedsys",
+	.resolution_cfg = mt6985_resolution_cfg,
 	.con0_reg = 0x248,
 	.con1_reg = 0x24C
 };
@@ -314,6 +396,7 @@ static int irq_intsa;
 static int irq_vdesa;
 static int irq_underflowsa;
 static int irq_tl;
+static unsigned long long dp_intf_bw;
 static struct mtk_dp_intf *g_dp_intf;
 
 static inline struct mtk_dp_intf *comp_to_dp_intf(struct mtk_ddp_comp *comp)
@@ -357,6 +440,7 @@ static void mtk_dp_intf_start(struct mtk_ddp_comp *comp,
 	irq_vdesa = 0;
 	irq_underflowsa = 0;
 	irq_tl = 0;
+	dp_intf_bw = 0;
 
 	mtk_dp_intf_mask(dp_intf, DP_INTSTA, 0xf, 0);
 	mtk_ddp_write_mask(comp, 1,
@@ -382,7 +466,7 @@ static void mtk_dp_intf_start(struct mtk_ddp_comp *comp,
 		DP_EN, DP_CONTROLLER_EN, handle);
 
 	dp_intf->enable = 1;
-	DDPMSG("%s, dp_intf_start:0x%x!\n",
+	DPTXMSG("%s, dp_intf_start:0x%x!\n",
 		mtk_dump_comp_str(comp), readl(baddr + DP_EN));
 }
 
@@ -395,8 +479,9 @@ static void mtk_dp_intf_stop(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 	irq_vdesa = 0;
 	irq_underflowsa = 0;
 	irq_tl = 0;
+	dp_intf_bw = 0;
 
-	DDPMSG("%s, stop\n", mtk_dump_comp_str(comp));
+	DPTXMSG("%s, stop\n", mtk_dump_comp_str(comp));
 }
 
 static void mtk_dp_intf_prepare(struct mtk_ddp_comp *comp)
@@ -404,7 +489,7 @@ static void mtk_dp_intf_prepare(struct mtk_ddp_comp *comp)
 	struct mtk_dp_intf *dp_intf = NULL;
 	int ret;
 
-	DDPFUNC();
+	DPTXFUNC();
 	mtk_dp_poweron();
 
 	dp_intf = comp_to_dp_intf(comp);
@@ -413,26 +498,26 @@ static void mtk_dp_intf_prepare(struct mtk_ddp_comp *comp)
 	if (dp_intf != NULL) {
 		ret = clk_prepare_enable(dp_intf->hf_fmm_ck);
 		if (ret < 0)
-			DDPPR_ERR("%s Failed to enable hf_fmm_ck clock: %d\n",
+			DPTXERR("%s Failed to enable hf_fmm_ck clock: %d\n",
 				__func__, ret);
 		ret = clk_prepare_enable(dp_intf->hf_fdp_ck);
 		if (ret < 0)
-			DDPPR_ERR("%s Failed to enable hf_fdp_ck clock: %d\n",
+			DPTXERR("%s Failed to enable hf_fdp_ck clock: %d\n",
 				__func__, ret);
 		//ret = clk_prepare_enable(dp_intf->pclk);
 		if (ret < 0)
-			DDPPR_ERR("%s Failed to enable pclk clock: %d\n",
+			DPTXERR("%s Failed to enable pclk clock: %d\n",
 				__func__, ret);
-		DDPMSG("%s:succesed enable dp_intf clock\n", __func__);
+		DPTXMSG("%s:succesed enable dp_intf clock\n", __func__);
 	} else
-		DDPPR_ERR("Failed to enable dp_intf clock\n");
+		DPTXERR("Failed to enable dp_intf clock\n");
 }
 
 static void mtk_dp_intf_unprepare(struct mtk_ddp_comp *comp)
 {
 	struct mtk_dp_intf *dp_intf = NULL;
 
-	DDPFUNC();
+	DPTXFUNC();
 	mtk_dp_poweroff();
 
 	dp_intf = comp_to_dp_intf(comp);
@@ -442,9 +527,9 @@ static void mtk_dp_intf_unprepare(struct mtk_ddp_comp *comp)
 		clk_disable_unprepare(dp_intf->hf_fmm_ck);
 		clk_disable_unprepare(dp_intf->hf_fdp_ck);
 		clk_disable_unprepare(dp_intf->pclk);
-		DDPMSG("%s:succesed disable dp_intf clock\n", __func__);
+		DPTXMSG("%s:succesed disable dp_intf clock\n", __func__);
 	} else
-		DDPPR_ERR("Failed to disable dp_intf clock\n");
+		DPTXERR("Failed to disable dp_intf clock\n");
 }
 
 void mtk_dp_inf_video_clock(struct mtk_dp_intf *dp_intf)
@@ -455,18 +540,21 @@ void mtk_dp_inf_video_clock(struct mtk_dp_intf *dp_intf)
 	unsigned int con1_reg;
 	int ret = 0;
 	struct device_node *node;
-	if (dp_intf == NULL)
-		DDPPR_ERR("%s:input error\n", __func__);
+
+	if (dp_intf == NULL) {
+		DPTXERR("%s:input error\n", __func__);
+		return;
+	}
 
 	if (dp_intf->res >= SINK_MAX || dp_intf->res < 0) {
-		DDPPR_ERR("%s:input res error: %d\n", __func__, dp_intf->res);
+		DPTXERR("%s:input res error: %d\n", __func__, dp_intf->res);
 		dp_intf->res = SINK_1920_1080;
 	}
 
 	if (mtk_de_get_clk_debug()) {
 		clksrc = mtk_de_get_clksrc();
 		con1 = mtk_de_get_con1();
-		DDPMSG("%s:clksrc change: %x, con1 change: %x", __func__,
+		DPTXMSG("%s:clksrc change: %x, con1 change: %x", __func__,
 			dp_intf->driver_data->video_clock_cfg->resolution_cfg[dp_intf->res].clksrc,
 			dp_intf->driver_data->video_clock_cfg->resolution_cfg[dp_intf->res].con1);
 	} else {
@@ -476,22 +564,24 @@ void mtk_dp_inf_video_clock(struct mtk_dp_intf *dp_intf)
 	con0_reg = dp_intf->driver_data->video_clock_cfg->con0_reg;
 	con1_reg = dp_intf->driver_data->video_clock_cfg->con1_reg;
 
-	DDPMSG("%s:clksrc %x\ncon1 %x\ncon0_reg %x\ncon1_reg %x\ncompatible %s",
+	DPTXMSG("%s:clksrc %x,con1 %x,con0_reg %x,con1_reg %x,compatible %s",
 		__func__, clksrc, con1, con0_reg, con1_reg,
 		dp_intf->driver_data->video_clock_cfg->compatible);
 	if (clk_apmixed_base == NULL) {
 		node = of_find_compatible_node(NULL, NULL,
 			dp_intf->driver_data->video_clock_cfg->compatible);
-		if (!node)
-			DDPPR_ERR("dp_intf [CLK_APMIXED] find node failed\n");
-			clk_apmixed_base = of_iomap(node, 0);
+		if (!node) {
+			DPTXERR("dp_intf [CLK_APMIXED] find node failed\n");
+			return;
+		}
+		clk_apmixed_base = of_iomap(node, 0);
 		if (clk_apmixed_base == NULL) {
-			DDPPR_ERR("dp_intf [CLK_APMIXED] io map failed\n");
+			DPTXERR("dp_intf [CLK_APMIXED] io map failed\n");
 			return;
 		}
 	}
 
-	DDPMSG("clk_apmixed_base clk_apmixed_base 0x%lx!!!,res %d\n",
+	DPTXMSG("clk_apmixed_base clk_apmixed_base 0x%lx!!!,res %d\n",
 		clk_apmixed_base, dp_intf->res);
 	ret = clk_prepare_enable(dp_intf->pclk);
 	ret = clk_set_parent(dp_intf->pclk, dp_intf->pclk_src[clksrc]);
@@ -502,7 +592,7 @@ void mtk_dp_inf_video_clock(struct mtk_dp_intf *dp_intf)
 	DISP_REG_SET_FIELD(NULL, REG_FLD_MSB_LSB(0, 0),
 			clk_apmixed_base + con0_reg, 1);
 
-	DDPMSG("%s set pclk2 and src %d\n", __func__, clksrc);
+	DPTXMSG("%s set pclk2 and src %d\n", __func__, clksrc);
 
 }
 
@@ -528,9 +618,10 @@ static void mtk_dp_intf_config(struct mtk_ddp_comp *comp,
 	unsigned int vfp = 0, vbp = 0;
 	unsigned int bg_left = 0, bg_right = 0;
 	unsigned int bg_top = 0, bg_bot = 0;
+	unsigned int rw_times = 0;
 
-	DDPMSG("%s w %d, h, %d, fps %d!\n",
-			__func__, cfg->w, cfg->h, cfg->vrefresh);
+	DPTXMSG("%s w %d, h, %d, clock %d, fps %d!\n",
+			__func__, cfg->w, cfg->h, cfg->clock, cfg->vrefresh);
 
 	hsize = cfg->w;
 	vsize = cfg->h;
@@ -560,6 +651,25 @@ static void mtk_dp_intf_config(struct mtk_ddp_comp *comp,
 		vpw = 5;
 		vfp = 4;
 		vbp = 36;
+	} else if ((cfg->w == 1920) && (cfg->h == 1080)
+		   && (cfg->vrefresh == 120)) {
+		if (cfg->clock == 285500) {
+			dp_intf->res = SINK_1920_1080_120_RB;
+			hpw = 8;
+			hfp = 12;
+			hbp = 20;
+			vpw = 5;
+			vfp = 3;
+			vbp = 56;
+		} else {
+			dp_intf->res = SINK_1920_1080_120;
+			hpw = 11;
+			hfp = 22;
+			hbp = 37;
+			vpw = 5;
+			vfp = 4;
+			vbp = 36;
+		}
 	} else if ((cfg->w == 1080) && (cfg->h == 2460)
 			  && (cfg->vrefresh == 60)) {
 		dp_intf->res = SINK_1080_2460;
@@ -608,18 +718,14 @@ static void mtk_dp_intf_config(struct mtk_ddp_comp *comp,
 	} else if ((cfg->w == 3840) && (cfg->h == 2160)
 		   && (cfg->vrefresh == 60)) {
 		dp_intf->res = SINK_3840_2160;
-		hpw = 10; //22;
-		hfp = 25; //134;
-		hbp = 20; //74;
+		hpw = 22;
+		hfp = 44;
+		hbp = 74;
 		vpw = 10;
 		vfp = 8;
 		vbp = 72;
-		hsize /= 3;/* with dsc on*/
-		mtk_ddp_write_mask(comp, RB_SWAP,
-			DP_OUTPUT_SETTING, RB_SWAP, handle);
-
 	} else
-		DDPPR_ERR("%s error, w %d, h, %d, fps %d!\n",
+		DPTXERR("%s error, w %d, h, %d, fps %d!\n",
 			__func__, cfg->w, cfg->h, cfg->vrefresh);
 
 
@@ -655,7 +761,18 @@ static void mtk_dp_intf_config(struct mtk_ddp_comp *comp,
 			DISP_REG_DSC_SLICE_W, handle);
 	mtk_ddp_write(comp, 0x20000c03, DISP_REG_DSC_PPS6, handle);
 #endif
-	DDPMSG("%s config done\n",
+
+	if (hsize & 0x3)
+		rw_times = ((hsize >> 2) + 1) * vsize;
+	else
+		rw_times = (hsize >> 2) * vsize;
+
+	mtk_ddp_write_relaxed(comp, rw_times,
+			DP_BUF_RW_TIMES, handle);
+	mtk_ddp_write_mask(comp, BUF_BUF_EN,
+			DP_BUF_CON0, BUF_BUF_EN, handle);
+
+	DPTXMSG("%s config done\n",
 			mtk_dump_comp_str(comp));
 
 	dp_intf->enable = true;
@@ -663,7 +780,14 @@ static void mtk_dp_intf_config(struct mtk_ddp_comp *comp,
 
 int mtk_dp_intf_dump(struct mtk_ddp_comp *comp)
 {
-	void __iomem *baddr = comp->regs;
+	void __iomem *baddr = NULL;
+
+	if (IS_ERR_OR_NULL(comp) || IS_ERR_OR_NULL(comp->regs)) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return 0;
+	}
+
+	baddr = comp->regs;
 
 	DDPDUMP("== %s REGS ==\n", mtk_dump_comp_str(comp));
 	DDPDUMP("(0x0000) DP_EN                 =0x%x\n",
@@ -740,6 +864,12 @@ int mtk_dp_intf_dump(struct mtk_ddp_comp *comp)
 			readl(baddr + DP_CHKSUM6));
 	DDPDUMP("(0x0120) DP_CHKSUM7            =0x%x\n",
 			readl(baddr + DP_CHKSUM7));
+	DDPDUMP("(0x0210) DP_BUF_CON0      =0x%x\n",
+			readl(baddr + DP_BUF_CON0));
+	DDPDUMP("(0x0214) DP_BUF_CON1      =0x%x\n",
+			readl(baddr + DP_BUF_CON1));
+	DDPDUMP("(0x0220) DP_BUF_RW_TIMES      =0x%x\n",
+			readl(baddr + DP_BUF_RW_TIMES));
 	DDPDUMP("(0x0F00) DP_PATTERN_CTRL0      =0x%x\n",
 			readl(baddr + DP_PATTERN_CTRL0));
 	DDPDUMP("(0x0F04) DP_PATTERN_CTRL1      =0x%x\n",
@@ -752,19 +882,110 @@ int mtk_dp_intf_analysis(struct mtk_ddp_comp *comp)
 {
 	void __iomem *baddr = comp->regs;
 
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return 0;
+	}
+
 	DDPDUMP("== %s ANALYSIS ==\n", mtk_dump_comp_str(comp));
 	DDPDUMP("en=%d, rst_sel=%d, rst=%d, bg_en=%d, intl_en=%d\n",
-		 DISP_REG_GET_FIELD(CON_FLD_DP_EN,
-				baddr + DP_EN),
-		 DISP_REG_GET_FIELD(CON_FLD_DP_RST_SEL,
-				baddr + DP_RST),
-		 DISP_REG_GET_FIELD(CON_FLD_DP_RST,
-				baddr + DP_RST),
-		 DISP_REG_GET_FIELD(CON_FLD_DP_BG_EN,
-				baddr + DP_CON),
-		 DISP_REG_GET_FIELD(CON_FLD_DP_INTL_EN,
-				baddr + DP_CON));
+	DISP_REG_GET_FIELD(CON_FLD_DP_EN, baddr + DP_EN),
+	DISP_REG_GET_FIELD(CON_FLD_DP_RST_SEL, baddr + DP_RST),
+	DISP_REG_GET_FIELD(CON_FLD_DP_RST, baddr + DP_RST),
+	DISP_REG_GET_FIELD(CON_FLD_DP_BG_EN, baddr + DP_CON),
+	DISP_REG_GET_FIELD(CON_FLD_DP_INTL_EN, baddr + DP_CON));
 	DDPDUMP("== End %s ANALYSIS ==\n", mtk_dump_comp_str(comp));
+
+	return 0;
+}
+
+unsigned long long mtk_dpintf_get_frame_hrt_bw_base(
+		struct mtk_drm_crtc *mtk_crtc, struct mtk_dp_intf *dp_intf)
+{
+	unsigned long long bw_base;
+	int hact;
+	int vtotal;
+	int vact;
+	int vrefresh;
+	u32 bpp = 3;
+
+	/* for the case dpintf not initialize yet, return 1 avoid treat as error */
+	if (!(mtk_crtc && mtk_crtc->base.state))
+		return 1;
+
+	hact = mtk_crtc->base.state->adjusted_mode.hdisplay;
+	vtotal = mtk_crtc->base.state->adjusted_mode.vtotal;
+	vact = mtk_crtc->base.state->adjusted_mode.vdisplay;
+	vrefresh = drm_mode_vrefresh(&mtk_crtc->base.state->adjusted_mode);
+	bw_base = (unsigned long long)vact * hact * vrefresh * 4 / 1000;
+	bw_base = bw_base * vtotal / vact;
+	bw_base = bw_base / 1000;
+
+	if (dp_intf_bw != bw_base) {
+		dp_intf_bw = bw_base;
+		DDPDBG("%s Frame Bw:%llu, bpp:%d\n", __func__, bw_base, bpp);
+		DPTXMSG("%s Frame Bw:%llu, bpp:%d\n", __func__, bw_base, bpp);
+	}
+	return bw_base;
+}
+
+static unsigned long long mtk_dpintf_get_frame_hrt_bw_base_by_mode(
+		struct mtk_drm_crtc *mtk_crtc, struct mtk_dp_intf *dp_intf)
+{
+	unsigned long long base_bw;
+	unsigned int hact;
+	unsigned int vtotal;
+	unsigned int vact;
+	unsigned int vrefresh;
+	u32 bpp = 3;
+
+	/* for the case dpintf not initialize yet, return 1 avoid treat as error */
+	if (!(mtk_crtc && mtk_crtc->avail_modes))
+		return 1;
+
+	hact = mtk_crtc->avail_modes->hdisplay;
+	vtotal = mtk_crtc->avail_modes->vtotal;
+	vact = mtk_crtc->avail_modes->vdisplay;
+	vrefresh = drm_mode_vrefresh(mtk_crtc->avail_modes);
+	base_bw = (unsigned long long)vact * hact * vrefresh * 4 / 1000;
+	base_bw = base_bw * vtotal / vact;
+	base_bw = base_bw / 1000;
+	if (dp_intf_bw != base_bw) {
+		dp_intf_bw = base_bw;
+		DDPDBG("%s Frame Bw:%llu, bpp:%d\n", __func__, base_bw, bpp);
+		DPTXMSG("%s Frame Bw:%llu, bpp:%d\n", __func__, base_bw, bpp);
+	}
+
+	return base_bw;
+}
+
+static int mtk_dpintf_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
+			  enum mtk_ddp_io_cmd cmd, void *params)
+{
+	struct mtk_dp_intf *dp_intf = comp_to_dp_intf(comp);
+
+	switch (cmd) {
+	case GET_FRAME_HRT_BW_BY_DATARATE:
+	{
+		struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+		unsigned long long *base_bw =
+			(unsigned long long *)params;
+
+		*base_bw = mtk_dpintf_get_frame_hrt_bw_base(mtk_crtc, dp_intf);
+	}
+		break;
+	case GET_FRAME_HRT_BW_BY_MODE:
+	{
+		struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+		unsigned long long *base_bw =
+			(unsigned long long *)params;
+
+		*base_bw = mtk_dpintf_get_frame_hrt_bw_base_by_mode(mtk_crtc, dp_intf);
+	}
+		break;
+	default:
+		break;
+	}
 
 	return 0;
 }
@@ -775,6 +996,7 @@ static const struct mtk_ddp_comp_funcs mtk_dp_intf_funcs = {
 	.stop = mtk_dp_intf_stop,
 	.prepare = mtk_dp_intf_prepare,
 	.unprepare = mtk_dp_intf_unprepare,
+	.io_cmd = mtk_dpintf_io_cmd,
 };
 
 static int mtk_dp_intf_bind(struct device *dev, struct device *master,
@@ -784,7 +1006,7 @@ static int mtk_dp_intf_bind(struct device *dev, struct device *master,
 	struct drm_device *drm_dev = data;
 	int ret;
 
-	DDPINFO("%s\n", __func__);
+	DPTXMSG("%s+\n", __func__);
 	ret = mtk_ddp_comp_register(drm_dev, &dp_intf->ddp_comp);
 	if (ret < 0) {
 		dev_err(dev, "Failed to register component %s: %d\n",
@@ -792,7 +1014,7 @@ static int mtk_dp_intf_bind(struct device *dev, struct device *master,
 		return ret;
 	}
 
-	DDPINFO("%s-\n", __func__);
+	DPTXMSG("%s-\n", __func__);
 	return 0;
 }
 
@@ -821,15 +1043,19 @@ static int mtk_dp_intf_probe(struct platform_device *pdev)
 	int ret;
 	struct device_node *node;
 
-	DDPMSG("%s+\n", __func__);
+	DPTXMSG("%s+\n", __func__);
 	dp_intf = devm_kzalloc(dev, sizeof(*dp_intf), GFP_KERNEL);
 	if (!dp_intf)
 		return -ENOMEM;
 	dp_intf->dev = dev;
 
 	of_id = of_match_device(mtk_dp_intf_driver_dt_match, &pdev->dev);
+	if (!of_id) {
+		dev_err(dev, "DP_intf device match failed\n");
+		return -ENODEV;
+	}
 	dp_intf->driver_data = (struct mtk_dp_intf_driver_data *)of_id->data;
-	DDPMSG("%s:%d\n", __func__, __LINE__);
+	DPTXMSG("%s:%d\n", __func__, __LINE__);
 
 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	dp_intf->regs = devm_ioremap_resource(dev, mem);
@@ -867,12 +1093,12 @@ static int mtk_dp_intf_probe(struct platform_device *pdev)
 		node = of_find_compatible_node(NULL, NULL,
 			dp_intf->driver_data->video_clock_cfg->compatible);
 		if (!node)
-			DDPPR_ERR("[CLK_APMIXED] find node failed\n");
+			DPTXERR("[CLK_APMIXED] find node failed\n");
 		clk_apmixed_base = of_iomap(node, 0);
 		if (clk_apmixed_base == NULL)
-			DDPPR_ERR("[CLK_APMIXED] io map failed\n");
+			DPTXERR("[CLK_APMIXED] io map failed\n");
 
-		DDPPR_ERR("clk_apmixed_base clk_apmixed_base 0x%lx!!!\n",
+		DPTXERR("clk_apmixed_base clk_apmixed_base 0x%lx!!!\n",
 			clk_apmixed_base);
 	}
 
@@ -889,7 +1115,7 @@ static int mtk_dp_intf_probe(struct platform_device *pdev)
 		return comp_id;
 	}
 
-	DDPMSG("%s:%d\n", __func__, __LINE__);
+	DPTXMSG("%s:%d\n", __func__, __LINE__);
 	ret = mtk_ddp_comp_init(dev, dev->of_node, &dp_intf->ddp_comp, comp_id,
 				&mtk_dp_intf_funcs);
 	if (ret) {
@@ -897,7 +1123,7 @@ static int mtk_dp_intf_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	DDPMSG("%s:%d\n", __func__, __LINE__);
+	DPTXMSG("%s:%d\n", __func__, __LINE__);
 	/* Get dp intf irq num and request irq */
 	dp_intf->irq = platform_get_irq(pdev, 0);
 	dp_intf->res = SINK_MAX;
@@ -916,7 +1142,7 @@ static int mtk_dp_intf_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	DDPMSG("%s:%d\n", __func__, __LINE__);
+	DPTXMSG("%s:%d\n", __func__, __LINE__);
 
 	platform_set_drvdata(pdev, dp_intf);
 	pm_runtime_enable(dev);
@@ -928,7 +1154,7 @@ static int mtk_dp_intf_probe(struct platform_device *pdev)
 	}
 
 	g_dp_intf = dp_intf;
-	DDPMSG("%s-\n", __func__);
+	DPTXMSG("%s-\n", __func__);
 	return ret;
 }
 
@@ -963,7 +1189,6 @@ static irqreturn_t mtk_dp_intf_irq_status(int irq, void *dev_id)
 			mtk_crtc = dp_intf->ddp_comp.mtk_crtc;
 			mtk_crtc_vblank_irq(&mtk_crtc->base);
 			irq_intsa++;
-
 		}
 
 		if (status & INTSTA_VDE)
@@ -977,14 +1202,14 @@ static irqreturn_t mtk_dp_intf_irq_status(int irq, void *dev_id)
 	}
 
 	if (irq_intsa == 3)
-		mtk_dp_video_trigger(video_unmute<<16 | dp_intf->res);
+		mtk_dp_video_trigger(video_unmute << 16 | dp_intf->res);
 
-	if (((irq_intsa+1)%200 == 0)
-		|| ((irq_vdesa+1)%200 == 0)
-		|| ((irq_underflowsa+1)%200 == 0)
-		|| ((irq_tl+1)%200 == 0))
-		DDPMSG("dp_intf irq %d - %d - %d - %d! 0x%x\n", irq_intsa,
-				irq_vdesa, irq_underflowsa, irq_tl, status);
+	if (((irq_intsa + 1) % 200 == 0)
+		|| ((irq_vdesa + 1) % 200 == 0)
+		|| ((irq_underflowsa + 1) % 200 == 0)
+		|| ((irq_tl + 1) % 200 == 0))
+		DPTXDBG("%s, status:0x%x, vsync:%d, vde:%d, underflow:%d, target_line:%d\n",
+				__func__, status, irq_intsa, irq_vdesa, irq_underflowsa, irq_tl);
 
 	return IRQ_HANDLED;
 }
@@ -996,6 +1221,7 @@ static const struct mtk_dp_intf_driver_data mt6885_dp_intf_driver_data = {
 	.irq_handler = mtk_dp_intf_irq_status,
 	.video_clock_cfg = &mt6983_dp_intf_video_clock,
 };
+
 static const struct mtk_dp_intf_driver_data mt6895_dp_intf_driver_data = {
 	.reg_cmdq_ofs = 0x200,
 	.poll_for_idle = mtk_dp_intf_poll_for_idle,
@@ -1003,11 +1229,20 @@ static const struct mtk_dp_intf_driver_data mt6895_dp_intf_driver_data = {
 	.video_clock_cfg = &mt6895_dp_intf_video_clock,
 };
 
+static const struct mtk_dp_intf_driver_data mt6985_dp_intf_driver_data = {
+	.reg_cmdq_ofs = 0x200,
+	.poll_for_idle = mtk_dp_intf_poll_for_idle,
+	.irq_handler = mtk_dp_intf_irq_status,
+	.video_clock_cfg = &mt6985_dp_intf_video_clock,
+};
+
 static const struct of_device_id mtk_dp_intf_driver_dt_match[] = {
 	{ .compatible = "mediatek,mt6885-dp-intf",
 	.data = &mt6885_dp_intf_driver_data},
 	{ .compatible = "mediatek,mt6895-dp-intf",
 	.data = &mt6895_dp_intf_driver_data},
+	{ .compatible = "mediatek,mt6985-dp-intf",
+	.data = &mt6985_dp_intf_driver_data},
 	{},
 };
 MODULE_DEVICE_TABLE(of, mtk_dp_intf_driver_dt_match);

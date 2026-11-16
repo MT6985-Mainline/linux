@@ -4,13 +4,12 @@
  */
 
 #include <drm/drm_crtc_helper.h>
+#include <drm/drm_atomic_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_gem.h>
-#include <drm/drm_framebuffer.h>
+#include <drm/drm_damage_helper.h>
 #include <drm/drm_modeset_helper.h>
-#include <drm/drm_fourcc.h>
 #include <linux/dma-buf.h>
-#include <linux/dma-resv.h>
 
 #include "mtk_drm_drv.h"
 #include "mtk_drm_fb.h"
@@ -104,6 +103,7 @@ static void mtk_drm_fb_destroy(struct drm_framebuffer *fb)
 
 static const struct drm_framebuffer_funcs mtk_drm_fb_funcs = {
 	.create_handle = mtk_drm_fb_create_handle,
+	.dirty = drm_atomic_helper_dirtyfb,
 	.destroy = mtk_drm_fb_destroy,
 };
 
@@ -119,10 +119,10 @@ mtk_drm_framebuffer_init(struct drm_device *dev,
 	if (!mtk_fb)
 		return ERR_PTR(-ENOMEM);
 
-	drm_helper_mode_fill_fb_struct(dev, &mtk_fb->base,
-				   drm_format_info(mode->pixel_format), mode);
+	drm_helper_mode_fill_fb_struct(dev, &mtk_fb->base, drm_get_format_info(dev, mode->pixel_format, mode->modifier[0]), mode);
 
 	mtk_fb->gem_obj = obj;
+	/* Both aliases share the framebuffer's single owned GEM reference. */
 	mtk_fb->base.obj[0] = obj;
 
 	ret = drm_framebuffer_init(dev, &mtk_fb->base, &mtk_drm_fb_funcs);
@@ -158,7 +158,7 @@ int mtk_fb_wait(struct drm_framebuffer *fb)
 {
 	struct drm_gem_object *gem;
 	struct dma_resv *resv;
-	long ret;
+	//long ret;
 
 	if (!fb)
 		return 0;
@@ -168,22 +168,27 @@ int mtk_fb_wait(struct drm_framebuffer *fb)
 		return 0;
 
 	resv = gem->dma_buf->resv;
-	ret = dma_resv_wait_timeout(resv, DMA_RESV_USAGE_WRITE, true,
-				      MAX_SCHEDULE_TIMEOUT);
+	/* display wait for sync(DWFS), /kernel-5.15/drivers/dma-buf/dma-resv.c */
+	/*
+	ret = dma_resv_wait_timeout_rcu(resv, false, true,
+					MAX_SCHEDULE_TIMEOUT);
+	*/
+
 	/* MAX_SCHEDULE_TIMEOUT on success, -ERESTARTSYS if interrupted */
+	/*
 	if (ret < 0) {
 		DDPAEE("%s:%d, invalid ret:%ld\n",
 			__func__, __LINE__,
 			ret);
 		return ret;
 	}
-
+	*/
 	return 0;
 }
 
 struct drm_framebuffer *
 mtk_drm_mode_fb_create(struct drm_device *dev, struct drm_file *file,
-		      const struct drm_format_info *info,
+		       const struct drm_format_info *info,
 		       const struct drm_mode_fb_cmd2 *cmd)
 {
 	struct mtk_drm_fb *mtk_fb = NULL;
@@ -207,7 +212,9 @@ mtk_drm_mode_fb_create(struct drm_device *dev, struct drm_file *file,
 
 	mtk_gem = to_mtk_gem_obj(gem);
 
-	if (cmd->modifier[0] & MTK_FMT_SECURE)
+	if (disp_sec_cb.cb != NULL)
+		DDPINFO("mtk_gem->sec %d", mtk_gem->sec);
+	else if (cmd->modifier[0] & MTK_FMT_SECURE)
 		mtk_gem->sec = true;
 
 	//TO-DO: should need remove "!mtk_gem->sec"

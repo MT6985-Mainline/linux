@@ -274,7 +274,7 @@ enum MFC_STATUS MFC_Open(MFC_HANDLE *handle, void *fb_addr,
 	ctxt->font_width = MFC_FONT_WIDTH;
 	ctxt->font_height = MFC_FONT_HEIGHT;
 	ctxt->filp = filp;
-
+	ctxt->buffer_size = fb_width * fb_height * fb_bpp;
 	*handle = ctxt;
 
 	return MFC_STATUS_OK;
@@ -511,7 +511,6 @@ void screen_logger_add_message(char *obj, enum message_mode mode, char *message)
 	struct screen_logger *p = NULL;
 	int add_new = 1;
 	char *new = NULL, *old = NULL;
-	unsigned int len = 0;
 
 	screen_logger_init();
 	list_for_each_entry(p, &logger_head.list, list) {
@@ -526,13 +525,9 @@ void screen_logger_add_message(char *obj, enum message_mode mode, char *message)
 			kfree(old);
 			break;
 		case MESSAGE_APPEND:
-			len = strlen(p->message) + strlen(message);
-			new = kmalloc(sizeof(char) * (len + 1), GFP_KERNEL);
-			memcpy(new, p->message, strlen(p->message) + 1);
-			if (strlen(message) + strlen(p->message) < len)
-				strncat(new, message, strlen(message));
-			else
-				strncat(new, message, len - strlen(p->message));
+			new = kasprintf(GFP_KERNEL, "%s%s", p->message, message);
+			if (!new)
+				return;
 			old = p->message;
 			p->message = new;
 			kfree(old);

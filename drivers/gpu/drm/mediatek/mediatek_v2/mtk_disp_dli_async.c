@@ -16,6 +16,8 @@
 #include "mtk_rect.h"
 #include "mtk_drm_drv.h"
 
+#define DISP_REG_OVL_DL_IN_RELAY0_SIZE 0x260
+
 /**
  * struct mtk_disp_dli_async - DISP_RSZ driver structure
  * @ddp_comp - structure containing type enum and hardware resources
@@ -35,16 +37,33 @@ static void mtk_dli_async_addon_config(struct mtk_ddp_comp *comp,
 				 union mtk_addon_config *addon_config,
 				 struct cmdq_pkt *handle)
 {
-	DDPINFO("%s\n", __func__);
+	DDPDBG("%s+\n", __func__);
+
+	if (!addon_config)
+		return;
+
+	if ((addon_config->config_type.module == DISP_MML_IR_PQ_v2) ||
+	    (addon_config->config_type.module == DISP_MML_IR_PQ_v2_1)) {
+		u8 pipe = addon_config->addon_mml_config.pipe;
+
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			       comp->regs_pa + DISP_REG_OVL_DL_IN_RELAY0_SIZE,
+			       (addon_config->addon_mml_config.mml_dst_roi[pipe].width |
+				addon_config->addon_mml_config.mml_dst_roi[pipe].height << 16),
+			       ~0);
+	}
 }
 
 void mtk_dli_async_dump(struct mtk_ddp_comp *comp)
 {
-	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
-	void __iomem *baddr = mtk_crtc->config_regs;
+	void __iomem *baddr = comp->regs;
 
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return;
+	}
 	DDPINFO("%s\n", __func__);
-	DDPDUMP("== DISP %s REGS:0x%x ==\n", mtk_dump_comp_str(comp), mtk_crtc->config_regs_pa);
+	DDPDUMP("== DISP %s REGS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
 	DDPDUMP("0x26C: 0x%08x\n", readl(baddr + 0x26C));
 	DDPDUMP("0x2C8: 0x%08x 0x%08x\n", readl(baddr + 0x2C8),
 		readl(baddr + 0x2CC));
@@ -58,13 +77,13 @@ int mtk_dli_async_analysis(struct mtk_ddp_comp *comp)
 
 static void mtk_dli_async_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 {
-	DDPINFO("%s\n", __func__);
+	DDPDBG("%s+\n", __func__);
 	// nothig to do
 }
 
 static void mtk_dli_async_stop(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 {
-	DDPINFO("%s\n", __func__);
+	DDPDBG("%s+\n", __func__);
 	// nothig to do
 }
 
@@ -180,6 +199,8 @@ static void mtk_disp_dli_async_remove(struct platform_device *pdev)
 static const struct of_device_id mtk_disp_dli_async_driver_dt_match[] = {
 	{.compatible = "mediatek,mt6983-disp-dli-async3",},
 	{.compatible = "mediatek,mt6895-disp-dli-async3",},
+	{.compatible = "mediatek,mt6985-disp-dli-async",},
+	{.compatible = "mediatek,mt6886-disp-dli-async3",},
 	{},
 };
 MODULE_DEVICE_TABLE(of, mtk_disp_dli_async_driver_dt_match);

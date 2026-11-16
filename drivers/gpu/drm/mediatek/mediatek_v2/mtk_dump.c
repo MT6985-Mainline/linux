@@ -38,6 +38,10 @@ int mtk_dump_reg(struct mtk_ddp_comp *comp)
 	case DDP_COMPONENT_OVL1_2L:
 	case DDP_COMPONENT_OVL2_2L:
 	case DDP_COMPONENT_OVL3_2L:
+	case DDP_COMPONENT_OVL4_2L:
+	case DDP_COMPONENT_OVL5_2L:
+	case DDP_COMPONENT_OVL6_2L:
+	case DDP_COMPONENT_OVL7_2L:
 	case DDP_COMPONENT_OVL0_2L_NWCG:
 	case DDP_COMPONENT_OVL1_2L_NWCG:
 	case DDP_COMPONENT_OVL2_2L_NWCG:
@@ -52,23 +56,43 @@ int mtk_dump_reg(struct mtk_ddp_comp *comp)
 	case DDP_COMPONENT_RDMA5:
 		mtk_rdma_dump(comp);
 		break;
+	case DDP_COMPONENT_MDP_RDMA0:
+	case DDP_COMPONENT_MDP_RDMA1:
+		mtk_mdp_rdma_dump(comp);
+		break;
 	case DDP_COMPONENT_WDMA0:
 	case DDP_COMPONENT_WDMA1:
 	case DDP_COMPONENT_WDMA2:
 	case DDP_COMPONENT_WDMA3:
+	case DDP_COMPONENT_OVLSYS_WDMA0:
+	case DDP_COMPONENT_OVLSYS_WDMA1:
+	case DDP_COMPONENT_OVLSYS_WDMA2:
+	case DDP_COMPONENT_OVLSYS_WDMA3:
 		mtk_wdma_dump(comp);
 		break;
 	case DDP_COMPONENT_RSZ0:
 	case DDP_COMPONENT_RSZ1:
+	case DDP_COMPONENT_RSZ2:
+	case DDP_COMPONENT_OVLSYS_RSZ1:
+	case DDP_COMPONENT_OVLSYS_RSZ2:
 		mtk_rsz_dump(comp);
+		break;
+	case DDP_COMPONENT_MDP_RSZ0:
+	case DDP_COMPONENT_MDP_RSZ1:
+		mtk_mdp_rsz_dump(comp);
 		break;
 	case DDP_COMPONENT_DSI0:
 	case DDP_COMPONENT_DSI1:
 		mtk_dsi_dump(comp);
 		break;
+	case DDP_COMPONENT_DP_INTF0:
+		mtk_dp_intf_dump(comp);
+		break;
 
 	case DDP_COMPONENT_TDSHP0:
 	case DDP_COMPONENT_TDSHP1:
+	case DDP_COMPONENT_TDSHP2:
+	case DDP_COMPONENT_TDSHP3:
 		mtk_disp_tdshp_dump(comp);
 		break;
 
@@ -79,6 +103,8 @@ int mtk_dump_reg(struct mtk_ddp_comp *comp)
 		break;
 	case DDP_COMPONENT_CCORR0:
 	case DDP_COMPONENT_CCORR1:
+	case DDP_COMPONENT_CCORR2:
+	case DDP_COMPONENT_CCORR3:
 		mtk_ccorr_dump(comp);
 		break;
 	case DDP_COMPONENT_C3D0:
@@ -90,10 +116,13 @@ int mtk_dump_reg(struct mtk_ddp_comp *comp)
 		mtk_aal_dump(comp);
 		break;
 	case DDP_COMPONENT_DMDP_AAL0:
+	case DDP_COMPONENT_DMDP_AAL1:
 		mtk_dmdp_aal_dump(comp);
 		break;
 	case DDP_COMPONENT_DITHER0:
 	case DDP_COMPONENT_DITHER1:
+	case DDP_COMPONENT_DITHER2:
+	case DDP_COMPONENT_DITHER3:
 		mtk_dither_dump(comp);
 		break;
 	case DDP_COMPONENT_GAMMA0:
@@ -108,6 +137,7 @@ int mtk_dump_reg(struct mtk_ddp_comp *comp)
 		mtk_cm_dump(comp);
 		break;
 	case DDP_COMPONENT_SPR0:
+	case DDP_COMPONENT_SPR1:
 		mtk_spr_dump(comp);
 		break;
 	case DDP_COMPONENT_DSC0:
@@ -115,6 +145,8 @@ int mtk_dump_reg(struct mtk_ddp_comp *comp)
 		break;
 	case DDP_COMPONENT_MERGE0:
 	case DDP_COMPONENT_MERGE1:
+	case DDP_COMPONENT_MERGE2:
+	case DDP_COMPONENT_MERGE3:
 		mtk_merge_dump(comp);
 		break;
 	case DDP_COMPONENT_CHIST0:
@@ -122,12 +154,15 @@ int mtk_dump_reg(struct mtk_ddp_comp *comp)
 		mtk_chist_dump(comp);
 		break;
 	case DDP_COMPONENT_Y2R0:
+	case DDP_COMPONENT_Y2R1:
 		mtk_y2r_dump(comp);
 		break;
-	case DDP_COMPONENT_DLO_ASYNC:
+	case DDP_COMPONENT_DLO_ASYNC3:
+	case DDP_COMPONENT_DLO_ASYNC7:
 		mtk_dlo_async_dump(comp);
 		break;
-	case DDP_COMPONENT_DLI_ASYNC:
+	case DDP_COMPONENT_DLI_ASYNC3:
+	case DDP_COMPONENT_DLI_ASYNC7:
 		mtk_dli_async_dump(comp);
 		break;
 	case DDP_COMPONENT_INLINE_ROTATE0:
@@ -136,6 +171,10 @@ int mtk_dump_reg(struct mtk_ddp_comp *comp)
 		break;
 	case DDP_COMPONENT_MMLSYS_BYPASS:
 		mtk_mmlsys_bypass_dump(comp);
+		break;
+	case DDP_COMPONENT_ODDMR0:
+	case DDP_COMPONENT_ODDMR1:
+		mtk_oddmr_dump(comp);
 		break;
 	default:
 		return 0;
@@ -153,6 +192,10 @@ int mtk_dump_analysis(struct mtk_ddp_comp *comp)
 	case DDP_COMPONENT_OVL1_2L:
 	case DDP_COMPONENT_OVL2_2L:
 	case DDP_COMPONENT_OVL3_2L:
+	case DDP_COMPONENT_OVL4_2L:
+	case DDP_COMPONENT_OVL5_2L:
+	case DDP_COMPONENT_OVL6_2L:
+	case DDP_COMPONENT_OVL7_2L:
 	case DDP_COMPONENT_OVL0_2L_NWCG:
 	case DDP_COMPONENT_OVL1_2L_NWCG:
 	case DDP_COMPONENT_OVL2_2L_NWCG:
@@ -167,19 +210,37 @@ int mtk_dump_analysis(struct mtk_ddp_comp *comp)
 	case DDP_COMPONENT_RDMA5:
 		mtk_rdma_analysis(comp);
 		break;
+	case DDP_COMPONENT_MDP_RDMA0:
+	case DDP_COMPONENT_MDP_RDMA1:
+		mtk_mdp_rdma_analysis(comp);
+		break;
 	case DDP_COMPONENT_WDMA0:
 	case DDP_COMPONENT_WDMA1:
 	case DDP_COMPONENT_WDMA2:
 	case DDP_COMPONENT_WDMA3:
+	case DDP_COMPONENT_OVLSYS_WDMA0:
+	case DDP_COMPONENT_OVLSYS_WDMA1:
+	case DDP_COMPONENT_OVLSYS_WDMA2:
+	case DDP_COMPONENT_OVLSYS_WDMA3:
 		mtk_wdma_analysis(comp);
 		break;
 	case DDP_COMPONENT_RSZ0:
 	case DDP_COMPONENT_RSZ1:
+	case DDP_COMPONENT_RSZ2:
+	case DDP_COMPONENT_OVLSYS_RSZ1:
+	case DDP_COMPONENT_OVLSYS_RSZ2:
 		mtk_rsz_analysis(comp);
+		break;
+	case DDP_COMPONENT_MDP_RSZ0:
+	case DDP_COMPONENT_MDP_RSZ1:
+		mtk_mdp_rsz_analysis(comp);
 		break;
 	case DDP_COMPONENT_DSI0:
 	case DDP_COMPONENT_DSI1:
 		mtk_dsi_analysis(comp);
+		break;
+	case DDP_COMPONENT_DP_INTF0:
+		mtk_dp_intf_analysis(comp);
 		break;
 	case DDP_COMPONENT_POSTMASK0:
 	case DDP_COMPONENT_POSTMASK1:
@@ -196,10 +257,17 @@ int mtk_dump_analysis(struct mtk_ddp_comp *comp)
 		break;
 	case DDP_COMPONENT_MERGE0:
 	case DDP_COMPONENT_MERGE1:
+	case DDP_COMPONENT_MERGE2:
+	case DDP_COMPONENT_MERGE3:
 		mtk_merge_analysis(comp);
+		break;
 	case DDP_COMPONENT_CHIST0:
 	case DDP_COMPONENT_CHIST1:
 		mtk_chist_analysis(comp);
+		break;
+	case DDP_COMPONENT_ODDMR0:
+	case DDP_COMPONENT_ODDMR1:
+		mtk_oddmr_analysis(comp);
 		break;
 	default:
 		return 0;
@@ -212,17 +280,26 @@ int mtk_dump_analysis(struct mtk_ddp_comp *comp)
 void mtk_serial_dump_reg(void __iomem *base, unsigned int offset,
 			 unsigned int num)
 {
-	unsigned int i = 0, s = 0, l = 0;
+	unsigned int i = 0;
+	int s = 0, l = 0;
 	char buf[SERIAL_REG_MAX];
 
 	if (num > 4)
 		num = 4;
 
 	l = snprintf(buf, SERIAL_REG_MAX, "0x%03x:", offset);
+	if (l < 0) {
+		/* Handle snprintf() error*/
+		return;
+	}
 
 	for (i = 0; i < num; i++) {
 		s = snprintf(buf + l, SERIAL_REG_MAX, "0x%08x ",
 			     readl(base + offset + i * 0x4));
+		if (s < 0) {
+			/* Handle snprintf() error*/
+			return;
+		}
 		l += s;
 	}
 
@@ -233,19 +310,21 @@ void mtk_serial_dump_reg(void __iomem *base, unsigned int offset,
 void mtk_cust_dump_reg(void __iomem *base, int off1, int off2, int off3,
 		       int off4)
 {
-	unsigned int i = 0, s = 0, l = 0;
+	unsigned int i = 0;
+	int s = 0, l = 0;
 	int off[] = {off1, off2, off3, off4};
 	char buf[CUST_REG_MAX];
 
 	for (i = 0; i < 4; i++) {
 		if (off[i] < 0)
 			break;
-		s = snprintf(buf + l, CUST_REG_MAX, "0x%03x:0x%08x ", off[i],
+		s = snprintf(buf + l, CUST_REG_MAX - l, "0x%03x:0x%08x ", off[i],
 			     readl(base + off[i]));
 		if (s < 0) {
 			/* Handle snprintf() error */
 			return;
 		}
+
 		l += s;
 	}
 

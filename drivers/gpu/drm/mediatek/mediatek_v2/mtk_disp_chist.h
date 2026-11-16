@@ -14,6 +14,7 @@ struct mtk_disp_chist_data {
 	unsigned int color_format;
 	unsigned int max_channel;
 	unsigned int max_bin;
+	unsigned int chist_shift_num;
 };
 
 struct mtk_disp_chist {
@@ -37,4 +38,7 @@ int mtk_drm_ioctl_get_chist_caps(struct drm_device *dev, void *data,
 int mtk_drm_ioctl_set_chist_config(struct drm_device *dev, void *data,
 	struct drm_file *file_priv);
 
+extern unsigned int g_left_pipe_overhead[2];
+extern unsigned int g_right_pipe_overhead[2];
 #endif
+

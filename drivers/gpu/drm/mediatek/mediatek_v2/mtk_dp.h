@@ -178,6 +178,8 @@ enum DP_VIDEO_TIMING_TYPE {
 	SINK_1280_960,
 	SINK_1280_1024,
 	SINK_1920_1080,
+	SINK_1920_1080_120_RB,
+	SINK_1920_1080_120,
 	SINK_1080_2460,
 	SINK_1920_1200,
 	SINK_1920_1440,
@@ -199,8 +201,6 @@ enum DPTX_VIDEO_MODE {
 	DPTX_VIDEO_PROGRESSIVE  = 1,
 };
 
-
-#define MAX_LANECOUNT	DP_LANECOUNT_2
 
 #define FAKE_DEFAULT_RES 0xFF
 
@@ -245,6 +245,8 @@ void mdrv_DPTx_CheckMaxLinkRate(struct mtk_dp *mtk_dp);
 void mtk_dp_video_config(struct mtk_dp *mtk_dp);
 void mtk_dp_force_res(unsigned int res, unsigned int bpc);
 void mtk_dp_hotplug_uevent(unsigned int status);
+void mtk_dp_set_force_2lane(bool en);
+bool mtk_dp_2lane_only(void);
 void mtk_dp_enable_4k60(int enable);
 void mdrv_DPTx_FEC_Ready(struct mtk_dp *mtk_dp, u8 err_cnt_sel);
 void mdrv_DPTx_DSC_Support(struct mtk_dp *mtk_dp);
@@ -279,9 +281,13 @@ void mdrv_DPTx_PatternSet(bool enable, int resolution);
 void mdrv_DPTx_set_maxlinkrate(bool enable, int maxlinkrate);
 void mtk_dp_SWInterruptSet(int bstatus);
 void mtk_dp_aux_swap_enable(bool enable);
+void mtk_dp_set_pin_assign(u8 type);
+
 extern void mhal_DPTx_VideoClock(bool enable, int resolution);
 void mtk_dp_clock_debug(unsigned int clksrc, unsigned int con1);
 unsigned int mtk_de_get_clk_debug(void);
 unsigned int mtk_de_get_clksrc(void);
 unsigned int mtk_de_get_con1(void);
+void mtk_dp_vsvoter_set(struct mtk_dp *mtk_dp);
+void mtk_dp_vsvoter_clr(struct mtk_dp *mtk_dp);
 #endif //__MTK_DP__H__

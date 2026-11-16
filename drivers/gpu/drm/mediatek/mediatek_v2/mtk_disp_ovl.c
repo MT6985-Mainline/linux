@@ -9,6 +9,7 @@
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
+#include <linux/ratelimit.h>
 #ifndef DRM_CMDQ_DISABLE
 #include <linux/soc/mediatek/mtk-cmdq-ext.h>
 #else
@@ -25,13 +26,16 @@
 #include "mtk_drm_graphics_base.h"
 #include "mtk_drm_helper.h"
 #include "mtk_drm_drv.h"
+#include "mtk_disp_ovl.h"
 #include "mtk_disp_pmqos.h"
+#include "mtk_drm_assert.h"
 #ifdef IF_ZERO
 #include "mtk_iommu_ext.h"
 #endif
 #include "mtk_layer_layout_trace.h"
 #include "mtk_drm_mmp.h"
 #include "mtk_drm_gem.h"
+#include "platform/mtk_drm_platform.h"
 
 #include "slbc_ops.h"
 #include "../mml/mtk-mml.h"
@@ -72,7 +76,7 @@ int mtk_dprec_mmp_dump_ovl_layer(struct mtk_plane_state *plane_state);
 #define INTEN_FLD_RDMA3_SMI_UNDERFLOW_INTEN REG_FLD_MSB_LSB(12, 12)
 #define INTEN_FLD_ABNORMAL_SOF REG_FLD_MSB_LSB(13, 13)
 #define INTEN_FLD_START_INTEN REG_FLD_MSB_LSB(14, 14)
-
+#define INIEN_ROI_TIMING_0 REG_FLD_MSB_LSB(15, 15)
 #define DISP_REG_OVL_INTSTA 0x0008
 #define DISP_REG_OVL_EN (0x000CUL)
 #define EN_FLD_BLOCK_EXT_ULTRA			REG_FLD_MSB_LSB(18, 18)
@@ -83,8 +87,16 @@ int mtk_dprec_mmp_dump_ovl_layer(struct mtk_plane_state *plane_state);
 
 #define DISP_REG_OVL_RST 0x0014
 #define DISP_REG_OVL_ROI_SIZE 0x0020
+#define OVL_ROI_TIMING_0 0x740
 #define DISP_REG_OVL_DATAPATH_CON	(0x024UL)
 #define DISP_OVL_BGCLR_IN_SEL BIT(2)
+#define DATAPATH_PQ_OUT_SEL REG_FLD_MSB_LSB(18, 16)
+#define DISP_OVL_PQ_OUT_EN REG_FLD_MSB_LSB(19, 19)
+#define DISP_OVL_RDMA0_OUT_SEL REG_FLD_MSB_LSB(20, 20)
+#define DISP_OVL_RDMA1_OUT_SEL REG_FLD_MSB_LSB(21, 21)
+#define DISP_OVL_RDMA2_OUT_SEL REG_FLD_MSB_LSB(22, 22)
+#define DISP_OVL_RDMA3_OUT_SEL REG_FLD_MSB_LSB(23, 23)
+#define DISP_OVL_PQ_OUT_OPT REG_FLD_MSB_LSB(23, 23)
 #define DISP_OVL_OUTPUT_CLAMP BIT(26)
 #define DATAPATH_CON_FLD_LAYER_SMI_ID_EN	REG_FLD_MSB_LSB(0, 0)
 #define DATAPATH_CON_FLD_GCLAST_EN		REG_FLD_MSB_LSB(24, 24)
@@ -217,6 +229,7 @@ int mtk_dprec_mmp_dump_ovl_layer(struct mtk_plane_state *plane_state);
 #define DISP_REG_OVL_CLRFMT_EXT (0x2D0UL)
 #define FLD_Ln_CLRFMT_NB(n) REG_FLD_MSB_LSB((n)*4 + 1, (n)*4)
 #define FLD_ELn_CLRFMT_NB(n) REG_FLD_MSB_LSB((n)*4 + 17, (n)*4 + 16)
+#define DISP_REG_OVL_WCG_CFG0 (0x2D4UL)
 #define DISP_REG_OVL_WCG_CFG1 (0x2D8UL)
 #define FLD_Ln_IGAMMA_EN(n) REG_FLD_MSB_LSB((n)*4, (n)*4)
 #define FLD_Ln_CSC_EN(n) REG_FLD_MSB_LSB((n)*4 + 1, (n)*4 + 1)
@@ -242,9 +255,20 @@ int mtk_dprec_mmp_dump_ovl_layer(struct mtk_plane_state *plane_state);
 #define DISP_REG_OVL_EL0_CLR(n) (0x390UL + 0x4 * (n))
 #define DISP_REG_OVL_ADDR_MT2701 0x0040
 #define DISP_REG_OVL_ADDR_MT6779 0x0f40
-#define DISP_REG_OVL_ADDR_BASE 0x0f40
 #define DISP_REG_OVL_ADDR_MT8173 0x0f40
 #define DISP_REG_OVL_ADDR(module, n) ((module)->data->addr + 0x20 * (n))
+
+#define DISP_REG_OVL_PQ_LOOP_CON (0x2E0UL)
+#define DISP_OVL_PQ_OUT_SIZE_SEL BIT(0)
+#define DISP_REG_OVL_PQ_OUT_SIZE (0x2E4UL)
+#define FLD_OVL_PQ_OUT_SRC_W REG_FLD_MSB_LSB(12, 0)
+#define FLD_OVL_PQ_OUT_SRC_H REG_FLD_MSB_LSB(28, 16)
+
+/* OVL Bandwidth monitor */
+#define DISP_REG_OVL_BURST_MON_CFG (0x97CUL)
+#define FLD_OVL_BURST_ACC_EN REG_FLD_MSB_LSB(0, 0)
+#define FLD_OVL_BURST_ACC_FBDC REG_FLD_MSB_LSB(4, 4)
+#define FLD_OVL_BURST_ACC_WIN_SIZE REG_FLD_MSB_LSB(12, 8)
 
 #define DISP_REG_OVL_ADDR_MSB(n) (0x0f4c + 0x20 * (n))
 #define DISP_REG_OVL_EL_ADDR_MSB(n) (0x0fbc + 0x10 * (n))
@@ -337,13 +361,11 @@ int mtk_dprec_mmp_dump_ovl_layer(struct mtk_plane_state *plane_state);
 
 
 /* AID offset in mmsys config */
-/* MT6985 exposes one AID bit per layer in the OVL system block. */
 #define MT6985_OVL0_2L_AID_SEL	(0xB00UL)
 #define MT6985_OVL1_2L_AID_SEL	(0xB20UL)
 #define MT6985_OVL2_2L_AID_SEL	(0xB40UL)
 #define MT6985_OVL3_2L_AID_SEL	(0xB60UL)
-#define MT6985_OVL_LAYER_OFFSET	0x4
-#define MT6985_OVLSYS_REG_MASK	0x1FFFFFUL
+#define MT6985_OVL_LAYER_OFFEST	0x4
 
 #define MT6983_OVL0_AID_SEL	(0xB00UL)
 #define MT6983_OVL1_2L_AID_SEL	(0xB08UL)
@@ -358,7 +380,14 @@ int mtk_dprec_mmp_dump_ovl_layer(struct mtk_plane_state *plane_state);
 #define MT6879_OVL0_2L_AID_SEL	(0xB04UL)
 #define MT6879_OVL0_2L_NWCG_AID_SEL (0xB0CUL)
 
+#define MT6886_OVL0_AID_SEL		(0xC00UL)
+#define MT6886_OVL0_2L_AID_SEL		(0xC1CUL)
+#define MT6886_OVL1_2L_AID_SEL		(0xC30UL)
+#define MT6886_OVL0_2L_NWCG_AID_SEL		(0xB0CUL)
+#define MT6886_OVL1_2L_NWCG_AID_SEL		(0xB10UL)
+
 #define SMI_LARB_NON_SEC_CON        0x380
+#define DISP_REG_OVL_SMI_2ND_CFG	(0x8F0)
 
 #define MML_SRAM_SHIFT (512*1024)
 
@@ -386,10 +415,10 @@ enum GS_OVL_FLD {
 
 #define CSC_COEF_NUM 9
 
-static u32 sRGB_to_DCI_P3[CSC_COEF_NUM] = {215603, 46541, 0,     8702,  253442,
+static s32 sRGB_to_DCI_P3[CSC_COEF_NUM] = {215603, 46541, 0,     8702,  253442,
 					   0,      4478,  18979, 238687};
 
-static u32 DCI_P3_to_sRGB[CSC_COEF_NUM] = {
+static s32 DCI_P3_to_sRGB[CSC_COEF_NUM] = {
 	321111, -58967, 0, -11025, 273169, 0, -5148, -20614, 287906};
 
 #define DECLARE_MTK_OVL_COLORSPACE(EXPR)                                       \
@@ -404,8 +433,8 @@ static const char * const mtk_ovl_colorspace_str[] = {
 	DECLARE_MTK_OVL_COLORSPACE(DECLARE_STR)};
 
 #define DECLARE_MTK_OVL_TRANSFER(EXPR)                                         \
-	EXPR(OVL_GAMMA2)                                                       \
 	EXPR(OVL_GAMMA2_2)                                                     \
+	EXPR(OVL_GAMMA2)                                                       \
 	EXPR(OVL_LINEAR)                                                       \
 	EXPR(OVL_GAMMA_NUM)                                                    \
 	EXPR(OVL_GAMMA_UNKNOWN)
@@ -414,46 +443,6 @@ enum mtk_ovl_transfer { DECLARE_MTK_OVL_TRANSFER(DECLARE_NUM) };
 
 static const char * const mtk_ovl_transfer_str[] = {
 	DECLARE_MTK_OVL_TRANSFER(DECLARE_STR)};
-
-struct compress_info {
-	/* naming rule: tech_version_MTK_sub-version,
-	 * i.e.: PVRIC_V3_1_MTK_1
-	 * sub-version is used when compression version is the same
-	 * but mtk decoder is different among platforms.
-	 */
-	const char name[25];
-
-	bool (*l_config)(struct mtk_ddp_comp *comp,
-			unsigned int idx, struct mtk_plane_state *state,
-			struct cmdq_pkt *handle);
-};
-
-struct mtk_disp_ovl_data {
-	unsigned int addr;
-	unsigned int el_addr_offset;
-	unsigned int el_hdr_addr;
-	unsigned int el_hdr_addr_offset;
-	bool fmt_rgb565_is_0;
-	unsigned int fmt_uyvy;
-	unsigned int fmt_yuyv;
-	const struct compress_info *compr_info;
-	bool support_shadow;
-	bool need_bypass_shadow;
-	/* golden setting */
-	unsigned int preultra_th_dc;
-	unsigned int fifo_size;
-	unsigned int issue_req_th_dl;
-	unsigned int issue_req_th_dc;
-	unsigned int issue_req_th_urg_dl;
-	unsigned int issue_req_th_urg_dc;
-	unsigned int greq_num_dl;
-	bool is_support_34bits;
-	unsigned int (*aid_sel_mapping)(struct mtk_ddp_comp *comp);
-	bool aid_per_layer_setting;
-	resource_size_t (*mmsys_mapping)(struct mtk_ddp_comp *comp);
-	unsigned int source_bpc;
-	bool support_pq_selfloop;
-};
 
 #define MAX_LAYER_NUM 4
 struct mtk_ovl_backup_info {
@@ -475,6 +464,7 @@ struct mtk_disp_ovl {
 	struct mtk_ddp_comp ddp_comp;
 	const struct mtk_disp_ovl_data *data;
 	unsigned int underflow_cnt;
+	bool ovl_dis;
 	int bg_w, bg_h;
 	struct clk *fbdc_clk;
 	struct mtk_ovl_backup_info backup_info[MAX_LAYER_NUM];
@@ -495,6 +485,10 @@ int mtk_ovl_layer_num(struct mtk_ddp_comp *comp)
 	case DDP_COMPONENT_OVL1_2L:
 	case DDP_COMPONENT_OVL2_2L:
 	case DDP_COMPONENT_OVL3_2L:
+	case DDP_COMPONENT_OVL4_2L:
+	case DDP_COMPONENT_OVL5_2L:
+	case DDP_COMPONENT_OVL6_2L:
+	case DDP_COMPONENT_OVL7_2L:
 	case DDP_COMPONENT_OVL0_2L_NWCG:
 	case DDP_COMPONENT_OVL1_2L_NWCG:
 	case DDP_COMPONENT_OVL2_2L_NWCG:
@@ -528,20 +522,37 @@ resource_size_t mtk_ovl_mmsys_mapping_MT6983(struct mtk_ddp_comp *comp)
 	}
 }
 
-static resource_size_t mtk_ovl_mmsys_mapping_MT6985(struct mtk_ddp_comp *comp)
+resource_size_t mtk_ovl_mmsys_mapping_MT6985(struct mtk_ddp_comp *comp)
 {
-	/* 7.2 does not carry the t-oss ovlsys resources in mtk_drm_private.
-	 * The MT6985 OVL registers live in the 0x2000..0x5000 window of
-	 * each 0x200000-aligned OVL system block, so derive its base from the
-	 * existing component resource without adding a DTS/private-struct
-	 * dependency in this phase.
-	 */
+	struct mtk_drm_private *priv = comp->mtk_crtc->base.dev->dev_private;
+
 	switch (comp->id) {
 	case DDP_COMPONENT_OVL0_2L:
 	case DDP_COMPONENT_OVL1_2L:
 	case DDP_COMPONENT_OVL2_2L:
 	case DDP_COMPONENT_OVL3_2L:
-		return comp->regs_pa & ~MT6985_OVLSYS_REG_MASK;
+		return priv->ovlsys0_regs_pa;
+	case DDP_COMPONENT_OVL4_2L:
+	case DDP_COMPONENT_OVL5_2L:
+	case DDP_COMPONENT_OVL6_2L:
+	case DDP_COMPONENT_OVL7_2L:
+		return priv->ovlsys1_regs_pa;
+	default:
+		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
+		return 0;
+	}
+}
+
+resource_size_t mtk_ovl_mmsys_mapping_MT6886(struct mtk_ddp_comp *comp)
+{
+	struct mtk_drm_private *priv = comp->mtk_crtc->base.dev->dev_private;
+
+	switch (comp->id) {
+	case DDP_COMPONENT_OVL0:
+	case DDP_COMPONENT_OVL0_2L:
+	case DDP_COMPONENT_OVL1_2L:
+	case DDP_COMPONENT_OVL0_2L_NWCG:
+		return priv->config_regs_pa;
 	default:
 		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
 		return 0;
@@ -582,23 +593,6 @@ resource_size_t mtk_ovl_mmsys_mapping_MT6879(struct mtk_ddp_comp *comp)
 	}
 }
 
-static unsigned int mtk_ovl_aid_sel_MT6985(struct mtk_ddp_comp *comp)
-{
-	switch (comp->id) {
-	case DDP_COMPONENT_OVL0_2L:
-		return MT6985_OVL0_2L_AID_SEL;
-	case DDP_COMPONENT_OVL1_2L:
-		return MT6985_OVL1_2L_AID_SEL;
-	case DDP_COMPONENT_OVL2_2L:
-		return MT6985_OVL2_2L_AID_SEL;
-	case DDP_COMPONENT_OVL3_2L:
-		return MT6985_OVL3_2L_AID_SEL;
-	default:
-		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
-		return 0;
-	}
-}
-
 unsigned int mtk_ovl_aid_sel_MT6983(struct mtk_ddp_comp *comp)
 {
 	switch (comp->id) {
@@ -615,6 +609,46 @@ unsigned int mtk_ovl_aid_sel_MT6983(struct mtk_ddp_comp *comp)
 	case DDP_COMPONENT_OVL1_2L_NWCG:
 	case DDP_COMPONENT_OVL3_2L_NWCG:
 		return MT6983_OVL1_2L_NWCG_AID_SEL;
+	default:
+		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
+		return 0;
+	}
+}
+
+unsigned int mtk_ovl_aid_sel_MT6985(struct mtk_ddp_comp *comp)
+{
+	switch (comp->id) {
+	case DDP_COMPONENT_OVL0_2L:
+	case DDP_COMPONENT_OVL4_2L:
+		return MT6985_OVL0_2L_AID_SEL;
+	case DDP_COMPONENT_OVL1_2L:
+	case DDP_COMPONENT_OVL5_2L:
+		return MT6985_OVL1_2L_AID_SEL;
+	case DDP_COMPONENT_OVL2_2L:
+	case DDP_COMPONENT_OVL6_2L:
+		return MT6985_OVL2_2L_AID_SEL;
+	case DDP_COMPONENT_OVL3_2L:
+	case DDP_COMPONENT_OVL7_2L:
+		return MT6985_OVL3_2L_AID_SEL;
+	default:
+		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
+		return 0;
+	}
+}
+
+unsigned int mtk_ovl_aid_sel_MT6886(struct mtk_ddp_comp *comp)
+{
+	switch (comp->id) {
+	case DDP_COMPONENT_OVL0:
+		return MT6886_OVL0_AID_SEL;
+	case DDP_COMPONENT_OVL0_2L:
+		return MT6886_OVL0_2L_AID_SEL;
+	case DDP_COMPONENT_OVL1_2L:
+		return MT6886_OVL1_2L_AID_SEL;
+	case DDP_COMPONENT_OVL0_2L_NWCG:
+		return MT6886_OVL0_2L_NWCG_AID_SEL;
+	case DDP_COMPONENT_OVL1_2L_NWCG:
+		return MT6886_OVL1_2L_NWCG_AID_SEL;
 	default:
 		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
 		return 0;
@@ -654,36 +688,31 @@ unsigned int mtk_ovl_aid_sel_MT6879(struct mtk_ddp_comp *comp)
 	}
 }
 
+bool is_right_ovl_comp_MT6985(struct mtk_ddp_comp *comp)
+{
+	switch (comp->id) {
+	case DDP_COMPONENT_OVL0_2L:
+	case DDP_COMPONENT_OVL1_2L:
+	case DDP_COMPONENT_OVL2_2L:
+	case DDP_COMPONENT_OVL3_2L:
+		return false;
+	case DDP_COMPONENT_OVL4_2L:
+	case DDP_COMPONENT_OVL5_2L:
+	case DDP_COMPONENT_OVL6_2L:
+	case DDP_COMPONENT_OVL7_2L:
+		return true;
+	default:
+		DDPPR_ERR("%s invalid ovl module=%d\n", __func__, comp->id);
+		return false;
+	}
+}
+
 int mtk_ovl_aid_bit(struct mtk_ddp_comp *comp, bool is_ext, int id)
 {
 	if (is_ext)
 		return mtk_ovl_layer_num(comp) + id;
 	else
 		return id;
-}
-
-static void mtk_ovl_aid_config(struct mtk_disp_ovl *ovl,
-		struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
-		resource_size_t mmsys_reg, unsigned int aid_sel_offset,
-		int sec_bit, bool enable)
-{
-	unsigned int offset = aid_sel_offset;
-	unsigned int value;
-	unsigned int mask;
-
-	if (!mmsys_reg || !aid_sel_offset)
-		return;
-
-	if (ovl->data->aid_per_layer_setting) {
-		offset += MT6985_OVL_LAYER_OFFSET * sec_bit;
-		value = enable ? BIT(0) : 0;
-		mask = BIT(0);
-	} else {
-		value = enable ? BIT(sec_bit) : 0;
-		mask = BIT(sec_bit);
-	}
-
-	cmdq_pkt_write(handle, comp->cmdq_base, mmsys_reg + offset, value, mask);
 }
 
 static void dump_ovl_layer_trace(struct mtk_drm_crtc *mtk_crtc,
@@ -789,7 +818,6 @@ next:
 	trace_layer_bw(msg);
 #endif
 }
-
 static irqreturn_t mtk_disp_ovl_irq_handler(int irq, void *dev_id)
 {
 	struct mtk_disp_ovl *priv = dev_id;
@@ -798,6 +826,7 @@ static irqreturn_t mtk_disp_ovl_irq_handler(int irq, void *dev_id)
 	struct mtk_drm_crtc *mtk_crtc = NULL;
 	unsigned int val = 0;
 	unsigned int ret = 0;
+	static DEFINE_RATELIMIT_STATE(isr_ratelimit, 1 * HZ, 4);
 
 	if (IS_ERR_OR_NULL(priv))
 		return IRQ_NONE;
@@ -819,6 +848,8 @@ static irqreturn_t mtk_disp_ovl_irq_handler(int irq, void *dev_id)
 	DRM_MMP_MARK(IRQ, ovl->regs_pa, val);
 
 	mtk_crtc = ovl->mtk_crtc;
+	if (mtk_crtc)
+		drv_priv = mtk_crtc->base.dev->dev_private;
 
 	if (ovl->id == DDP_COMPONENT_OVL0)
 		DRM_MMP_MARK(ovl0, val, 0);
@@ -844,25 +875,45 @@ static irqreturn_t mtk_disp_ovl_irq_handler(int irq, void *dev_id)
 		DDPIRQ("[IRQ] %s: reg commit!\n", mtk_dump_comp_str(ovl));
 	if (val & (1 << 1)) {
 		DDPIRQ("[IRQ] %s: frame done!\n", mtk_dump_comp_str(ovl));
+
 		dump_ovl_layer_trace(mtk_crtc, ovl);
 	}
+	if ((ovl->id == DDP_COMPONENT_OVL0_2L) && (val & (1 << 15))) {
+		DDPIRQ("[IRQ] %s: OVL target line\n", mtk_dump_comp_str(ovl));
+		DRM_MMP_MARK(ovl0, val, 3);
+		if (mtk_crtc && mtk_crtc->esd_ctx) {
+			atomic_set(&mtk_crtc->esd_ctx->target_time, 1);
+			wake_up_interruptible(&mtk_crtc->esd_ctx->check_task_wq);
+		}
+	}
 	if (val & (1 << 2)) {
-		DDPPR_ERR("[IRQ] %s: frame underflow! cnt=%d\n",
-			  mtk_dump_comp_str(ovl), priv->underflow_cnt);
+		unsigned long long aee_now_ts = sched_clock();
+
+		if (drv_priv && (!atomic_read(&drv_priv->need_recover)))
+			atomic_set(&drv_priv->need_recover, 1);
+
+		if (__ratelimit(&isr_ratelimit)) {
+			unsigned int smi_cnt = 0;
+
+			if (val & (1 << 13))
+				smi_cnt = readl(ovl->regs + DISP_REG_OVL_GREQ_LAYER_CNT);
+			DDPPR_ERR("[IRQ] %s: frame underflow! %u reqs are smi hang, cnt=%d\n",
+				  mtk_dump_comp_str(ovl), smi_cnt, priv->underflow_cnt);
+		}
 		priv->underflow_cnt++;
-//		mtk_ovl_dump(ovl);
-//		mtk_ovl_analysis(ovl);
+		if (mtk_crtc && (mtk_crtc->last_aee_trigger_ts == 0 ||
+			(aee_now_ts - mtk_crtc->last_aee_trigger_ts > TIGGER_INTERVAL_S(10)))) {
+			mtk_ovl_dump(ovl);
+			mtk_ovl_analysis(ovl);
+			mtk_crtc->last_aee_trigger_ts = aee_now_ts;
+		}
 	}
 	if (val & (1 << 3))
 		DDPIRQ("[IRQ] %s: sw reset done!\n", mtk_dump_comp_str(ovl));
 
-	if (mtk_crtc) {
-		drv_priv = mtk_crtc->base.dev->dev_private;
-		if (!mtk_drm_helper_get_opt(
-			    drv_priv->helper_opt,
-			    MTK_DRM_OPT_COMMIT_NO_WAIT_VBLANK)) {
-			mtk_crtc_vblank_irq(&mtk_crtc->base);
-		}
+	if (drv_priv && (!mtk_drm_helper_get_opt(drv_priv->helper_opt,
+						 MTK_DRM_OPT_COMMIT_NO_WAIT_VBLANK))) {
+		mtk_crtc_vblank_irq(&mtk_crtc->base);
 	}
 
 	ret = IRQ_HANDLED;
@@ -896,6 +947,37 @@ static void mtk_ovl_disable_vblank(struct mtk_ddp_comp *comp,
 static int mtk_ovl_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 			  enum mtk_ddp_io_cmd io_cmd, void *params);
 
+static void mtk_ovl_all_layer_off(struct mtk_ddp_comp *comp,
+	struct cmdq_pkt *handle, int keep_first_layer)
+{
+	int i;
+	unsigned int phy_layer0_on = 0;
+
+	/* In 6779 we need to set DISP_OVL_FORCE_RELAY_MODE */
+
+	/* To make sure the OVL_SRC_CON register keep the same value
+	 * as readl while writing the new value in GCE. This function should
+	 * only used in driver probe.
+	 */
+	if (keep_first_layer)
+		phy_layer0_on = readl(comp->regs + DISP_REG_OVL_SRC_CON) & 0x1;
+	if (phy_layer0_on)
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			       comp->regs_pa + DISP_REG_OVL_SRC_CON, 0x1, ~0);
+	else
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			       comp->regs_pa + DISP_REG_OVL_SRC_CON,
+			       DISP_OVL_FORCE_RELAY_MODE, ~0);
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		       comp->regs_pa + DISP_REG_OVL_DATAPATH_EXT_CON, 0, ~0);
+
+	for (i = phy_layer0_on ? 1 : 0; i < OVL_PHY_LAYER_NR; i++)
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			       comp->regs_pa + DISP_REG_OVL_RDMA_CTRL(i), 0,
+			       ~0);
+}
+
 static void mtk_ovl_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 {
 	unsigned int val;
@@ -906,6 +988,13 @@ static void mtk_ovl_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 	DDPDBG("%s+ %s\n", __func__, mtk_dump_comp_str(comp));
 
 	mtk_ovl_io_cmd(comp, handle, IRQ_LEVEL_NORMAL, NULL);
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa + DISP_REG_OVL_RST, BIT(0), BIT(0));
+	cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa + DISP_REG_OVL_RST, 0x0, BIT(0));
+	cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DISP_REG_OVL_INTSTA, 0, ~0);
 
 	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_EN,
 		       0x1, 0x1);
@@ -930,6 +1019,7 @@ static void mtk_ovl_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 	value = 0;
 	mask = 0;
 	SET_VAL_MASK(value, mask, 1, DATAPATH_CON_FLD_LAYER_SMI_ID_EN);
+	SET_VAL_MASK(value, mask, 1, DATAPATH_CON_FLD_HDR_GCLAST_EN);
 	SET_VAL_MASK(value, mask, 1, DATAPATH_CON_FLD_GCLAST_EN);
 	SET_VAL_MASK(value, mask, 1, DATAPATH_CON_FLD_OUTPUT_CLAMP);
 	cmdq_pkt_write(handle, comp->cmdq_base,
@@ -941,34 +1031,33 @@ static void mtk_ovl_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 		comp->regs_pa + DISP_REG_OVL_GDRDY_PRD,
 		0xFFFFFFFF, 0xFFFFFFFF);
 
-	pr_err("COROT-STAGE ovl_start: %s dual_pipe=%d EN=0x%08x SRC_CON=0x%08x DATAPATH=0x%08x ROI=0x%08x\n",
-	       mtk_dump_comp_str(comp),
-	       (comp->mtk_crtc && comp->mtk_crtc->is_dual_pipe) ? 1 : 0,
-	       readl(comp->regs + DISP_REG_OVL_EN),
-	       readl(comp->regs + DISP_REG_OVL_SRC_CON),
-	       readl(comp->regs + DISP_REG_OVL_DATAPATH_CON),
-	       readl(comp->regs + DISP_REG_OVL_ROI_SIZE));
-
 	DDPDBG("%s-\n", __func__);
 }
 
 static void mtk_ovl_stop(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 {
-	DDPDBG("%s+\n", __func__);
+	DDPDBG("%s+ %s\n", __func__, mtk_dump_comp_str(comp));
 
 	cmdq_pkt_write(handle, comp->cmdq_base,
 			comp->regs_pa + DISP_REG_OVL_INTEN, 0, ~0);
 	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_EN,
 		       0x0, 0x1);
-	cmdq_pkt_write(handle, comp->cmdq_base,
-			comp->regs_pa + DISP_REG_OVL_RST, 1, ~0);
-	cmdq_pkt_write(handle, comp->cmdq_base,
-			comp->regs_pa + DISP_REG_OVL_INTSTA, 0, ~0);
-	cmdq_pkt_write(handle, comp->cmdq_base,
-			comp->regs_pa + DISP_REG_OVL_RST, 0, ~0);
+
+	mtk_ovl_all_layer_off(comp, handle, 0);
 
 	comp->qos_bw = 0;
+	comp->qos_bw_other = 0;
 	comp->fbdc_bw = 0;
+	DDPDBG("%s-\n", __func__);
+}
+
+static void mtk_ovl_reset(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
+{
+	DDPDBG("%s+ %s\n", __func__, mtk_dump_comp_str(comp));
+	cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DISP_REG_OVL_RST, BIT(0) | BIT(28), ~0);
+	cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DISP_REG_OVL_RST, 0, ~0);
 	DDPDBG("%s-\n", __func__);
 }
 
@@ -988,6 +1077,9 @@ static void _get_bg_roi(struct mtk_ddp_comp *comp, int *h, int *w)
 	*w = ovl->bg_w;
 }
 
+static void _ovl_PQ_loop_set_size(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
+				  const u32 layer, const u32 src, const u32 clip_w);
+
 static int mtk_ovl_golden_setting(struct mtk_ddp_comp *comp,
 				  struct mtk_ddp_config *cfg,
 				  struct cmdq_pkt *handle);
@@ -996,10 +1088,22 @@ static void mtk_ovl_config(struct mtk_ddp_comp *comp,
 			   struct mtk_ddp_config *cfg, struct cmdq_pkt *handle)
 {
 	unsigned int width;
+	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
+	struct drm_crtc *crtc = &mtk_crtc->base;
+	struct mtk_drm_private *priv = crtc->dev->dev_private;
+	unsigned long crtc_idx = (unsigned long)drm_crtc_index(crtc);
+	int fps = drm_mode_vrefresh(&crtc->state->adjusted_mode);
+	struct mtk_disp_ovl *ovl = comp_to_ovl(comp);
 
-	if (comp->mtk_crtc->is_dual_pipe)
-		width = cfg->w / 2;
-	else
+	if (comp->mtk_crtc->is_dual_pipe) {
+		if (cfg->tile_overhead.is_support) {
+			if (ovl->data->is_right_ovl_comp && ovl->data->is_right_ovl_comp(comp))
+				width = cfg->tile_overhead.right_in_width;
+			else
+				width = cfg->tile_overhead.left_in_width;
+		} else
+			width = cfg->w / 2;
+	} else
 		width = cfg->w;
 
 	if (cfg->w != 0 && cfg->h != 0) {
@@ -1011,7 +1115,52 @@ static void mtk_ovl_config(struct mtk_ddp_comp *comp,
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		       comp->regs_pa + DISP_REG_OVL_ROI_BGCLR, OVL_ROI_BGCLR,
 		       ~0);
+	//enable sram dbg reg:0x900~0x934
+	cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa + DISP_REG_OVL_TRIG, 0x1000, 0x1000);
 
+
+	mtk_ddp_write(comp, (cfg->h * 9) / 10,
+		OVL_ROI_TIMING_0, handle);
+
+	DDPINFO("%s -> %u\n", __func__, (cfg->h * 9) / 10);
+
+	if (mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_OVL_BW_MONITOR) &&
+		(crtc_idx == 0)) {
+		unsigned int bw_monitor_config;
+
+		/****************************************************************/
+		/*BURST_ACC_FBDC: 1/0:fbdc size/actual BW(fbdc+sBCH)            */
+		/*BURST_ACC_EN: 1: enable bw monitor 0: disable                 */
+		/*BURST_ACC_WIN_SIZE: check below table                         */
+		/*Scenario | 4AFBC line times(us) | Best fit to 200us MD window */
+		/*FHD+@60  | 22.0                 | 198(9w)                     */
+		/*FHD+@120 | 11.0                 | 198(18w)                    */
+		/*WQHD+@60 | 16.5                 | 198(12w)                    */
+		/*WQHD+@120| 8.26                 | 198(24w)                    */
+		/****************************************************************/
+		bw_monitor_config = REG_FLD_VAL(FLD_OVL_BURST_ACC_EN, 1);
+		bw_monitor_config |= REG_FLD_VAL(FLD_OVL_BURST_ACC_FBDC, 0);
+		if (cfg->w <= 1080) {
+			if (fps <= 60) {
+				bw_monitor_config |= REG_FLD_VAL(FLD_OVL_BURST_ACC_WIN_SIZE, 8);
+				ovl_win_size = 9;
+			} else {
+				bw_monitor_config |= REG_FLD_VAL(FLD_OVL_BURST_ACC_WIN_SIZE, 17);
+				ovl_win_size = 18;
+			}
+		} else {
+			if (fps <= 60) {
+				bw_monitor_config |= REG_FLD_VAL(FLD_OVL_BURST_ACC_WIN_SIZE, 11);
+				ovl_win_size = 12;
+			} else {
+				bw_monitor_config |= REG_FLD_VAL(FLD_OVL_BURST_ACC_WIN_SIZE, 23);
+				ovl_win_size = 24;
+			}
+		}
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DISP_REG_OVL_BURST_MON_CFG, bw_monitor_config, ~0);
+	}
 	mtk_ovl_golden_setting(comp, cfg, handle);
 }
 
@@ -1087,9 +1236,10 @@ static void mtk_ovl_layer_off(struct mtk_ddp_comp *comp, unsigned int idx,
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			       comp->regs_pa + DISP_REG_OVL_SRC_CON, 0,
 			       BIT(idx));
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DISP_REG_OVL_RDMA_CTRL(idx), 0,
-			       ~0);
+		/* TODO: only disable RDMA with valid lye_blob information */
+		//cmdq_pkt_write(handle, comp->cmdq_base,
+		//	       comp->regs_pa + DISP_REG_OVL_RDMA_CTRL(idx), 0,
+		//	       ~0);
 	}
 }
 
@@ -1180,8 +1330,12 @@ static enum mtk_ovl_colorspace mtk_ovl_map_cs(enum mtk_drm_dataspace ds)
 		break;
 	case MTK_DRM_DATASPACE_STANDARD_ADOBE_RGB:
 		DDPPR_ERR("%s: ovl get cs ADOBE_RGB\n", __func__);
+		fallthrough;
 	case MTK_DRM_DATASPACE_STANDARD_BT2020:
+		fallthrough;
+	case MTK_DRM_DATASPACE_STANDARD_BT2020_CONSTANT_LUMINANCE:
 		DDPPR_ERR("%s: ovl does not support BT2020\n", __func__);
+		fallthrough;
 	default:
 		cs = OVL_SRGB;
 		break;
@@ -1199,11 +1353,15 @@ static enum mtk_ovl_transfer mtk_ovl_map_transfer(enum mtk_drm_dataspace ds)
 		xfr = OVL_LINEAR;
 		break;
 	case MTK_DRM_DATASPACE_TRANSFER_GAMMA2_6:
+		fallthrough;
 	case MTK_DRM_DATASPACE_TRANSFER_GAMMA2_8:
 		DDPINFO("%s: ovl does not support gamma 2.6/2.8, use gamma 2.2\n", __func__);
+		fallthrough;
 	case MTK_DRM_DATASPACE_TRANSFER_ST2084:
+		fallthrough;
 	case MTK_DRM_DATASPACE_TRANSFER_HLG:
 		DDPINFO("%s: HDR transfer\n", __func__);
+		fallthrough;
 	default:
 		xfr = OVL_GAMMA2_2;
 		break;
@@ -1230,16 +1388,14 @@ static int mtk_ovl_do_transfer(unsigned int idx,
 	       mtk_ovl_get_transfer_str(xfr_in),
 	       mtk_ovl_get_transfer_str(xfr_out));
 
-	en = xfr_in != OVL_LINEAR && (xfr_in != xfr_out || cs_in != cs_out);
-
+	en = (xfr_in != OVL_LINEAR);
 	if (en) {
 		*igamma_en = true;
 		*igamma_sel = xfr_in;
 	} else
 		*igamma_en = false;
 
-	en = xfr_out != OVL_LINEAR && (xfr_in != xfr_out || cs_in != cs_out);
-
+	en = xfr_out != OVL_LINEAR;
 	if (en) {
 		*gamma_en = true;
 		*gamma_sel = xfr_out;
@@ -1249,10 +1405,10 @@ static int mtk_ovl_do_transfer(unsigned int idx,
 	return 0;
 }
 
-static u32 *mtk_get_ovl_csc(enum mtk_ovl_colorspace in,
+static s32 *mtk_get_ovl_csc(enum mtk_ovl_colorspace in,
 			    enum mtk_ovl_colorspace out)
 {
-	static u32 *ovl_csc[OVL_CS_NUM][OVL_CS_NUM];
+	static s32 *ovl_csc[OVL_CS_NUM][OVL_CS_NUM];
 	static bool inited;
 
 	if (out < 0) {
@@ -1279,7 +1435,7 @@ done:
 
 static int mtk_ovl_do_csc(unsigned int idx, enum mtk_drm_dataspace plane_ds,
 			  enum mtk_drm_dataspace lcm_ds, bool *csc_en,
-			  u32 **csc)
+			  s32 **csc)
 {
 	enum mtk_ovl_colorspace in = OVL_SRGB, out = OVL_SRGB;
 	bool en = false;
@@ -1332,9 +1488,206 @@ mtk_ovl_map_lcm_color_mode(enum mtk_drm_color_mode cm)
 	return ds;
 }
 
+
+/* we want CT first ==> WCG ==> bri                              */
+/* for combination:                                              */
+/* (bri 4x4 matrix) x (WCG 4x4 matrix) x (CT 4x4 matrix) x (RGB) */
+void mtk_ovl_csc_combination(bool csc_en, unsigned int ocfbn, s32 *csc,
+	struct mtk_crtc_ovl_csc_config *occ, s32 *csc_final)
+{
+	unsigned int i, j;
+	long long csc_final_temp[16] = {0};
+
+	/* debug log */
+	if (csc) {
+		for (i = 0; i < 3; i++)
+			DDPDBG("WCG<%d> = <%d, %d, %d>\n", i, *(csc + i * 3 + 0),
+				*(csc + i * 3 + 1), *(csc + i * 3 + 2));
+	}
+	for (i = 0; i < 4; i++)
+		DDPDBG("brightness<%d> = <%d, %d, %d, %d>\n", i,
+			occ->setbrightness[i * 4 + 0], occ->setbrightness[i * 4 + 1],
+			occ->setbrightness[i * 4 + 2], occ->setbrightness[i * 4 + 3]);
+	for (i = 0; i < 4; i++)
+		DDPDBG("setcolortransform<%d> = <%d, %d, %d, %d>\n", i,
+			occ->setcolortransform[i * 4 + 0], occ->setcolortransform[i * 4 + 1],
+			occ->setcolortransform[i * 4 + 2], occ->setcolortransform[i * 4 + 3]);
+
+	if (csc_en && csc) {
+		/* WCG csc */
+		for (i = 0; i < 3; i++)
+			for (j = 0; j < 3; j++)
+				*(csc_final + i * 4 + j) = *(csc + i * 3 + j);
+	} else {
+		/* no WCG, set relay matrix */
+		*(csc_final + 0 * 4 + 0) = 1 << ocfbn;
+		*(csc_final + 1 * 4 + 1) = 1 << ocfbn;
+		*(csc_final + 2 * 4 + 2) = 1 << ocfbn;
+	}
+	/* for offset csc_combination */
+	*(csc_final + 15) = 1 << ocfbn;
+
+	/* debug log */
+	for (i = 0; i < 4; i++)
+		DDPDBG("csc_final_WCG<%d> = <%d, %d, %d, %d>\n", i, csc_final[i * 4 + 0],
+			csc_final[i * 4 + 1], csc_final[i * 4 + 2], csc_final[i * 4 + 3]);
+
+	if (occ) {
+		/* brightness para */
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 4; j++) {
+				csc_final_temp[i * 4 + j] =
+				(long long)(occ->setbrightness[i * 4 + 0]) *
+					(long long)*(csc_final + 0 * 4 + j) +
+				(long long)(occ->setbrightness[i * 4 + 1]) *
+					(long long)*(csc_final + 1 * 4 + j) +
+				(long long)(occ->setbrightness[i * 4 + 2]) *
+					(long long)*(csc_final + 2 * 4 + j) +
+				(long long)(occ->setbrightness[i * 4 + 3]) *
+					(long long)*(csc_final + 3 * 4 + j);
+			}
+		/* copy 4x4 back */
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 4; j++)
+				if (csc_final_temp[i * 4 + j] < 0)
+					csc_final_temp[i * 4 + j] =
+						(csc_final_temp[i * 4 + j] >> ocfbn) |
+						(0xffffffffffffffff << (64 - ocfbn));
+				else
+					csc_final_temp[i * 4 + j] =
+						csc_final_temp[i * 4 + j] >> ocfbn;
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 4; j++)
+				*(csc_final + i * 4 + j) = csc_final_temp[i * 4 + j];
+
+		/* debug log */
+		for (i = 0; i < 4; i++)
+			DDPDBG("csc_final_bri<%d> = <%d, %d, %d, %d>\n", i,
+				csc_final[i * 4 + 0], csc_final[i * 4 + 1],
+				csc_final[i * 4 + 2], csc_final[i * 4 + 3]);
+
+		/* CT para */
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 4; j++) {
+				csc_final_temp[i * 4 + j] =
+				(long long)(occ->setcolortransform[i * 4 + 0]) *
+					(long long)*(csc_final + 0 * 4 + j) +
+				(long long)(occ->setcolortransform[i * 4 + 1]) *
+					(long long)*(csc_final + 1 * 4 + j) +
+				(long long)(occ->setcolortransform[i * 4 + 2]) *
+					(long long)*(csc_final + 2 * 4 + j) +
+				(long long)(occ->setcolortransform[i * 4 + 3]) *
+					(long long)*(csc_final + 3 * 4 + j);
+			}
+		/* copy 4x4 back */
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 4; j++)
+				if (csc_final_temp[i * 4 + j] < 0)
+					csc_final_temp[i * 4 + j] =
+						(csc_final_temp[i * 4 + j] >> ocfbn) |
+						(0xffffffffffffffff << (64 - ocfbn));
+				else
+					csc_final_temp[i * 4 + j] =
+						csc_final_temp[i * 4 + j] >> ocfbn;
+		for (i = 0; i < 4; i++)
+			for (j = 0; j < 4; j++)
+				*(csc_final + i * 4 + j) = csc_final_temp[i * 4 + j];
+
+		/* debug log */
+		for (i = 0; i < 4; i++)
+			DDPDBG("csc_final_CT<%d> = <%d, %d, %d, %d>\n", i,
+				csc_final[i * 4 + 0], csc_final[i * 4 + 1],
+				csc_final[i * 4 + 2], csc_final[i * 4 + 3]);
+	}
+}
+
+void mtk_ovl_swap(int *a, int *b)
+{
+	int tmp;
+
+	tmp = *a;
+	*a = *b;
+	*b = tmp;
+}
+
+void mtk_ovl_transpose(int *matrix, int size)
+{
+	int i, j;
+
+	for (i = 0; i < size; i++)
+		for (j = 0; j < i; j++)
+			if (i != j)
+				mtk_ovl_swap(matrix + i * size + j, matrix + j * size + i);
+}
+
+void mtk_ovl_get_ovl_csc_data(struct drm_crtc *crtc,
+	struct mtk_plane_state *mtk_plane_state, int *ovl_scs_en,
+	struct mtk_crtc_ovl_csc_config *occ)
+{
+	int blob_id;
+	struct drm_property_blob *blob1 = NULL;
+	struct drm_property_blob *blob2 = NULL;
+
+	/* get brightness 4x4 by blob_id */
+	blob_id = mtk_plane_state->prop_val[PLANE_PROP_OVL_CSC_SET_BRIGHTNESS];
+	if (blob_id) {
+		blob1 = drm_property_lookup_blob(crtc->dev, blob_id);
+		if (blob1 && blob1->data && blob1->length == 64) {
+			memcpy(occ->setbrightness, blob1->data, blob1->length);
+			mtk_ovl_transpose(occ->setbrightness, 4);
+			*ovl_scs_en = 1;
+		} else {
+			DDPINFO("Cannot get ovl_csc_config: SET_BRIGHTNESS, blob: %d!\n",
+										blob_id);
+			if (blob1)
+				DDPINFO("size of blob1->data is %d\n", blob1->length);
+		}
+
+		if (blob1)
+			drm_property_blob_put(blob1);
+	}
+
+	/* get colortransform 4x4 by blob_id */
+	blob_id = mtk_plane_state->prop_val[PLANE_PROP_OVL_CSC_SET_COLORTRANSFORM];
+	if (blob_id) {
+		blob2 = drm_property_lookup_blob(crtc->dev, blob_id);
+		if (blob2 && blob2->data && blob2->length == 64) {
+			memcpy(occ->setcolortransform, blob2->data, blob2->length);
+			mtk_ovl_transpose(occ->setcolortransform, 4);
+			*ovl_scs_en = 1;
+		} else {
+			DDPINFO("Cannot get ovl_csc_config: SET_COLORTRANSFORM, blob: %d!\n",
+										blob_id);
+			if (blob2)
+				DDPINFO("size of blob2->data is %d\n", blob2->length);
+		}
+		if (blob2)
+			drm_property_blob_put(blob2);
+	}
+}
+
+static int mtk_ovl_y2r_clamp(struct mtk_ddp_comp *comp, unsigned int idx,
+			     unsigned int ext_idx, struct cmdq_pkt *handle)
+{
+	struct drm_crtc *crtc = &comp->mtk_crtc->base;
+
+	if (!(mtk_drm_dal_enable() && drm_crtc_index(crtc) == 0))
+		return 0;
+
+	if (ext_idx != LYE_NORMAL) {
+		cmdq_pkt_write(handle, comp->cmdq_base,
+		       comp->regs_pa + DISP_REG_OVL_WCG_CFG0, BIT(ext_idx),
+		       BIT(ext_idx));
+	} else {
+		cmdq_pkt_write(handle, comp->cmdq_base,
+		       comp->regs_pa + DISP_REG_OVL_WCG_CFG0, BIT(idx),
+		       BIT(idx));
+	}
+	return 0;
+}
+
 static int mtk_ovl_color_manage(struct mtk_ddp_comp *comp, unsigned int idx,
-				struct mtk_plane_state *state,
-				struct cmdq_pkt *handle)
+			struct mtk_plane_state *state, struct cmdq_pkt *handle)
 {
 	unsigned int lye_idx = 0, ext_lye_idx = 0;
 	struct mtk_plane_pending_state *pending = &state->pending;
@@ -1342,12 +1695,16 @@ static int mtk_ovl_color_manage(struct mtk_ddp_comp *comp, unsigned int idx,
 	struct mtk_drm_private *priv;
 	bool gamma_en = false, igamma_en = false, csc_en = false;
 	u32 gamma_sel = 0, igamma_sel = 0;
-	u32 *csc = NULL;
+	s32 *csc = NULL;
 	u32 wcg_mask = 0, wcg_value = 0, sel_mask = 0, sel_value = 0, reg = 0;
 	enum mtk_drm_color_mode lcm_cm;
-	enum mtk_drm_dataspace lcm_ds, plane_ds;
+	enum mtk_drm_dataspace lcm_ds = 0, plane_ds = 0;
 	struct mtk_panel_params *params;
 	int i;
+	int ovl_csc_en_cur = 0;
+	unsigned int ocfbn = 0;
+	struct mtk_crtc_ovl_csc_config occ = {0};
+	s32 csc_final[16] = {0}; /* 4x4 matrix */
 
 	if (state->comp_state.comp_id) {
 		lye_idx = state->comp_state.lye_id;
@@ -1358,54 +1715,83 @@ static int mtk_ovl_color_manage(struct mtk_ddp_comp *comp, unsigned int idx,
 	if (!crtc)
 		goto done;
 
-	priv = crtc->dev->dev_private;
-	if (!mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_OVL_WCG) ||
-	    !pending->enable)
-		goto done;
-
-	params = mtk_drm_get_lcm_ext_params(crtc);
-	if (params)
-		lcm_cm = params->lcm_color_mode;
-	else
-		lcm_cm = MTK_DRM_COLOR_MODE_NATIVE;
-
-	lcm_ds = mtk_ovl_map_lcm_color_mode(lcm_cm);
-	plane_ds =
-		(enum mtk_drm_dataspace)pending->prop_val[PLANE_PROP_DATASPACE];
-
-	DDPDBG("%s+ idx:%d ds:0x%08x->0x%08x\n", __func__, idx, plane_ds,
-	       lcm_ds);
-
-	mtk_ovl_do_transfer(idx, plane_ds, lcm_ds, &gamma_en, &igamma_en,
-			    &gamma_sel, &igamma_sel);
-	mtk_ovl_do_csc(idx, plane_ds, lcm_ds, &csc_en, &csc);
-
-done:
-
-	if (ext_lye_idx != LYE_NORMAL) {
-		SET_VAL_MASK(wcg_value, wcg_mask, igamma_en,
-			     FLD_ELn_IGAMMA_EN(ext_lye_idx - 1));
-		SET_VAL_MASK(wcg_value, wcg_mask, gamma_en,
-			     FLD_ELn_GAMMA_EN(ext_lye_idx - 1));
-		SET_VAL_MASK(wcg_value, wcg_mask, csc_en,
-			     FLD_ELn_CSC_EN(ext_lye_idx - 1));
-		SET_VAL_MASK(sel_value, sel_mask, igamma_sel,
-			     FLD_ELn_IGAMMA_SEL(ext_lye_idx - 1));
-		SET_VAL_MASK(sel_value, sel_mask, gamma_sel,
-			     FLD_ELn_GAMMA_SEL(ext_lye_idx - 1));
-	} else {
-		SET_VAL_MASK(wcg_value, wcg_mask, igamma_en,
-			     FLD_Ln_IGAMMA_EN(lye_idx));
-		SET_VAL_MASK(wcg_value, wcg_mask, gamma_en,
-			     FLD_Ln_GAMMA_EN(lye_idx));
-		SET_VAL_MASK(wcg_value, wcg_mask, csc_en,
-			     FLD_Ln_CSC_EN(lye_idx));
-		SET_VAL_MASK(sel_value, sel_mask, igamma_sel,
-			     FLD_Ln_IGAMMA_SEL(lye_idx));
-		SET_VAL_MASK(sel_value, sel_mask, gamma_sel,
-			     FLD_Ln_GAMMA_SEL(lye_idx));
+	/* init */
+	if (comp && comp->mtk_crtc) /* get ocfbn */
+		ocfbn = comp->mtk_crtc->crtc_caps.ovl_csc_bit_number;
+	if (ocfbn == 0) {
+		ocfbn = 18; /* data protect for mt6983 mt6985 */
+		DDPINFO("%s, ocfbn is 0, set to 18\n", __func__);
+	}
+	for (i = 0; i < 4; i++) { /* set matrix identity */
+		occ.setbrightness[i * 4 + i] = 1 << ocfbn;
+		occ.setcolortransform[i * 4 + i] = 1 << ocfbn;
+		csc_final[i * 4 + i] = 1 << ocfbn;
 	}
 
+	/* get brightness/layercolortransform csc */
+	mtk_ovl_get_ovl_csc_data(crtc, state, &ovl_csc_en_cur, &occ);
+
+	priv = crtc->dev->dev_private;
+	if ((mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_OVL_WCG) && /* WCG condition */
+		pending->enable) ||	/* WCG condition */
+	    ovl_csc_en_cur) {	/* ovl csc condition */
+		params = mtk_drm_get_lcm_ext_params(crtc);
+		if (params)
+			lcm_cm = params->lcm_color_mode;
+		else
+			lcm_cm = MTK_DRM_COLOR_MODE_NATIVE;
+
+		lcm_ds = mtk_ovl_map_lcm_color_mode(lcm_cm);
+		plane_ds =
+			(enum mtk_drm_dataspace)pending->prop_val[PLANE_PROP_DATASPACE];
+		DDPDBG("%s+ idx:%d ds:0x%08x->0x%08x\n", __func__, idx, plane_ds,
+		       lcm_ds);
+
+		mtk_ovl_do_transfer(idx, plane_ds, lcm_ds, &gamma_en, &igamma_en,
+				    &gamma_sel, &igamma_sel);
+
+		/* get WCG CSC */
+		if (mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_OVL_WCG) &&
+			pending->enable)
+			mtk_ovl_do_csc(idx, plane_ds, lcm_ds, &csc_en, &csc);
+	}
+	DDPDBG("%s, g, ig, gs, igs <%d><%d><%d><%d>\n",
+		__func__, gamma_en, igamma_en, gamma_sel, igamma_sel);
+
+	/* csc combination */
+	mtk_ovl_csc_combination(csc_en, ocfbn,
+		csc, &occ, csc_final);
+
+done:
+	if (csc_en || ovl_csc_en_cur) {
+		if (ext_lye_idx != LYE_NORMAL) {
+			SET_VAL_MASK(wcg_value, wcg_mask, igamma_en,
+				     FLD_ELn_IGAMMA_EN(ext_lye_idx - 1));
+			SET_VAL_MASK(wcg_value, wcg_mask, gamma_en,
+				     FLD_ELn_GAMMA_EN(ext_lye_idx - 1));
+			SET_VAL_MASK(wcg_value, wcg_mask, 1,
+				     FLD_ELn_CSC_EN(ext_lye_idx - 1));
+			SET_VAL_MASK(sel_value, sel_mask, igamma_sel,
+				     FLD_ELn_IGAMMA_SEL(ext_lye_idx - 1));
+			SET_VAL_MASK(sel_value, sel_mask, gamma_sel,
+				     FLD_ELn_GAMMA_SEL(ext_lye_idx - 1));
+		} else {
+			SET_VAL_MASK(wcg_value, wcg_mask, igamma_en,
+				     FLD_Ln_IGAMMA_EN(lye_idx));
+			SET_VAL_MASK(wcg_value, wcg_mask, gamma_en,
+				     FLD_Ln_GAMMA_EN(lye_idx));
+			SET_VAL_MASK(wcg_value, wcg_mask, 1,
+				     FLD_Ln_CSC_EN(lye_idx));
+			SET_VAL_MASK(sel_value, sel_mask, igamma_sel,
+				     FLD_Ln_IGAMMA_SEL(lye_idx));
+			SET_VAL_MASK(sel_value, sel_mask, gamma_sel,
+				     FLD_Ln_GAMMA_SEL(lye_idx));
+		}
+	}
+	DDPDBG("%s, lye_idx%d,ext_lye_idx%d,csc_en%d,ovl_csc_en%d,wcg_value0x%x,sel_value0x%x\n",
+		__func__, lye_idx, ext_lye_idx, csc_en, ovl_csc_en_cur, wcg_value, sel_value);
+
+	/* enable, gamma, igamma */
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		       comp->regs_pa + DISP_REG_OVL_WCG_CFG1, wcg_value,
 		       wcg_mask);
@@ -1413,16 +1799,30 @@ done:
 		       comp->regs_pa + DISP_REG_OVL_WCG_CFG2, sel_value,
 		       sel_mask);
 
-	if (csc_en) {
-		if (ext_lye_idx != LYE_NORMAL)
-			reg = DISP_REG_OVL_ELn_R2R_PARA(ext_lye_idx - 1);
-		else
-			reg = DISP_REG_OVL_Ln_R2R_PARA(lye_idx);
+	if (ext_lye_idx != LYE_NORMAL)
+		reg = DISP_REG_OVL_ELn_R2R_PARA(ext_lye_idx - 1);
+	else
+		reg = DISP_REG_OVL_Ln_R2R_PARA(lye_idx);
 
-		for (i = 0; i < CSC_COEF_NUM; i++)
-			cmdq_pkt_write(handle, comp->cmdq_base,
-				       comp->regs_pa + reg + 4 * i, csc[i], ~0);
-	}
+	/* 3x3 write reg */
+	for (i = 0; i < CSC_COEF_NUM; i++)
+		cmdq_pkt_write(handle, comp->cmdq_base,
+			       comp->regs_pa + reg + 4 * i, csc_final[((i / 3) * 4) + i % 3], ~0);
+
+	/* offset write reg */
+	/* offset in coda is s12.6 for u8, but value from HWC is s5.18 and normalize value */
+	for (i = 0; i < 3; i++)
+		if (csc_final[i * 4 + 3] < 0)
+			csc_final[i * 4 + 3] = csc_final[i * 4 + 3] >> 4 | 0xf0000000;
+		else
+			csc_final[i * 4 + 3] = csc_final[i * 4 + 3] >> 4;
+
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		       comp->regs_pa + reg + 4 * 12, csc_final[3], ~0);
+	cmdq_pkt_write(handle, comp->cmdq_base,
+		       comp->regs_pa + reg + 4 * 13, csc_final[7], ~0);
+	cmdq_pkt_write(handle, comp->cmdq_base,
+			   comp->regs_pa + reg + 4 * 14, csc_final[11], ~0);
 
 	return 0;
 }
@@ -1436,15 +1836,21 @@ static int mtk_ovl_yuv_matrix_convert(enum mtk_drm_dataspace plane_ds)
 	case MTK_DRM_DATASPACE_STANDARD_BT601_625_UNADJUSTED:
 	case MTK_DRM_DATASPACE_STANDARD_BT601_525:
 	case MTK_DRM_DATASPACE_STANDARD_BT601_525_UNADJUSTED:
-		ret = ((plane_ds & MTK_DRM_DATASPACE_RANGE_MASK) ==
-			MTK_DRM_DATASPACE_RANGE_FULL)
-			       ? OVL_CON_MTX_JPEG_TO_RGB
-			       : OVL_CON_MTX_BT601_TO_RGB;
+		switch (plane_ds & MTK_DRM_DATASPACE_RANGE_MASK) {
+		case MTK_DRM_DATASPACE_RANGE_UNSPECIFIED:
+		case MTK_DRM_DATASPACE_RANGE_LIMITED:
+			ret = OVL_CON_MTX_BT601_TO_RGB;
+			break;
+		default:
+			ret = OVL_CON_MTX_JPEG_TO_RGB;
+			break;
+		}
 		break;
 
 	case MTK_DRM_DATASPACE_STANDARD_BT709:
 	case MTK_DRM_DATASPACE_STANDARD_DCI_P3:
 	case MTK_DRM_DATASPACE_STANDARD_BT2020:
+	case MTK_DRM_DATASPACE_STANDARD_BT2020_CONSTANT_LUMINANCE:
 		ret = OVL_CON_MTX_BT709_TO_RGB;
 		break;
 
@@ -1613,9 +2019,28 @@ static void _ovl_common_config(struct mtk_ddp_comp *comp, unsigned int idx,
 
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, true, id);
-			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
-					aid_sel_offset, sec_bit,
-					state->pending.is_sec && pending->addr);
+			if (ovl->data->aid_per_layer_setting == true) {
+				if (state->pending.is_sec && pending->addr) {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						BIT(0), BIT(0));
+				} else {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						0, BIT(0));
+				}
+			} else {
+				if (state->pending.is_sec && pending->addr)
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						BIT(sec_bit), BIT(sec_bit));
+				else
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						0, BIT(sec_bit));
+			}
 		}
 
 		write_ext_layer_addr_cmdq(comp, handle, id, addr);
@@ -1636,13 +2061,33 @@ static void _ovl_common_config(struct mtk_ddp_comp *comp, unsigned int idx,
 
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, false, lye_idx);
-			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
-					aid_sel_offset, sec_bit,
-					state->pending.is_sec && pending->addr);
+			if (ovl->data->aid_per_layer_setting == true) {
+				if (state->pending.is_sec && pending->addr) {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						BIT(0), BIT(0));
+				} else {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						0, BIT(0));
+				}
+			} else {
+				if (state->pending.is_sec && pending->addr)
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						BIT(sec_bit), BIT(sec_bit));
+				else
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						0, BIT(sec_bit));
+			}
 		}
 
 		if (pending->mml_mode == MML_MODE_RACING) {
 			dma_addr_t sram_addr = pending->addr;
+
 			sram_addr += offset;
 			// enable
 			cmdq_pkt_write(handle, comp->cmdq_base,
@@ -1655,25 +2100,35 @@ static void _ovl_common_config(struct mtk_ddp_comp *comp, unsigned int idx,
 				comp->regs_pa + DISP_REG_OVL_SYSRAM_BUF1_ADDR(lye_idx),
 				sram_addr + MML_SRAM_SHIFT,
 				~0);
-			// setting SMI for read SRAM
-			cmdq_pkt_write(handle, comp->cmdq_base,
-				(resource_size_t)(0x14021000) + SMI_LARB_NON_SEC_CON + 4*9,
-				0x000F0000, GENMASK(19, 16));
+
+			/* setting SMI for read SRAM */
+			if (comp->larb_cons)
+				cmdq_pkt_write(handle, comp->cmdq_base, comp->larb_cons[0],
+					       GENMASK(19, 16), GENMASK(19, 16));
+			else
+				DDPPR_ERR("%s: comp %d larb_cons is null\n", __func__, comp->id);
 
 			write_phy_layer_addr_cmdq(comp, handle, lye_idx, sram_addr);
-
-			if (comp->mtk_crtc && comp->mtk_crtc->is_dual_pipe) {
-				// setting SMI for read SRAM
-				cmdq_pkt_write(handle, comp->cmdq_base,
-					(resource_size_t)(0x14421000) + SMI_LARB_NON_SEC_CON + 4*9,
-					0x000F0000, GENMASK(19, 16));
-			}
 		} else {
 			write_phy_layer_addr_cmdq(comp, handle, lye_idx, addr);
 		}
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			comp->regs_pa + DISP_REG_OVL_SRC_SIZE(lye_idx),
-			src_size, ~0);
+
+		if (ovl->data->support_pq_selfloop) {
+			if (state->comp_state.layer_caps & MTK_DISP_RSZ_LAYER)
+				_ovl_PQ_loop_set_size(comp, handle, lye_idx, src_size, 0);
+			else if ((state->comp_state.layer_caps &
+				  MTK_MML_DISP_DIRECT_DECOUPLE_LAYER) &&
+				 comp->mtk_crtc->is_force_mml_scen)
+				_ovl_PQ_loop_set_size(comp, handle, lye_idx, 0, dst_w);
+			else
+				cmdq_pkt_write(handle, comp->cmdq_base,
+					       comp->regs_pa + DISP_REG_OVL_SRC_SIZE(lye_idx),
+					       src_size, ~0);
+		} else
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				       comp->regs_pa + DISP_REG_OVL_SRC_SIZE(lye_idx), src_size,
+				       ~0);
+
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			comp->regs_pa + DISP_REG_OVL_CLIP(lye_idx), clip,
 			~0);
@@ -1696,6 +2151,26 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 	unsigned int value = 0, mask = 0, fmt_ex = 0;
 	unsigned long long temp_bw;
 	unsigned int dim_color;
+	struct drm_crtc *crtc;
+	struct mtk_crtc_state *mtk_crtc_state;
+	unsigned int frame_idx;
+	unsigned long alloc_id = state->prop_val[PLANE_PROP_BUFFER_ALLOC_ID];
+	unsigned int avg_ratio = 0;
+	struct mtk_drm_private *priv;
+	unsigned long crtc_idx;
+	int i = 0;
+
+	/* OVL comp might not attach to CRTC in layer_config(), need to check */
+	if (unlikely(!comp->mtk_crtc)) {
+		DDPPR_ERR("%s, %s has no CRTC\n", __func__, mtk_dump_comp_str(comp));
+		return;
+	}
+
+	crtc = &comp->mtk_crtc->base;
+	mtk_crtc_state = to_mtk_crtc_state(crtc->state);
+	frame_idx = mtk_crtc_state->prop_val[CRTC_PROP_OVL_DSI_SEQ];
+	priv = crtc->dev->dev_private;
+	crtc_idx = (unsigned long)drm_crtc_index(crtc);
 
 	/* handle dim layer for compression flag & color dim*/
 	if (fmt == DRM_FORMAT_C8) {
@@ -1735,9 +2210,20 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 		pending->enable = false;
 		DDPINFO("%s: DRM_FORMAT_RGB332 not support, so skip it\n", __func__);
 	}
+	if (ovl->ovl_dis == true && pending->enable == true) {
+		if (priv->data->mmsys_id == MMSYS_MT6985 &&
+			mtk_crtc_is_frame_trigger_mode(crtc))
+			pending->enable = false;
 
+		DDPPR_ERR("%s, %s, idx:%d, lye_idx:%d, ext_idx:%d, en:%d\n",
+			__func__, mtk_dump_comp_str_id(comp->id), idx, lye_idx,
+			ext_lye_idx, pending->enable);
+		ovl->ovl_dis = false;
+	}
 	if (!pending->enable)
 		mtk_ovl_layer_off(comp, lye_idx, ext_lye_idx, handle);
+	if (priv->data->mmsys_id == MMSYS_MT6835)
+		mtk_ovl_y2r_clamp(comp, lye_idx, ext_lye_idx, handle);
 
 	mtk_ovl_color_manage(comp, idx, state, handle);
 
@@ -1761,13 +2247,6 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 	if (!pending->addr)
 		con |= BIT(28);
 
-	DDPINFO("%s+ id %d, idx:%d, ext_idx:%d, enable:%d, fmt:0x%x, ",
-		__func__, comp->id, idx, ext_lye_idx, pending->enable, pending->format);
-	DDPINFO("addr 0x%lx, compr %d, con 0x%x, mml_mode %d\n",
-		(unsigned long)pending->addr,
-		(unsigned int)pending->prop_val[PLANE_PROP_COMPRESS], con,
-		pending->mml_mode);
-
 	if (rotate) {
 		unsigned int bg_w = 0, bg_h = 0;
 
@@ -1786,12 +2265,13 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 	else if (fmt == DRM_FORMAT_ABGR16161616F)
 		fmt_ex = 3;
 
-	if (pending->mml_mode == MML_MODE_RACING &&
-		(comp->id == DDP_COMPONENT_OVL0_2L ||
-		 comp->id == DDP_COMPONENT_OVL1_2L) &&
-		 comp->mtk_crtc->is_force_mml_scen) {
+	if ((pending->mml_mode == MML_MODE_RACING) && comp->mtk_crtc->is_force_mml_scen &&
+	    !ovl->data->support_pq_selfloop &&
+	    (comp->id == DDP_COMPONENT_OVL0_2L || comp->id == DDP_COMPONENT_OVL1_2L ||
+	     comp->id == DDP_COMPONENT_OVL2_2L || comp->id == DDP_COMPONENT_OVL3_2L)) {
 		con |= REG_FLD_VAL(L_CON_FLD_MTX_AUTO_DIS, 1);
 		con |= REG_FLD_VAL(L_CON_FLD_MTX_EN, 0);
+		/* if pq selfloop is supported, use Y2R inside OVL instead */
 	}
 
 	if (ext_lye_idx != LYE_NORMAL) {
@@ -1810,21 +2290,82 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			       comp->regs_pa + DISP_REG_OVL_EL0_CLR(id),
 			       dim_color, ~0);
+		/* ext layer is the same as attached phy layer */
+		if (!IS_ERR(comp->qos_req_other)) {
+			int val = (lye_idx % 2);
+
+			cmdq_pkt_write(handle, comp->cmdq_base,
+			       comp->regs_pa + DISP_REG_OVL_SMI_2ND_CFG,
+			       (val << (id + 4)), (1 << (id + 4)));
+		}
 	} else {
 		SET_VAL_MASK(value, mask, fmt_ex, FLD_Ln_CLRFMT_NB(lye_idx));
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			       comp->regs_pa + DISP_REG_OVL_CLRFMT_EXT, value,
 			       mask);
+
+		/* do not overwrite LAYER_SRC, it might be set when addon config */
+		if (ovl->data->support_pq_selfloop &&
+			((state->comp_state.layer_caps & MTK_DISP_RSZ_LAYER) ||
+			((pending->mml_mode == MML_MODE_RACING) &&
+			comp->mtk_crtc->is_force_mml_scen)))
+			mask = ~REG_FLD_MASK(L_CON_FLD_LSRC);
+		else
+			mask = ~0;
 		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DISP_REG_OVL_CON(lye_idx), con,
-			       ~0);
+			       comp->regs_pa + DISP_REG_OVL_CON(lye_idx), con, mask);
+
+		if (ovl->data->support_pq_selfloop) {
+			if (state->comp_state.layer_caps & MTK_MML_DISP_DIRECT_DECOUPLE_LAYER) {
+				if (comp->id == DDP_COMPONENT_OVL0_2L)
+					offset = mtk_crtc_state->mml_dst_roi_dual[0].y << 16 |
+						 mtk_crtc_state->mml_dst_roi_dual[0].x;
+				else if (comp->id == DDP_COMPONENT_OVL4_2L)
+					offset = mtk_crtc_state->mml_dst_roi_dual[1].y << 16 |
+						 mtk_crtc_state->mml_dst_roi_dual[1].x;
+				else
+					offset = mtk_crtc_state->mml_dst_roi.y << 16 |
+						 mtk_crtc_state->mml_dst_roi.x;
+			} else if (state->comp_state.layer_caps & MTK_DISP_RSZ_LAYER) {
+				if (comp->id == DDP_COMPONENT_OVL0_2L &&
+					comp->mtk_crtc->is_dual_pipe)
+					offset = mtk_crtc_state->rsz_dst_roi.y << 16 |
+						 mtk_crtc_state->rsz_param[0].out_x;
+				else if (comp->id == DDP_COMPONENT_OVL4_2L &&
+					comp->mtk_crtc->is_dual_pipe)
+					offset = mtk_crtc_state->rsz_dst_roi.y << 16 |
+						 mtk_crtc_state->rsz_param[1].out_x;
+				else
+					offset = mtk_crtc_state->rsz_dst_roi.y << 16 |
+						 mtk_crtc_state->rsz_dst_roi.x;
+			}
+		}
 		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DISP_REG_OVL_OFFSET(lye_idx),
-			       offset, ~0);
+			       comp->regs_pa + DISP_REG_OVL_OFFSET(lye_idx), offset, ~0);
+
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			       comp->regs_pa + DISP_REG_OVL_L0_CLR(lye_idx),
 			       dim_color, ~0);
+		/*
+		 * layer0 --> larb0, layer1 --> larb1
+		 * layer2 --> larb0, layer3 --> larb1
+		 */
+		if (!IS_ERR(comp->qos_req_other)) {
+			int val = (lye_idx % 2);
+
+			cmdq_pkt_write(handle, comp->cmdq_base,
+			       comp->regs_pa + DISP_REG_OVL_SMI_2ND_CFG,
+			       (val << lye_idx), (1 << lye_idx));
+		}
 	}
+
+	DDPINFO("%s id %s, idx:%d, lye_idx:%d, ext_idx:%d, en:%d, fmt:0x%x\n",
+		__func__, mtk_dump_comp_str_id(comp->id), idx, lye_idx, ext_lye_idx,
+		pending->enable, pending->format);
+	DDPINFO("addr 0x%lx, compr %d, con 0x%x, mask 0x%x, mml %d\n",
+		(unsigned long)pending->addr,
+		(unsigned int)pending->prop_val[PLANE_PROP_COMPRESS], con, mask,
+		pending->mml_mode);
 
 	if (pending->enable) {
 		struct drm_crtc *crtc;
@@ -1887,6 +2428,71 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 		DDPDBG("comp %d bw %llu vtotal:%d vact:%d\n",
 			comp->id, temp_bw, vtotal, vact);
 
+		if (mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_OVL_BW_MONITOR) &&
+			(crtc_idx == 0)) {
+			uint64_t key = 0;
+			int fbt_layer_id = -1;
+			unsigned long long temp_bw_old = temp_bw;
+
+			fbt_layer_id = mtk_crtc->fbt_layer_id;
+			/* if layer is fbt layer need find fbt layer ratio to cal bw */
+			if (idx == fbt_layer_id) {
+				key = frame_idx - MAX_FRAME_RATIO_NUMBER;
+				for (i = 0; i < MAX_FRAME_RATIO_NUMBER; i++) {
+					if ((key == fbt_layer_compress_ratio_tb[i].key_value) &&
+						(fbt_layer_compress_ratio_tb[i].average_ratio
+						!= 0) &&
+						(fbt_layer_compress_ratio_tb[i].average_ratio
+						<= 1000)) {
+						avg_ratio =
+						fbt_layer_compress_ratio_tb[i].average_ratio;
+						temp_bw = temp_bw * avg_ratio;
+						do_div(temp_bw, 1000);
+						break;
+					}
+				}
+			} else {
+				int have_get_ratio = 0;
+
+				key = frame_idx + alloc_id - MAX_FRAME_RATIO_NUMBER;
+				for (i = 0; i < MAX_LAYER_RATIO_NUMBER; i++) {
+					if ((alloc_id ==
+						unchanged_compress_ratio_table[i].key_value) &&
+						(unchanged_compress_ratio_table[i].average_ratio
+						!= 0) &&
+						(unchanged_compress_ratio_table[i].average_ratio
+						<= 1000)) {
+						avg_ratio =
+						unchanged_compress_ratio_table[i].average_ratio;
+						temp_bw = temp_bw * avg_ratio;
+						do_div(temp_bw, 1000);
+						have_get_ratio = 1;
+						break;
+					}
+				}
+				for (i = 0; i < MAX_FRAME_RATIO_NUMBER*MAX_LAYER_RATIO_NUMBER;
+					i++) {
+					if (have_get_ratio)
+						break;
+
+					if ((key == normal_layer_compress_ratio_tb[i].key_value) &&
+						(normal_layer_compress_ratio_tb[i].average_ratio
+						!= 0) &&
+						(normal_layer_compress_ratio_tb[i].average_ratio
+						<= 1000)) {
+						avg_ratio =
+						normal_layer_compress_ratio_tb[i].average_ratio;
+						temp_bw = temp_bw * avg_ratio;
+						do_div(temp_bw, 1000);
+						break;
+					}
+				}
+			}
+
+			DDPINFO("BWM:frame idx:%u alloc id:%lu key:%lu lye_idx:%u bw:%llu(%llu)\n",
+					frame_idx, alloc_id, key, idx, temp_bw, temp_bw_old);
+		}
+
 		if (pending->mml_mode != MML_MODE_RACING) {
 #ifdef IF_ZERO
 			if (pending->prop_val[PLANE_PROP_COMPRESS])
@@ -1895,7 +2501,13 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 				comp->qos_bw += temp_bw;
 #else
 			/* so far only report one qos BW, no need to separate FBDC or normal BW */
-			comp->qos_bw += temp_bw;
+			if (!IS_ERR(comp->qos_req_other)) {
+				if (lye_idx % 2)
+					comp->qos_bw_other += temp_bw;
+				else
+					comp->qos_bw += temp_bw;
+			} else
+				comp->qos_bw += temp_bw;
 #endif
 		}
 	}
@@ -2076,9 +2688,28 @@ static bool compr_l_config_PVRIC_V3_1(struct mtk_ddp_comp *comp,
 
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, true, id);
-			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
-					aid_sel_offset, sec_bit,
-					state->pending.is_sec && pending->addr);
+			if (ovl->data->aid_per_layer_setting == true) {
+				if (state->pending.is_sec && pending->addr) {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						BIT(0), BIT(0));
+				} else {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						0, BIT(0));
+				}
+			} else {
+				if (state->pending.is_sec && pending->addr)
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						BIT(sec_bit), BIT(sec_bit));
+				else
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						0, BIT(sec_bit));
+			}
 		}
 
 		write_ext_layer_addr_cmdq(comp, handle, id, lx_addr);
@@ -2103,9 +2734,28 @@ static bool compr_l_config_PVRIC_V3_1(struct mtk_ddp_comp *comp,
 	} else {
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, false, lye_idx);
-			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
-					aid_sel_offset, sec_bit,
-					state->pending.is_sec && pending->addr);
+			if (ovl->data->aid_per_layer_setting == true) {
+				if (state->pending.is_sec && pending->addr) {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						BIT(0), BIT(0));
+				} else {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						0, BIT(0));
+				}
+			} else {
+				if (state->pending.is_sec && pending->addr)
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						BIT(sec_bit), BIT(sec_bit));
+				else
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						0, BIT(sec_bit));
+			}
 		}
 
 		write_phy_layer_addr_cmdq(comp, handle, lye_idx, lx_addr);
@@ -2129,16 +2779,14 @@ static bool compr_l_config_PVRIC_V3_1(struct mtk_ddp_comp *comp,
 	return 0;
 }
 
-static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
+bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 			unsigned int idx, struct mtk_plane_state *state,
 			struct cmdq_pkt *handle)
 {
 	/* input config */
 	struct mtk_plane_pending_state *pending = &state->pending;
-	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
-	struct drm_crtc *crtc = &mtk_crtc->base;
-	int crtc_idx = drm_crtc_index(crtc);
 	dma_addr_t addr = pending->addr;
+	bool enable = pending->enable;
 	unsigned int pitch = pending->pitch & 0xffff;
 	unsigned int vpitch = (unsigned int)pending->prop_val[PLANE_PROP_VPITCH];
 	unsigned int src_x = pending->src_x, src_y = pending->src_y;
@@ -2164,7 +2812,6 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 	unsigned int src_buf_tile_num = 0;
 	unsigned int buf_size = 0;
 	unsigned int buf_total_size = 0;
-
 
 	/* variable to config into register */
 	unsigned int lx_fbdc_en;
@@ -2221,19 +2868,9 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 		comp->regs_pa + DISP_REG_OVL_SYSRAM_BUF1_ADDR(lye_idx),
 		0, ~0);
 
-	if (crtc_idx == 0 &&
-		(comp->id == DDP_COMPONENT_OVL0_2L || comp->id == DDP_COMPONENT_OVL1_2L)) {
-		// setting SMI for read SRAM
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			(resource_size_t)(0x14021000) + SMI_LARB_NON_SEC_CON + 4*9,
-			0x00000000, GENMASK(19, 16));
-		if (comp->mtk_crtc && comp->mtk_crtc->is_dual_pipe) {
-			// setting SMI for read SRAM
-			cmdq_pkt_write(handle, comp->cmdq_base,
-				(resource_size_t)(0x14421000) + SMI_LARB_NON_SEC_CON + 4*9,
-				0x00000000, GENMASK(19, 16));
-		}
-	}
+	/* setting SMI for read DRAM */
+	if (comp->larb_cons)
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->larb_cons[0], 0, GENMASK(19, 16));
 
 	/* if no compress, do common config and return */
 	if (compress == 0 || (pending->mml_mode == MML_MODE_RACING)) {
@@ -2242,6 +2879,10 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 	}
 
 	/* 2. pre-calculation */
+	if (Bpp == 0) {
+		DDPPR_ERR("%s fail, no Bpp info\n", __func__);
+		return 0;
+	}
 	src_buf_tile_num = ALIGN_TO(pitch / Bpp, tile_w) *
 	    ALIGN_TO(vpitch, tile_h);
 	src_buf_tile_num /= (tile_w * tile_h);
@@ -2282,7 +2923,7 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 	}
 
 	/* 3. cal OVL_LX_ADDR * OVL_LX_PITCH */
-	lx_addr = buf_addr + tile_offset * tile_body_size;
+	lx_addr = buf_addr + (dma_addr_t) tile_offset * (dma_addr_t) tile_body_size;
 	lx_pitch = ((pitch * tile_h) & 0xFFFF);
 	lx_pitch_msb = (REG_FLD_VAL((L_PITCH_MSB_FLD_YUV_TRANS), (1)) |
 		REG_FLD_VAL((L_PITCH_MSB_FLD_2ND_SUBBUF), (lx_2nd_subbuf)) |
@@ -2349,8 +2990,28 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, true, id);
-			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
-					aid_sel_offset, sec_bit, state->pending.is_sec);
+			if (ovl->data->aid_per_layer_setting == true) {
+				if (state->pending.is_sec && pending->addr) {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						BIT(0), BIT(0));
+				} else {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						0, BIT(0));
+				}
+			} else {
+				if (state->pending.is_sec && pending->addr)
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						BIT(sec_bit), BIT(sec_bit));
+				else
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						0, BIT(sec_bit));
+			}
 		}
 
 		write_ext_layer_addr_cmdq(comp, handle, id, lx_addr);
@@ -2373,8 +3034,28 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 	} else {
 		if (mmsys_reg && aid_sel_offset) {
 			sec_bit = mtk_ovl_aid_bit(comp, false, lye_idx);
-			mtk_ovl_aid_config(ovl, comp, handle, mmsys_reg,
-					aid_sel_offset, sec_bit, state->pending.is_sec);
+			if (ovl->data->aid_per_layer_setting == true) {
+				if (state->pending.is_sec && pending->addr) {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						BIT(0), BIT(0));
+				} else {
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						(mmsys_reg + aid_sel_offset
+						+ MT6985_OVL_LAYER_OFFEST * sec_bit),
+						0, BIT(0));
+				}
+			} else {
+				if (state->pending.is_sec && pending->addr)
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						BIT(sec_bit), BIT(sec_bit));
+				else
+					cmdq_pkt_write(handle, comp->cmdq_base,
+						mmsys_reg + aid_sel_offset,
+						0, BIT(sec_bit));
+			}
 		}
 
 		write_phy_layer_addr_cmdq(comp, handle, lye_idx, lx_addr);
@@ -2386,9 +3067,21 @@ static bool compr_l_config_AFBC_V1_2(struct mtk_ddp_comp *comp,
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			comp->regs_pa + DISP_REG_OVL_PITCH(lye_idx),
 			lx_pitch, 0xffff);
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			comp->regs_pa + DISP_REG_OVL_SRC_SIZE(lye_idx),
-			lx_src_size, ~0);
+
+		if (ovl->data->support_pq_selfloop &&
+		    state->comp_state.layer_caps & MTK_DISP_RSZ_LAYER)
+			_ovl_PQ_loop_set_size(comp, handle, lye_idx, lx_src_size, 0);
+		else
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				       comp->regs_pa + DISP_REG_OVL_SRC_SIZE(lye_idx), lx_src_size,
+				       ~0);
+
+		if (ovl->ovl_dis == false && enable == 1 && compress == 1 &&
+			((lx_src_size&0xffff) * (lx_src_size>>16) == 0)) {
+			DDPPR_ERR("%s, %s, idx=%d, en=%d, size:0x%08x\n", __func__,
+				mtk_dump_comp_str_id(comp->id), lye_idx, enable, lx_src_size);
+			ovl->ovl_dis = true;
+		}
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			comp->regs_pa + DISP_REG_OVL_CLIP(lye_idx),
 			lx_clip, ~0);
@@ -2415,6 +3108,7 @@ static int _ovl_UFOd_in(struct mtk_ddp_comp *comp, int connect,
 
 	SET_VAL_MASK(value, mask, 2, L_CON_FLD_LSRC);
 	SET_VAL_MASK(value, mask, 0, L_CON_FLD_AEN);
+
 	cmdq_pkt_write(handle, comp->cmdq_base,
 		       comp->regs_pa + DISP_REG_OVL_LC_CON, value, mask);
 	cmdq_pkt_write(handle, comp->cmdq_base,
@@ -2425,6 +3119,94 @@ static int _ovl_UFOd_in(struct mtk_ddp_comp *comp, int connect,
 	return 0;
 }
 
+static void _ovl_PQ_out(struct mtk_ddp_comp *comp, const bool connect, struct cmdq_pkt *handle,
+				bool y2r)
+{
+	u32 value = 0, mask = 0;
+
+	/* TODO: how to get OVL?_2L L? */
+	if (connect) {
+		SET_VAL_MASK(value, mask, 0, DATAPATH_PQ_OUT_SEL); /* from RDMA0 */
+		SET_VAL_MASK(value, mask, 1, DISP_OVL_PQ_OUT_EN);
+		if (y2r)
+			SET_VAL_MASK(value, mask, 1, DISP_OVL_PQ_OUT_OPT);
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_DATAPATH_CON,
+			       value, mask);
+	} else {
+		SET_VAL_MASK(value, mask, 0, DISP_OVL_PQ_OUT_EN);
+		SET_VAL_MASK(value, mask, 0, DISP_OVL_PQ_OUT_OPT);
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_DATAPATH_CON,
+			       value, mask);
+	}
+}
+
+static void _ovl_PQ_in(struct mtk_ddp_comp *comp, const bool connect, struct cmdq_pkt *handle)
+{
+	u32 value = 0, mask = 0;
+
+	/* TODO: how to get OVL?_2L */
+	if (connect) {
+		SET_VAL_MASK(value, mask, 3, L_CON_FLD_LSRC);
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_CON(0), value,
+			       mask);
+	} else {
+		SET_VAL_MASK(value, mask, 0, L_CON_FLD_LSRC);
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_CON(0), value,
+			       mask);
+	}
+}
+
+static void _ovl_PQ_loop_set_size(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
+				  const u32 layer, const u32 _src, const u32 clip_w)
+{
+	struct mtk_crtc_state *mtk_crtc_state = to_mtk_crtc_state(comp->mtk_crtc->base.state);
+	u32 src, dst;
+
+	if (_src > 0) {
+		if (comp->id == DDP_COMPONENT_OVL0_2L && comp->mtk_crtc->is_dual_pipe) {
+			src = _src;
+			dst = mtk_crtc_state->rsz_dst_roi.height << 16 |
+				  mtk_crtc_state->rsz_param[0].out_len;
+		} else if (comp->id == DDP_COMPONENT_OVL4_2L && comp->mtk_crtc->is_dual_pipe) {
+			src = _src;
+			dst = mtk_crtc_state->rsz_dst_roi.height << 16 |
+				  mtk_crtc_state->rsz_param[1].out_len;
+		} else {
+			src = _src;
+			dst = mtk_crtc_state->rsz_dst_roi.height << 16 |
+				  mtk_crtc_state->rsz_dst_roi.width;
+		}
+	} else {
+		if (clip_w)
+			src = mtk_crtc_state->mml_src_roi[0].height << 16 | clip_w;
+		else
+			src = mtk_crtc_state->mml_src_roi[0].height << 16 |
+			      mtk_crtc_state->mml_src_roi[0].width;
+		dst = mtk_crtc_state->mml_dst_roi.height << 16
+			| mtk_crtc_state->mml_dst_roi.width;
+
+		if (comp->mtk_crtc->is_force_mml_scen) {
+			if (comp->id == DDP_COMPONENT_OVL0_2L) {
+				dst = mtk_crtc_state->mml_dst_roi_dual[0].height << 16
+					| mtk_crtc_state->mml_dst_roi_dual[0].width;
+			} else if (comp->id == DDP_COMPONENT_OVL4_2L) {
+				dst = mtk_crtc_state->mml_dst_roi_dual[1].height << 16
+					| mtk_crtc_state->mml_dst_roi_dual[1].width;
+				if (clip_w)
+					src = mtk_crtc_state->mml_src_roi[1].height << 16 |
+						clip_w;
+				else
+					src = mtk_crtc_state->mml_src_roi[1].height << 16 |
+						mtk_crtc_state->mml_src_roi[1].width;
+			}
+		}
+	}
+
+	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_PQ_OUT_SIZE, src, ~0);
+	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_SRC_SIZE(layer), dst,
+		       ~0);
+}
+
 static void
 mtk_ovl_addon_rsz_config(struct mtk_ddp_comp *comp, enum mtk_ddp_comp_id prev,
 			 enum mtk_ddp_comp_id next, struct mtk_rect rsz_src_roi,
@@ -2432,7 +3214,8 @@ mtk_ovl_addon_rsz_config(struct mtk_ddp_comp *comp, enum mtk_ddp_comp_id prev,
 {
 	if (prev == DDP_COMPONENT_RSZ0 ||
 		prev == DDP_COMPONENT_RSZ1 ||
-		prev == DDP_COMPONENT_Y2R0) {
+		prev == DDP_COMPONENT_Y2R0 ||
+		prev == DDP_COMPONENT_Y2R1) {
 		int lc_x = rsz_dst_roi.x, lc_y = rsz_dst_roi.y;
 		int lc_w = rsz_dst_roi.width, lc_h = rsz_dst_roi.height;
 
@@ -2457,7 +3240,9 @@ mtk_ovl_addon_rsz_config(struct mtk_ddp_comp *comp, enum mtk_ddp_comp_id prev,
 
 	if (prev == DDP_COMPONENT_OVL0 || prev == DDP_COMPONENT_OVL0_2L ||
 		prev == DDP_COMPONENT_OVL1 || prev == DDP_COMPONENT_OVL1_2L ||
-		prev == DDP_COMPONENT_OVL2_2L || prev == DDP_COMPONENT_OVL3_2L)
+		prev == DDP_COMPONENT_OVL2_2L || prev == DDP_COMPONENT_OVL3_2L ||
+		prev == DDP_COMPONENT_OVL4_2L || prev == DDP_COMPONENT_OVL5_2L ||
+		prev == DDP_COMPONENT_OVL6_2L)
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			       comp->regs_pa + DISP_REG_OVL_DATAPATH_CON,
 			       DISP_OVL_BGCLR_IN_SEL, DISP_OVL_BGCLR_IN_SEL);
@@ -2472,6 +3257,35 @@ mtk_ovl_addon_rsz_config(struct mtk_ddp_comp *comp, enum mtk_ddp_comp_id prev,
 			       rsz_src_roi.height << 16 | rsz_src_roi.width,
 			       ~0);
 		_store_bg_roi(comp, rsz_src_roi.height, rsz_src_roi.width);
+	}
+}
+
+static void _mtk_ovl_embed_config(struct mtk_ddp_comp *comp, enum mtk_ddp_comp_id prev,
+				  enum mtk_ddp_comp_id next, struct mtk_rect src,
+				  struct mtk_rect dst, struct cmdq_pkt *handle)
+{
+	if ((prev == DDP_COMPONENT_OVLSYS_RSZ1 && next == DDP_COMPONENT_OVLSYS_RSZ1) ||
+	    (prev == DDP_COMPONENT_OVLSYS_RSZ2 && next == DDP_COMPONENT_OVLSYS_RSZ2)) {
+		_ovl_PQ_out(comp, 1, handle, true);
+		_ovl_PQ_in(comp, 1, handle);
+
+		/* Need to check pq out size */
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_PQ_LOOP_CON, 1,
+			       DISP_OVL_PQ_OUT_SIZE_SEL);
+	} else if ((prev == DDP_COMPONENT_OVLSYS_Y2R0 && next == DDP_COMPONENT_OVLSYS_DLO_ASYNC0) ||
+		  (prev == DDP_COMPONENT_OVLSYS_Y2R2 && next == DDP_COMPONENT_OVLSYS_DLO_ASYNC7)) {
+		_ovl_PQ_out(comp, 1, handle, false);
+		_ovl_PQ_in(comp, 1, handle);
+
+		/* Need to check pq out size */
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_PQ_LOOP_CON, 1,
+			       DISP_OVL_PQ_OUT_SIZE_SEL);
+	} else {
+		_ovl_PQ_out(comp, 0, handle, false);
+		_ovl_PQ_in(comp, 0, handle);
+
+		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DISP_REG_OVL_PQ_LOOP_CON, 0,
+			       DISP_OVL_PQ_OUT_SIZE_SEL);
 	}
 }
 
@@ -2495,31 +3309,99 @@ static void mtk_ovl_addon_config(struct mtk_ddp_comp *comp,
 					 config->rsz_dst_roi, handle);
 	}
 
-	if (addon_config->config_type.module == DISP_INLINE_ROTATE &&
+	if ((addon_config->config_type.module == DISP_MML_IR_PQ ||
+		addon_config->config_type.module == DISP_MML_IR_PQ_1 ||
+		addon_config->config_type.module == DISP_MML_IR_PQ_v3) &&
 		(addon_config->config_type.type == ADDON_CONNECT ||
 		addon_config->config_type.type == ADDON_DISCONNECT)) {
-		struct mtk_addon_mml_config *config =
-			&addon_config->addon_mml_config;
+		struct mtk_addon_mml_config *config = &addon_config->addon_mml_config;
+		struct mtk_rect src, dst;
+
+		src = config->mml_src_roi[config->pipe];
+		dst = config->mml_dst_roi[config->pipe];
 
 		/* this rsz means enlarge/narrow, not component */
-		mtk_ovl_addon_rsz_config(comp, prev, next, config->mml_src_roi,
-			config->mml_dst_roi, handle);
+		mtk_ovl_addon_rsz_config(comp, prev, next, src, dst, handle);
+	}
+
+	if ((addon_config->config_type.module == OVL_RSZ ||
+	     addon_config->config_type.module == OVL_RSZ_1) &&
+	    addon_config->config_type.type == ADDON_EMBED) {
+		struct mtk_addon_rsz_config *config = &addon_config->addon_rsz_config;
+
+		_mtk_ovl_embed_config(comp, prev, next,
+				      config->rsz_src_roi, config->rsz_dst_roi, handle);
+	}
+
+	if ((addon_config->config_type.module == DISP_MML_IR_PQ_v2 ||
+		addon_config->config_type.module == DISP_MML_IR_PQ_v2_1) &&
+		(addon_config->config_type.type == ADDON_CONNECT ||
+		addon_config->config_type.type == ADDON_DISCONNECT)) {
+		//addon_config->config_type.type == ADDON_EMBED) {
+		struct mtk_addon_mml_config *config = &addon_config->addon_mml_config;
+		struct mtk_rect src, dst;
+
+		src = config->mml_src_roi[config->pipe];
+		dst = config->mml_dst_roi[config->pipe];
+		_mtk_ovl_embed_config(comp, prev, next, src, dst, handle);
 	}
 }
 
-static void mtk_ovl_connect(struct mtk_ddp_comp *comp,
+static void mtk_ovl_config_begin(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
+{
+	unsigned int crtc_idx;
+	enum addon_scenario scn;
+	struct mtk_disp_ovl *ovl = comp_to_ovl(comp);
+	struct mtk_crtc_state *mtk_crtc_state = NULL;
+
+	if (!comp->mtk_crtc)
+		return;
+
+	crtc_idx = comp->mtk_crtc->base.index;
+	if (crtc_idx != 0)
+		return;
+
+	mtk_crtc_state = to_mtk_crtc_state(comp->mtk_crtc->base.state);
+	scn = mtk_crtc_state->lye_state.scn[crtc_idx];
+
+	/* restore registers for none scn to avoid abnormal */
+	if (scn == NONE) {
+		if (ovl->data->support_pq_selfloop) {
+			_ovl_PQ_out(comp, 0, handle, false);
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				       comp->regs_pa + DISP_REG_OVL_PQ_LOOP_CON, 0,
+				       DISP_OVL_PQ_OUT_SIZE_SEL);
+		}
+	}
+}
+
+static void mtk_ovl_connect(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 			    enum mtk_ddp_comp_id prev,
 			    enum mtk_ddp_comp_id next)
 {
 	if (prev == DDP_COMPONENT_OVL0 || prev == DDP_COMPONENT_OVL0_2L ||
 		prev == DDP_COMPONENT_OVL1 || prev == DDP_COMPONENT_OVL1_2L ||
-		prev == DDP_COMPONENT_OVL2_2L || prev == DDP_COMPONENT_OVL3_2L)
-		mtk_ddp_cpu_mask_write(comp, DISP_REG_OVL_DATAPATH_CON,
+		prev == DDP_COMPONENT_OVL2_2L || prev == DDP_COMPONENT_OVL3_2L ||
+		prev == DDP_COMPONENT_OVL4_2L || prev == DDP_COMPONENT_OVL5_2L ||
+		prev == DDP_COMPONENT_OVL6_2L) {
+		if (handle == NULL)
+			mtk_ddp_cpu_mask_write(comp, DISP_REG_OVL_DATAPATH_CON,
 				       DISP_OVL_BGCLR_IN_SEL,
 				       DISP_OVL_BGCLR_IN_SEL);
-	else
-		mtk_ddp_cpu_mask_write(comp, DISP_REG_OVL_DATAPATH_CON,
-				       DISP_OVL_BGCLR_IN_SEL, 0);
+		else
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				       comp->regs_pa + DISP_REG_OVL_DATAPATH_CON,
+				       DISP_OVL_BGCLR_IN_SEL,
+				       DISP_OVL_BGCLR_IN_SEL);
+	} else {
+		if (handle == NULL)
+			mtk_ddp_cpu_mask_write(comp, DISP_REG_OVL_DATAPATH_CON,
+				       0, DISP_OVL_BGCLR_IN_SEL);
+		else
+			cmdq_pkt_write(handle, comp->cmdq_base,
+				       comp->regs_pa + DISP_REG_OVL_DATAPATH_CON,
+				       0, DISP_OVL_BGCLR_IN_SEL);
+	}
 }
 
 void mtk_ovl_cal_golden_setting(struct mtk_ddp_config *cfg,
@@ -2662,37 +3544,6 @@ static int mtk_ovl_golden_setting(struct mtk_ddp_comp *comp,
 	return 0;
 }
 
-static void mtk_ovl_all_layer_off(struct mtk_ddp_comp *comp,
-	struct cmdq_pkt *handle, int keep_first_layer)
-{
-	int i;
-	unsigned int phy_layer0_on = 0;
-
-	/* In 6779 we need to set DISP_OVL_FORCE_RELAY_MODE */
-
-	/* To make sure the OVL_SRC_CON register keep the same value
-	 * as readl while writing the new value in GCE. This function should
-	 * only used in driver probe.
-	 */
-	if (keep_first_layer)
-		phy_layer0_on = readl(comp->regs + DISP_REG_OVL_SRC_CON) & 0x1;
-	if (phy_layer0_on)
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DISP_REG_OVL_SRC_CON, 0x1, ~0);
-	else
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DISP_REG_OVL_SRC_CON,
-			       DISP_OVL_FORCE_RELAY_MODE, ~0);
-
-	cmdq_pkt_write(handle, comp->cmdq_base,
-		       comp->regs_pa + DISP_REG_OVL_DATAPATH_EXT_CON, 0, ~0);
-
-	for (i = phy_layer0_on ? 1 : 0; i < OVL_PHY_LAYER_NR; i++)
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DISP_REG_OVL_RDMA_CTRL(i), 0,
-			       ~0);
-}
-
 static dma_addr_t read_phy_layer_addr(struct mtk_ddp_comp *comp, int id)
 {
 	struct mtk_disp_ovl *ovl = comp_to_ovl(comp);
@@ -2805,7 +3656,7 @@ static void mtk_ovl_backup_info_cmp(struct mtk_ddp_comp *comp, bool *compare)
 		cur_info[i].layer = i;
 		cur_info[i].layer_en = src_on & (0x1 << i);
 		if (!cur_info[i].layer_en) {
-			DDPMSG("%s:layer%d,en %d,size 0x%x,addr 0x%lx\n",
+			DDPDBG("%s:layer%d,en %d,size 0x%x,addr 0x%lx\n",
 			       __func__, i, cur_info[i].layer_en,
 			       cur_info[i].src_size, (unsigned long)cur_info[i].addr);
 			continue;
@@ -2824,7 +3675,7 @@ static void mtk_ovl_backup_info_cmp(struct mtk_ddp_comp *comp, bool *compare)
 		cur_info[i].data_path_con =
 			readl(DISP_REG_OVL_DATAPATH_CON + Lx_base);
 
-		DDPMSG("%s:layer%d,en %d,size 0x%x, addr 0x%lx\n", __func__, i,
+		DDPDBG("%s:layer%d,en %d,size 0x%x, addr 0x%lx\n", __func__, i,
 		       cur_info[i].layer_en, cur_info[i].src_size,
 		       (unsigned long)cur_info[i].addr);
 		if (memcmp(&cur_info[i], &ovl->backup_info[i],
@@ -2839,9 +3690,15 @@ static int mtk_ovl_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 			  enum mtk_ddp_io_cmd io_cmd, void *params)
 {
 	int ret = 0;
-	struct mtk_drm_private *priv =
-		comp->mtk_crtc->base.dev->dev_private;
+	struct mtk_drm_private *priv;
 
+	if (!(comp->mtk_crtc && comp->mtk_crtc->base.dev)) {
+		DDPINFO("%s %s %u has invalid CRTC or device\n",
+				__func__, mtk_dump_comp_str(comp), io_cmd);
+		return -INVALID_TYPE;
+	}
+
+	priv = comp->mtk_crtc->base.dev->dev_private;
 	switch (io_cmd) {
 	case MTK_IO_CMD_OVL_GOLDEN_SETTING: {
 		struct mtk_ddp_config *cfg;
@@ -2877,8 +3734,14 @@ static int mtk_ovl_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 	}
 	case IRQ_LEVEL_NORMAL: {
 		unsigned int inten;
+		struct mtk_drm_private *priv = comp->mtk_crtc->base.dev->dev_private;
 
-		inten = REG_FLD_VAL(INTEN_FLD_FME_UND_INTEN, 1);
+		if (priv->data->mmsys_id == MMSYS_MT6985)
+			inten = REG_FLD_VAL(INTEN_FLD_FME_UND_INTEN, 1) |
+					REG_FLD_VAL(INTEN_FLD_FME_CPL_INTEN, 1) |
+					REG_FLD_VAL(INIEN_ROI_TIMING_0, 1);
+		else
+			inten = REG_FLD_VAL(INTEN_FLD_FME_UND_INTEN, 1);
 		cmdq_pkt_write(handle, comp->cmdq_base,
 			       comp->regs_pa + DISP_REG_OVL_INTSTA, 0,
 			       ~0);
@@ -2938,6 +3801,8 @@ static int mtk_ovl_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 			break;
 
 		__mtk_disp_set_module_hrt(comp->hrt_qos_req, bw_val);
+		if (!IS_ERR(comp->hrt_qos_req_other))
+			__mtk_disp_set_module_hrt(comp->hrt_qos_req_other, bw_val);
 
 		ret = OVL_REQ_HRT;
 		break;
@@ -2959,14 +3824,23 @@ static int mtk_ovl_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 		//			    DISP_BW_FBDC_MODE);
 
 		/* process normal */
-		if (comp->last_qos_bw == comp->qos_bw)
-			break;
+		if (comp->last_qos_bw == comp->qos_bw) {
+			if (IS_ERR(comp->qos_req_other) ||
+			    (comp->last_qos_bw_other == comp->qos_bw_other))
+				break;
+			goto other;
+		}
 		__mtk_disp_set_module_bw(comp->qos_req, comp->id, comp->qos_bw,
 					    DISP_BW_NORMAL_MODE);
 		comp->last_qos_bw = comp->qos_bw;
-
-		DDPDBG("update ovl fbdc_bw to %u, qos bw to %u\n",
-			comp->fbdc_bw, comp->qos_bw);
+other:
+		if (!IS_ERR(comp->qos_req_other)) {
+			__mtk_disp_set_module_bw(comp->qos_req_other, comp->id, comp->qos_bw_other,
+					    DISP_BW_NORMAL_MODE);
+			comp->last_qos_bw_other = comp->qos_bw_other;
+		}
+		DDPINFO("update ovl fbdc_bw to %u, qos bw to %u, %u\n",
+			comp->fbdc_bw, comp->qos_bw, comp->qos_bw_other);
 		break;
 	}
 	case OVL_REPLACE_BOOTUP_MVA: {
@@ -2992,8 +3866,20 @@ static int mtk_ovl_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 	case OVL_GET_SOURCE_BPC: {
 		struct mtk_disp_ovl *ovl = comp_to_ovl(comp);
 
-		DDPINFO("%s, source_bpc[%d]\n", __func__, ovl->data->source_bpc);
-		return ovl->data->source_bpc;
+		if (ovl && ovl->data) {
+			DDPINFO("%s, source_bpc[%d]\n", __func__, ovl->data->source_bpc);
+			return ovl->data->source_bpc;
+		}
+		break;
+	}
+	case OVL_GET_SELFLOOP_SUPPORT: {
+		struct mtk_disp_ovl *ovl = comp_to_ovl(comp);
+
+		if (ovl && ovl->data) {
+			DDPINFO("%s, support_pq_selfloop[%d]\n", __func__,
+				ovl->data->support_pq_selfloop);
+			return ovl->data->support_pq_selfloop;
+		}
 		break;
 	}
 	default:
@@ -3157,6 +4043,11 @@ int mtk_ovl_dump(struct mtk_ddp_comp *comp)
 	void __iomem *baddr = comp->regs;
 	int i;
 
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return 0;
+	}
+
 	if (comp->blank_mode)
 		return 0;
 
@@ -3184,6 +4075,8 @@ int mtk_ovl_dump(struct mtk_ddp_comp *comp)
 			mtk_cust_dump_reg(baddr, 0xFBC, 0xFCC, 0xFDC, -1);
 		}
 	} else {
+		DDPDUMP("0x8f0:0x%x\n", readl(DISP_REG_OVL_SMI_2ND_CFG + baddr));
+		DDPDUMP("0x740:0x%x\n", readl(OVL_ROI_TIMING_0 + baddr));
 		/* STA, INTEN, INTSTA, EN*/
 		mtk_serial_dump_reg(baddr, 0x0, 4);
 
@@ -3209,7 +4102,10 @@ int mtk_ovl_dump(struct mtk_ddp_comp *comp)
 		}
 
 		mtk_serial_dump_reg(baddr, 0x200, 4);
+		/* debug monitor */
 		mtk_serial_dump_reg(baddr, 0x230, 4);
+		mtk_serial_dump_reg(baddr, 0x240, 4);
+		mtk_serial_dump_reg(baddr, 0x250, 4);
 		/* LC_CON */
 		mtk_serial_dump_reg(baddr, 0x280, 4);
 
@@ -3252,6 +4148,16 @@ int mtk_ovl_dump(struct mtk_ddp_comp *comp)
 		mtk_serial_dump_reg(baddr, 0x890, 4);
 		mtk_serial_dump_reg(baddr, 0x8a0, 4);
 		mtk_serial_dump_reg(baddr, 0x8b0, 4);
+		mtk_serial_dump_reg(baddr, 0x900, 4);
+		mtk_serial_dump_reg(baddr, 0x910, 4);
+		mtk_serial_dump_reg(baddr, 0x920, 4);
+		mtk_serial_dump_reg(baddr, 0x930, 4);
+
+		/* BW Monitor */
+		mtk_serial_dump_reg(baddr, 0x940, 4);
+		mtk_serial_dump_reg(baddr, 0x950, 4);
+		mtk_serial_dump_reg(baddr, 0x960, 4);
+		mtk_serial_dump_reg(baddr, 0x970, 4);
 
 		for (i = 0; i < 4; i++)
 			mtk_serial_dump_reg(baddr, 0xF44 + i * 0x20, 2);
@@ -3383,6 +4289,7 @@ static void ovl_dump_layer_info(struct mtk_ddp_comp *comp, int layer,
 	void __iomem *baddr = comp->regs;
 	void __iomem *Lx_base;
 	dma_addr_t addr;
+	static const char * const pixel_src[] = { "mem", "color", "ufod", "pq" };
 
 	if (is_ext_layer) {
 		Lx_base = baddr + layer * OVL_LAYER_OFFSET;
@@ -3412,8 +4319,7 @@ static void ovl_dump_layer_info(struct mtk_ddp_comp *comp, int layer,
 	DDPDUMP("pitch=%u,addr=0x%lx,source=%s,aen=%u,alpha=%u,cl=0x%x\n",
 		pitch & 0xffff,
 		(unsigned long)addr, /* unified_color_fmt_name(fmt),*/
-		(REG_FLD_VAL_GET(L_CON_FLD_LSRC, con) == 0) ? "mem"
-							    : "constant_color",
+		pixel_src[REG_FLD_VAL_GET(L_CON_FLD_LSRC, con)],
 		REG_FLD_VAL_GET(L_CON_FLD_AEN, con),
 		REG_FLD_VAL_GET(L_CON_FLD_APHA, con),
 		clip);
@@ -3434,6 +4340,13 @@ int mtk_ovl_analysis(struct mtk_ddp_comp *comp)
 	unsigned int src_con;
 	unsigned int ext_con;
 	unsigned int addcon;
+	unsigned int path_con;
+	unsigned int pq_out_size;
+
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return 0;
+	}
 
 	if (comp->blank_mode)
 		return 0;
@@ -3441,6 +4354,8 @@ int mtk_ovl_analysis(struct mtk_ddp_comp *comp)
 	src_con = readl(DISP_REG_OVL_SRC_CON + baddr);
 	ext_con = readl(DISP_REG_OVL_DATAPATH_EXT_CON + baddr);
 	addcon = readl(DISP_REG_OVL_ADDCON_DBG + baddr);
+	path_con = readl(DISP_REG_OVL_DATAPATH_CON + baddr);
+	pq_out_size = readl(DISP_REG_OVL_PQ_OUT_SIZE + baddr);
 
 	DDPDUMP("== %s ANALYSIS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
 	DDPDUMP("ovl_en=%d,layer_en(%d,%d,%d,%d),bg(%dx%d)\n",
@@ -3460,11 +4375,19 @@ int mtk_ovl_analysis(struct mtk_ddp_comp *comp)
 		REG_FLD_VAL_GET(ADDCON_DBG_FLD_L1_WIN_HIT, addcon),
 		REG_FLD_VAL_GET(ADDCON_DBG_FLD_L2_WIN_HIT, addcon),
 		REG_FLD_VAL_GET(ADDCON_DBG_FLD_L3_WIN_HIT, addcon),
-		DISP_REG_GET_FIELD(DATAPATH_CON_FLD_BGCLR_IN_SEL,
-				   DISP_REG_OVL_DATAPATH_CON + baddr)
-			? "DL"
-			: "const",
+		REG_FLD_VAL_GET(DATAPATH_CON_FLD_BGCLR_IN_SEL, path_con) ? "DL" : "const",
 		readl(DISP_REG_OVL_STA + baddr));
+
+	DDPDUMP("pq_out_en(%u),sel(%u),loop(%u),size(%u,%u),rdma_out_sel(%u,%u,%u,%u)\n",
+		REG_FLD_VAL_GET(DISP_OVL_PQ_OUT_EN, path_con),
+		REG_FLD_VAL_GET(DATAPATH_PQ_OUT_SEL, path_con),
+		readl(DISP_REG_OVL_PQ_LOOP_CON + baddr) & 0x1,
+		REG_FLD_VAL_GET(ADDCON_DBG_FLD_ROI_X, pq_out_size),
+		REG_FLD_VAL_GET(ADDCON_DBG_FLD_ROI_Y, pq_out_size),
+		REG_FLD_VAL_GET(DISP_OVL_RDMA0_OUT_SEL, path_con),
+		REG_FLD_VAL_GET(DISP_OVL_RDMA1_OUT_SEL, path_con),
+		REG_FLD_VAL_GET(DISP_OVL_RDMA2_OUT_SEL, path_con),
+		REG_FLD_VAL_GET(DISP_OVL_RDMA3_OUT_SEL, path_con));
 
 	/* phy layer */
 	for (i = 0; i < mtk_ovl_layer_num(comp); i++) {
@@ -3521,9 +4444,11 @@ static void mtk_ovl_prepare(struct mtk_ddp_comp *comp)
 		mtk_ddp_write_mask_cpu(comp, DISP_OVL_BYPASS_SHADOW,
 			DISP_REG_OVL_EN, DISP_OVL_BYPASS_SHADOW);
 
-	dev_priv = comp->mtk_crtc->base.dev->dev_private;
-	if (mtk_drm_helper_get_opt(dev_priv->helper_opt, MTK_DRM_OPT_LAYER_REC))
-		writel(0xffffffff, comp->regs + DISP_OVL_REG_GDRDY_PRD);
+	if (comp->mtk_crtc && comp->mtk_crtc->base.dev) {
+		dev_priv = comp->mtk_crtc->base.dev->dev_private;
+		if (mtk_drm_helper_get_opt(dev_priv->helper_opt, MTK_DRM_OPT_LAYER_REC))
+			writel(0xffffffff, comp->regs + DISP_OVL_REG_GDRDY_PRD);
+	}
 }
 
 static void mtk_ovl_unprepare(struct mtk_ddp_comp *comp)
@@ -3543,12 +4468,16 @@ mtk_ovl_config_trigger(struct mtk_ddp_comp *comp, struct cmdq_pkt *pkt,
 	switch (flag) {
 	case MTK_TRIG_FLAG_PRE_TRIGGER:
 	{
+	/* may cause side effect, need check
+		if (comp->blank_mode)
+			break;
 		DDPINFO("%s+ %s\n", __func__, mtk_dump_comp_str(comp));
-			cmdq_pkt_write(pkt, comp->cmdq_base,
-					comp->regs_pa + DISP_REG_OVL_RST, 0x1, 0x1);
-			cmdq_pkt_write(pkt, comp->cmdq_base,
-					comp->regs_pa + DISP_REG_OVL_RST, 0x0, 0x1);
 
+		cmdq_pkt_write(pkt, comp->cmdq_base,
+				comp->regs_pa + DISP_REG_OVL_RST, 0x1, 0x1);
+		cmdq_pkt_write(pkt, comp->cmdq_base,
+				comp->regs_pa + DISP_REG_OVL_RST, 0x0, 0x1);
+	*/
 		break;
 	}
 #ifdef IF_ZERO /* not ready for dummy register method */
@@ -3642,8 +4571,11 @@ mtk_ovl_config_trigger(struct mtk_ddp_comp *comp, struct cmdq_pkt *pkt,
 
 static const struct mtk_ddp_comp_funcs mtk_disp_ovl_funcs = {
 	.config = mtk_ovl_config,
+	.first_cfg = mtk_ovl_config,
+	.config_begin = mtk_ovl_config_begin,
 	.start = mtk_ovl_start,
 	.stop = mtk_ovl_stop,
+	.reset = mtk_ovl_reset,
 #ifdef IF_ZERO
 	.enable_vblank = mtk_ovl_enable_vblank,
 	.disable_vblank = mtk_ovl_disable_vblank,
@@ -3694,15 +4626,47 @@ static int mtk_disp_ovl_bind(struct device *dev, struct device *master,
 			MTK_DRM_OPT_MMQOS_SUPPORT)) {
 		mtk_disp_pmqos_get_icc_path_name(buf, sizeof(buf),
 						&priv->ddp_comp, "qos");
-		priv->ddp_comp.qos_req = of_mtk_icc_get(dev, buf);
+		ret = mtk_disp_pmqos_get_path(dev, buf, &priv->ddp_comp.qos_req);
+		if (ret) {
+			mtk_ddp_comp_unregister(drm_dev, &priv->ddp_comp);
+			return ret;
+		}
+
+		mtk_disp_pmqos_get_icc_path_name(buf, sizeof(buf),
+						&priv->ddp_comp, "qos_other");
+		ret = mtk_disp_pmqos_get_path(dev, buf, &priv->ddp_comp.qos_req_other);
+		if (ret) {
+			mtk_ddp_comp_unregister(drm_dev, &priv->ddp_comp);
+			return ret;
+		}
+		if (!IS_ERR(priv->ddp_comp.qos_req_other))
+			DDPMSG("%s, %s create success, dev:%s\n", __func__, buf, dev_name(dev));
 
 		mtk_disp_pmqos_get_icc_path_name(buf, sizeof(buf),
 						&priv->ddp_comp, "fbdc_qos");
-		priv->ddp_comp.fbdc_qos_req = of_mtk_icc_get(dev, buf);
+		ret = mtk_disp_pmqos_get_path(dev, buf, &priv->ddp_comp.fbdc_qos_req);
+		if (ret) {
+			mtk_ddp_comp_unregister(drm_dev, &priv->ddp_comp);
+			return ret;
+		}
 
 		mtk_disp_pmqos_get_icc_path_name(buf, sizeof(buf),
 						&priv->ddp_comp, "hrt_qos");
-		priv->ddp_comp.hrt_qos_req = of_mtk_icc_get(dev, buf);
+		ret = mtk_disp_pmqos_get_path(dev, buf, &priv->ddp_comp.hrt_qos_req);
+		if (ret) {
+			mtk_ddp_comp_unregister(drm_dev, &priv->ddp_comp);
+			return ret;
+		}
+
+		mtk_disp_pmqos_get_icc_path_name(buf, sizeof(buf),
+						&priv->ddp_comp, "hrt_qos_other");
+		ret = mtk_disp_pmqos_get_path(dev, buf, &priv->ddp_comp.hrt_qos_req_other);
+		if (ret) {
+			mtk_ddp_comp_unregister(drm_dev, &priv->ddp_comp);
+			return ret;
+		}
+		if (!IS_ERR(priv->ddp_comp.hrt_qos_req_other))
+			DDPMSG("%s, %s create success, dev:%s\n", __func__, buf, dev_name(dev));
 	}
 
 	baddr = priv->ddp_comp.regs;
@@ -3890,6 +4854,7 @@ static const struct mtk_disp_ovl_data mt6983_ovl_driver_data = {
 	.greq_num_dl = 0x7777,
 	.is_support_34bits = true,
 	.aid_sel_mapping = &mtk_ovl_aid_sel_MT6983,
+	.aid_per_layer_setting = false,
 	.mmsys_mapping = &mtk_ovl_mmsys_mapping_MT6983,
 	.source_bpc = 10,
 };
@@ -3922,7 +4887,8 @@ static const struct mtk_disp_ovl_data mt6985_ovl_driver_data = {
 	.aid_per_layer_setting = true,
 	.mmsys_mapping = &mtk_ovl_mmsys_mapping_MT6985,
 	.source_bpc = 10,
-	.support_pq_selfloop = true,
+	.support_pq_selfloop = true, /* pq in out self loop */
+	.is_right_ovl_comp = &is_right_ovl_comp_MT6985,
 };
 
 static const struct compress_info compr_info_mt6895  = {
@@ -3950,7 +4916,39 @@ static const struct mtk_disp_ovl_data mt6895_ovl_driver_data = {
 	.greq_num_dl = 0x7777,
 	.is_support_34bits = true,
 	.aid_sel_mapping = &mtk_ovl_aid_sel_MT6895,
+	.aid_per_layer_setting = false,
 	.mmsys_mapping = &mtk_ovl_mmsys_mapping_MT6895,
+	.source_bpc = 10,
+};
+
+static const struct compress_info compr_info_mt6886  = {
+	.name = "AFBC_V1_2_MTK_1",
+	.l_config = &compr_l_config_AFBC_V1_2,
+};
+
+static const struct mtk_disp_ovl_data mt6886_ovl_driver_data = {
+	.addr = DISP_REG_OVL_ADDR_BASE,
+	.el_addr_offset = 0x10,
+	.el_hdr_addr = 0xfb4,
+	.el_hdr_addr_offset = 0x10,
+	.fmt_rgb565_is_0 = true,
+	.fmt_uyvy = 4U << 12,
+	.fmt_yuyv = 5U << 12,
+	.compr_info = &compr_info_mt6886,
+	.support_shadow = false,
+	.need_bypass_shadow = false,
+	/* dc mode setting align mt6895 */
+	.preultra_th_dc = 0x15e,
+	.fifo_size = 768,
+	.issue_req_th_dl = 383,
+	.issue_req_th_dc = 15,
+	.issue_req_th_urg_dl = 191,
+	.issue_req_th_urg_dc = 15,
+	.greq_num_dl = 0xbbbb,
+	.is_support_34bits = true,
+	.aid_sel_mapping = &mtk_ovl_aid_sel_MT6886,
+	.aid_per_layer_setting = true,
+	.mmsys_mapping = &mtk_ovl_mmsys_mapping_MT6886,
 	.source_bpc = 10,
 };
 
@@ -4060,6 +5058,7 @@ static const struct mtk_disp_ovl_data mt6879_ovl_driver_data = {
 	.greq_num_dl = 0xbbbb,
 	.is_support_34bits = true,
 	.aid_sel_mapping = &mtk_ovl_aid_sel_MT6879,
+	.aid_per_layer_setting = false,
 	.mmsys_mapping = &mtk_ovl_mmsys_mapping_MT6879,
 	.source_bpc = 8,
 };
@@ -4119,6 +5118,8 @@ static const struct of_device_id mtk_disp_ovl_driver_dt_match[] = {
 	 .data = &mt6985_ovl_driver_data},
 	{.compatible = "mediatek,mt6895-disp-ovl",
 	 .data = &mt6895_ovl_driver_data},
+	{.compatible = "mediatek,mt6886-disp-ovl",
+	 .data = &mt6886_ovl_driver_data},
 	{.compatible = "mediatek,mt6873-disp-ovl",
 	 .data = &mt6873_ovl_driver_data},
 	{.compatible = "mediatek,mt6853-disp-ovl",
@@ -4129,6 +5130,8 @@ static const struct of_device_id mtk_disp_ovl_driver_dt_match[] = {
 	 .data = &mt6879_ovl_driver_data},
 	{.compatible = "mediatek,mt6855-disp-ovl",
 	 .data = &mt6855_ovl_driver_data},
+	{.compatible = "mediatek,mt6835-disp-ovl",
+	 .data = &mt6835_ovl_driver_data},
 	{},
 };
 MODULE_DEVICE_TABLE(of, mtk_disp_ovl_driver_dt_match);

@@ -68,6 +68,15 @@ int mtk_panel_tch_handle_reg(struct drm_panel *panel)
 }
 EXPORT_SYMBOL(mtk_panel_tch_handle_reg);
 
+void mtk_panel_tch_handle_unreg(struct drm_panel *panel)
+{
+	mutex_lock(&panel_ext_lock);
+	if (panel_rst_ctx.panel == panel)
+		panel_rst_ctx.panel = NULL;
+	mutex_unlock(&panel_ext_lock);
+}
+EXPORT_SYMBOL(mtk_panel_tch_handle_unreg);
+
 void **mtk_panel_tch_handle_init(void)
 {
 	return (void **)&panel_rst_ctx.rst_cb;
@@ -91,7 +100,11 @@ EXPORT_SYMBOL(mtk_panel_tch_rst);
 
 int mtk_panel_detach(struct mtk_panel_ctx *ctx)
 {
+	mutex_lock(&panel_ext_lock);
+	if (panel_rst_ctx.panel == ctx->panel)
+		panel_rst_ctx.panel = NULL;
 	ctx->panel = NULL;
+	mutex_unlock(&panel_ext_lock);
 
 	return 0;
 }
@@ -116,6 +129,7 @@ int mtk_panel_ext_create(struct device *dev,
 	mtk_panel_init(ext_ctx);
 	ext->params = ext_params;
 	ext->funcs = ext_funcs;
+	ext->is_connected = -1;
 	ext_ctx->ext = ext;
 
 	mtk_panel_add(ext_ctx);

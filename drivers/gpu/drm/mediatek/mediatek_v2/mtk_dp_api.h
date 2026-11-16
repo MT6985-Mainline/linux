@@ -19,3 +19,4 @@ int mtk_drm_dp_get_info(struct drm_device *dev,
 			struct drm_mtk_session_info *info);
 void mtk_dp_get_dsc_capability(u8 *dsc_cap);
 #endif
+

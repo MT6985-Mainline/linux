@@ -6,9 +6,9 @@
 #include <linux/kthread.h>
 #include <linux/wait.h>
 #include <linux/mutex.h>
-#include <drm/drm_fourcc.h>
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
+#include <uapi/linux/sched/types.h>
 #include <linux/delay.h>
 #include <drm/mediatek_drm.h>
 #include <drm/drm_vblank.h>
@@ -18,12 +18,6 @@
 #include "mtk_drm_ddp.h"
 #include "mtk_drm_ddp_comp.h"
 #include "mtk_drm_mmp.h"
-#ifdef CONFIG_MI_DISP_INPUT_HANDLER
-#include "mi_disp/mi_disp_input_handler.h"
-#endif
-#ifdef CONFIG_MI_DISP_BOOST
-#include "mi_disp/mi_disp_boost.h"
-#endif
 
 #define MAX_ENTER_IDLE_RSZ_RATIO 300
 
@@ -62,30 +56,15 @@ static void mtk_drm_vdo_mode_enter_idle(struct drm_crtc *crtc)
 		mtk_ddp_comp_io_cmd(comp, handle, DSI_VFP_IDLE_MODE, NULL);
 		mtk_ddp_comp_io_cmd(comp, handle, DSI_LFR_SET, &en);
 	}
+
 	cmdq_pkt_flush(handle);
 	cmdq_pkt_destroy(handle);
-	drm_crtc_vblank_off(crtc);
 }
 
 static void mtk_drm_cmd_mode_enter_idle(struct drm_crtc *crtc)
 {
-	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
-
-	// Temp code. This flow will only enter by debug command
-	// (CMD mode will enter MML IR by debug command), we don't
-	// have to worry about it will effect the original flow.
-	if (mtk_crtc && mtk_crtc->is_mml && mtk_crtc->mml_cfg &&
-		mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
-		return;
-	}
-
 	mtk_drm_idlemgr_disable_crtc(crtc);
 	lcm_fps_ctx_reset(crtc);
-#ifdef CONFIG_MI_DISP_ESD_CHECK
-	if (mtk_crtc->esd_ctx) {
-		atomic_set(&mtk_crtc->esd_ctx->target_time, 1);
-	}
-#endif
 }
 
 static void mtk_drm_vdo_mode_leave_idle(struct drm_crtc *crtc)
@@ -115,64 +94,47 @@ static void mtk_drm_vdo_mode_leave_idle(struct drm_crtc *crtc)
 
 	cmdq_pkt_flush(handle);
 	cmdq_pkt_destroy(handle);
-	drm_crtc_vblank_on(crtc);
 }
 
 static void mtk_drm_cmd_mode_leave_idle(struct drm_crtc *crtc)
 {
-	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
-
-	// Temp code. This flow will only enter by debug command
-	// (CMD mode will enter MML IR by debug command), we don't
-	// have to worry about it will effect the original flow.
-	if (mtk_crtc && mtk_crtc->is_mml && mtk_crtc->mml_cfg &&
-		mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
-		return;
-	}
-
-#ifdef CONFIG_MI_DISP_BOOST
-	mi_disp_boost_enable();
-#endif
-
 	mtk_drm_idlemgr_enable_crtc(crtc);
 	lcm_fps_ctx_reset(crtc);
-
-#ifdef CONFIG_MI_DISP_BOOST
-	mi_disp_boost_disable();
-#endif
 }
 
 static void mtk_drm_idlemgr_enter_idle_nolock(struct drm_crtc *crtc)
 {
-	struct mtk_drm_private *priv = crtc->dev->dev_private;
 	struct mtk_ddp_comp *output_comp;
 	int index = drm_crtc_index(crtc);
+	unsigned int idle_interval;
 	bool mode;
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 
-	output_comp = priv->ddp_comp[DDP_COMPONENT_DSI0];
+	output_comp = mtk_ddp_comp_request_output(mtk_crtc);
 
 	if (!output_comp)
 		return;
 
 	mode = mtk_dsi_is_cmd_mode(output_comp);
-	CRTC_MMP_EVENT_START(index, enter_idle, mode, 0);
+	idle_interval = mtk_drm_get_idle_check_interval(crtc);
+	CRTC_MMP_EVENT_START(index, enter_idle, mode, idle_interval);
 
 	if (mode)
 		mtk_drm_cmd_mode_enter_idle(crtc);
 	else
 		mtk_drm_vdo_mode_enter_idle(crtc);
 
-	CRTC_MMP_EVENT_END(index, enter_idle, mode, 0);
+	CRTC_MMP_EVENT_END(index, enter_idle, mode, idle_interval);
 }
 
 static void mtk_drm_idlemgr_leave_idle_nolock(struct drm_crtc *crtc)
 {
-	struct mtk_drm_private *priv = crtc->dev->dev_private;
 	struct mtk_ddp_comp *output_comp;
 	int index = drm_crtc_index(crtc);
 	bool mode;
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 
-	output_comp = priv->ddp_comp[DDP_COMPONENT_DSI0];
+	output_comp = mtk_ddp_comp_request_output(mtk_crtc);
 
 	if (!output_comp)
 		return;
@@ -197,6 +159,23 @@ bool mtk_drm_is_idle(struct drm_crtc *crtc)
 		return false;
 
 	return idlemgr->idlemgr_ctx->is_idle;
+}
+
+void mtk_drm_idlemgr_kick_async(struct drm_crtc *crtc)
+{
+	struct mtk_drm_crtc *mtk_crtc = NULL;
+	struct mtk_drm_idlemgr *idlemgr;
+
+	if (crtc)
+		mtk_crtc = to_mtk_crtc(crtc);
+
+	if (mtk_crtc && mtk_crtc->idlemgr)
+		idlemgr = mtk_crtc->idlemgr;
+	else
+		return;
+
+	atomic_set(&idlemgr->kick_task_active, 1);
+	wake_up_interruptible(&idlemgr->kick_wq);
 }
 
 void mtk_drm_idlemgr_kick(const char *source, struct drm_crtc *crtc,
@@ -339,9 +318,35 @@ static bool mtk_planes_is_yuv_fmt(struct drm_crtc *crtc)
 
 		if (pending->enable && is_yuv(fmt))
 			return true;
+
+		if (plane_state->comp_state.layer_caps & MTK_DISP_SRC_YUV_LAYER)
+			return true;
 	}
 
 	return false;
+}
+
+static int mtk_drm_async_kick_idlemgr_thread(void *data)
+{
+	struct sched_param param = {.sched_priority = 87 };
+	struct drm_crtc *crtc = (struct drm_crtc *)data;
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct mtk_drm_idlemgr *idlemgr = mtk_crtc->idlemgr;
+	int ret = 0;
+
+	sched_setscheduler(current, SCHED_RR, &param);
+
+	while (!kthread_should_stop()) {
+		ret = wait_event_interruptible(
+			idlemgr->kick_wq,
+			atomic_read(&idlemgr->kick_task_active));
+
+		atomic_set(&idlemgr->kick_task_active, 0);
+
+		mtk_drm_idlemgr_kick(__func__, crtc, true);
+	}
+
+	return 0;
 }
 
 static int mtk_drm_idlemgr_monitor_thread(void *data)
@@ -373,6 +378,13 @@ static int mtk_drm_idlemgr_monitor_thread(void *data)
 			continue;
 		}
 
+		if (mtk_crtc_is_frame_trigger_mode(crtc) &&
+				atomic_read(&priv->crtc_rel_present[crtc_id]) <
+				atomic_read(&priv->crtc_present[crtc_id])) {
+			DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
+			continue;
+		}
+
 		if (crtc->state) {
 			mtk_state = to_mtk_crtc_state(crtc->state);
 			if (mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE]) {
@@ -397,20 +409,11 @@ static int mtk_drm_idlemgr_monitor_thread(void *data)
 
 		if (idlemgr_ctx->is_idle
 			|| mtk_crtc_is_dc_mode(crtc)
-			|| priv->session_mode != MTK_DRM_SESSION_DL
 			|| mtk_crtc->sec_on
 			|| !priv->already_first_config) {
 			DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
 			continue;
 		}
-
-#ifdef CONFIG_MI_DISP_INPUT_HANDLER
-		if (mi_disp_input_is_touch_active()) {
-			/* kicked in touch active, it's not idle */
-			DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
-			continue;
-		}
-#endif
 
 		t_idle = local_clock() - idlemgr_ctx->idlemgr_last_kick_time;
 		if (t_idle < idlemgr_ctx->idle_check_interval * 1000 * 1000) {
@@ -450,21 +453,17 @@ int mtk_drm_idlemgr_init(struct drm_crtc *crtc, int index)
 {
 #define LEN 50
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
-	struct mtk_drm_idlemgr *idlemgr =
-		kzalloc(sizeof(struct mtk_drm_idlemgr), GFP_KERNEL);
-	struct mtk_drm_idlemgr_context *idlemgr_ctx =
-		kzalloc(sizeof(struct mtk_drm_idlemgr_context), GFP_KERNEL);
-	char name[LEN];
+	struct mtk_drm_idlemgr *idlemgr = NULL;
+	struct mtk_drm_idlemgr_context *idlemgr_ctx = NULL;
+	char name[LEN] = {0};
 
-	if (!idlemgr) {
-		DDPPR_ERR("struct mtk_drm_idlemgr allocate fail\n");
-		return -ENOMEM;
-		;
-	}
+	idlemgr = kzalloc(sizeof(*idlemgr), GFP_KERNEL);
+	idlemgr_ctx = kzalloc(sizeof(*idlemgr_ctx), GFP_KERNEL);
 
-	if (!idlemgr_ctx) {
-
-		DDPPR_ERR("struct mtk_drm_idlemgr_context allocate fail\n");
+	if (!idlemgr || !idlemgr_ctx) {
+		DDPPR_ERR("idlemgr or idlemgr_ctx allocate fail\n");
+		kfree(idlemgr);
+		kfree(idlemgr_ctx);
 		return -ENOMEM;
 	}
 
@@ -485,6 +484,14 @@ int mtk_drm_idlemgr_init(struct drm_crtc *crtc, int index)
 	atomic_set(&idlemgr->idlemgr_task_active, 1);
 
 	wake_up_process(idlemgr->idlemgr_task);
+
+	snprintf(name, LEN, "dis_ki-%d", index);
+	idlemgr->kick_task =
+		kthread_create(mtk_drm_async_kick_idlemgr_thread, crtc, name);
+	init_waitqueue_head(&idlemgr->kick_wq);
+	atomic_set(&idlemgr->kick_task_active, 0);
+
+	wake_up_process(idlemgr->kick_task);
 
 	return 0;
 }
@@ -516,6 +523,9 @@ static void mtk_drm_idlemgr_disable_crtc(struct drm_crtc *crtc)
 	bool mode = mtk_crtc_is_dc_mode(crtc);
 	struct mtk_drm_private *priv =
 				mtk_crtc->base.dev->dev_private;
+	struct mtk_ddp_comp *output_comp = NULL;
+	int en = 0;
+	struct cmdq_pkt *cmdq_handle = NULL;
 
 	DDPINFO("%s, crtc%d+\n", __func__, crtc_id);
 
@@ -525,35 +535,77 @@ static void mtk_drm_idlemgr_disable_crtc(struct drm_crtc *crtc)
 		return;
 	}
 
-	/* 1. stop CRTC */
-	mtk_crtc_stop(mtk_crtc, true);
+	if (mtk_crtc->is_mml) {
+		mtk_crtc->mml_ir_state = MML_IR_IDLE;
+	}
 
-	/* 2. disconnect addon module and recover config */
+	/* 0. Waiting CLIENT_DSI_CFG/CLIENT_CFG thread done */
+	if (mtk_crtc->gce_obj.client[CLIENT_DSI_CFG])
+		mtk_crtc_pkt_create(&cmdq_handle, crtc,
+			mtk_crtc->gce_obj.client[CLIENT_DSI_CFG]);
+
+	if (cmdq_handle) {
+		cmdq_pkt_flush(cmdq_handle);
+		cmdq_pkt_destroy(cmdq_handle);
+	}
+
+	mtk_crtc_pkt_create(&cmdq_handle, crtc, mtk_crtc->gce_obj.client[CLIENT_CFG]);
+
+	if (cmdq_handle) {
+		cmdq_pkt_clear_event(cmdq_handle,
+				     mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+		cmdq_pkt_clear_event(cmdq_handle,
+				     mtk_crtc->gce_obj.event[EVENT_STREAM_BLOCK]);
+		cmdq_pkt_wfe(cmdq_handle,
+				     mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
+
+		cmdq_pkt_flush(cmdq_handle);
+
+		if (mtk_crtc->is_mml)
+			CRTC_MMP_MARK(0, mml_dbg, (unsigned long)cmdq_handle, MMP_MML_IDLE);
+
+		cmdq_pkt_destroy(cmdq_handle);
+	}
+
+	/* 1. stop connector */
+	mtk_drm_idlemgr_disable_connector(crtc);
+
+	/* 2. stop CRTC */
+	mtk_crtc_stop(mtk_crtc, false);
+	CRTC_MMP_MARK((int)crtc_id, enter_idle, 1, 0);
+
+	/* 3. disconnect addon module and recover config */
 	mtk_crtc_disconnect_addon_module(crtc);
+	CRTC_MMP_MARK((int)crtc_id, enter_idle, 2, 0);
 
-	/* 3. set HRT BW to 0 */
+	/* 4. set HRT BW to 0 */
 	if (mtk_drm_helper_get_opt(priv->helper_opt,
 			MTK_DRM_OPT_MMQOS_SUPPORT))
 		mtk_disp_set_hrt_bw(mtk_crtc, 0);
 
-	/* 4. disconnect path */
+	/* 5. Release MMCLOCK request */
+	output_comp = mtk_ddp_comp_request_output(mtk_crtc);
+	if (output_comp)
+		mtk_ddp_comp_io_cmd(output_comp, NULL, SET_MMCLK_BY_DATARATE,
+				&en);
+
+	/* 6. disconnect path */
 	mtk_crtc_disconnect_default_path(mtk_crtc);
 
-	mtk_gce_backup_slot_backup(mtk_crtc);
-	/* 5. power off all modules in this CRTC */
+	/* 7. power off all modules in this CRTC */
 	mtk_crtc_ddp_unprepare(mtk_crtc);
-	mtk_drm_idlemgr_disable_connector(crtc);
 
 	drm_crtc_vblank_off(crtc);
 
 	mtk_crtc_vblank_irq(&mtk_crtc->base);
-	/* 6. power off MTCMOS */
+	/* 8. power off MTCMOS */
 	mtk_drm_top_clk_disable_unprepare(crtc->dev);
+	CRTC_MMP_MARK((int)crtc_id, enter_idle, 3, 0);
 
-	/* 7. disable fake vsync if need */
+	/* 9. disable fake vsync if need */
 	mtk_drm_fake_vsync_switch(crtc, false);
 
-	/* 8. CMDQ power off */
+	/* 10. CMDQ power off */
 	cmdq_mbox_disable(mtk_crtc->gce_obj.client[CLIENT_CFG]->chan);
 
 	DDPINFO("crtc%d do %s-\n", crtc_id, __func__);
@@ -569,6 +621,8 @@ static void mtk_drm_idlemgr_enable_crtc(struct drm_crtc *crtc)
 	bool mode = mtk_crtc_is_dc_mode(crtc);
 	struct mtk_ddp_comp *comp;
 	unsigned int i, j;
+	struct mtk_ddp_comp *output_comp = NULL;
+	int en = 1;
 
 	DDPINFO("crtc%d do %s+\n", crtc_id, __func__);
 
@@ -581,22 +635,38 @@ static void mtk_drm_idlemgr_enable_crtc(struct drm_crtc *crtc)
 	/* 0. CMDQ power on */
 	cmdq_mbox_enable(mtk_crtc->gce_obj.client[CLIENT_CFG]->chan);
 
-	/* 1. power on mtcmos */
+	/* 1. power on mtcmos & init apsrc*/
 	mtk_drm_top_clk_prepare_enable(crtc->dev);
+
+	mtk_crtc_rst_module(crtc);
+
+	mtk_crtc_v_idle_apsrc_control(crtc, NULL, true, true,
+		MTK_APSRC_CRTC_DEFAULT, false);
 
 	/* 2. prepare modules would be used in this CRTC */
 	mtk_drm_idlemgr_enable_connector(crtc);
+
+	/* 3. start event loop first */
+	if (crtc_id == 0) {
+		if (mtk_crtc_with_event_loop(crtc) &&
+			(mtk_crtc_is_frame_trigger_mode(crtc)))
+			mtk_crtc_start_event_loop(crtc);
+	}
+
+	/* 4. prepare modules would be used in this CRTC */
 	mtk_crtc_ddp_prepare(mtk_crtc);
 
-	mtk_gce_backup_slot_restore(mtk_crtc);
+	mtk_gce_backup_slot_init(mtk_crtc);
 
 #ifndef DRM_CMDQ_DISABLE
-	if (disp_helper_get_stage() == DISP_HELPER_STAGE_NORMAL)
+	if (mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_USE_M4U))
 		mtk_crtc_prepare_instr(crtc);
 #endif
 
-	/* 3. start trigger loop first to keep gce alive */
-	if (crtc_id == 0) {
+	/* 5. start trigger loop first to keep gce alive */
+	output_comp = mtk_ddp_comp_request_output(mtk_crtc);
+	if (!IS_ERR_OR_NULL(output_comp) &&
+		mtk_ddp_comp_get_type(output_comp->id) == MTK_DSI) {
 		if (mtk_crtc_with_sodi_loop(crtc) &&
 			(!mtk_crtc_is_frame_trigger_mode(crtc)))
 			mtk_crtc_start_sodi_loop(crtc);
@@ -605,32 +675,44 @@ static void mtk_drm_idlemgr_enable_crtc(struct drm_crtc *crtc)
 		mtk_crtc_hw_block_ready(crtc);
 	}
 
-	/* 4. connect path */
+	/* 6. connect path */
 	mtk_crtc_connect_default_path(mtk_crtc);
 
-	/* 5. config ddp engine & set dirty for cmd mode */
+	/* 7. config ddp engine & set dirty for cmd mode */
 	mtk_crtc_config_default_path(mtk_crtc);
 
-	/* 6. conect addon module and config */
-	mtk_crtc_connect_addon_module(crtc);
+	/* 8. conect addon module and config */
+	if (mtk_crtc->mml_ir_state == MML_IR_IDLE)
+		mtk_crtc_addon_connector_connect(crtc, NULL); /* config dsc only */
+	else
+		mtk_crtc_connect_addon_module(crtc);
 
-	/* 7. restore OVL setting */
+	if (mtk_crtc->mml_ir_sram.bk_hrt_idx)
+		mtk_crtc_alloc_sram(mtk_crtc, mtk_crtc->mml_ir_sram.bk_hrt_idx);
+
+	/* 9. restore OVL setting */
 	mtk_crtc_restore_plane_setting(mtk_crtc);
 
-	/* 8. Set QOS BW */
+	/* 10. Set QOS BW */
 	for_each_comp_in_cur_crtc_path(comp, mtk_crtc, i, j)
 		mtk_ddp_comp_io_cmd(comp, NULL, PMQOS_SET_BW, NULL);
 
-	/* 9. restore HRT BW */
+	/* 11. restore HRT BW */
 	if (mtk_drm_helper_get_opt(priv->helper_opt,
 			MTK_DRM_OPT_MMQOS_SUPPORT))
 		mtk_disp_set_hrt_bw(mtk_crtc,
 			mtk_crtc->qos_ctx->last_hrt_req);
 
-	/* 10. set vblank */
+	/* 12. Request MMClock */
+	mtk_crtc_attach_ddp_comp(crtc, mtk_crtc->ddp_mode, true);
+	if (output_comp)
+		mtk_ddp_comp_io_cmd(output_comp, NULL, SET_MMCLK_BY_DATARATE,
+				&en);
+
+	/* 13. set vblank */
 	drm_crtc_vblank_on(crtc);
 
-	/* 11. enable fake vsync if need */
+	/* 14. enable fake vsync if need */
 	mtk_drm_fake_vsync_switch(crtc, true);
 
 	DDPINFO("crtc%d do %s-\n", crtc_id, __func__);

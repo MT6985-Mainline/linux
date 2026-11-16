@@ -56,6 +56,7 @@ enum HRT_DISP_TYPE {
 	HRT_PRIMARY = 0,
 	HRT_SECONDARY,
 	HRT_THIRD,
+	HRT_FOURTH,
 	HRT_DISP_TYPE_NUM,
 };
 
@@ -102,6 +103,10 @@ enum LYE_HELPER_OPT {
 	LYE_OPT_EXT_LAYER,
 	LYE_OPT_RPO,
 	LYE_OPT_CLEAR_LAYER,
+	LYE_OPT_OVL_BW_MONITOR,
+	LYE_OPT_GPU_CACHE,
+	LYE_OPT_SPHRT,
+	LYE_OPT_SPDA_OVL_SWITCH,
 	LYE_OPT_NUM
 };
 
@@ -122,7 +127,6 @@ struct hrt_sort_entry {
 	struct drm_mtk_layer_config *layer_info;
 	int key;
 	int overlap_w;
-	int idx;
 };
 
 struct layering_rule_info_t {
@@ -133,21 +137,28 @@ struct layering_rule_info_t {
 	int hrt_sys_state;
 	int wrot_sram;
 	unsigned int hrt_idx;
+	unsigned int rpo_scale_num;
+	unsigned int rpo_tile_length;
+	unsigned int rpo_in_max_height;
+	bool need_repaint;
 };
 
 enum SCN_FACTOR {
+	SCN_NO_FACTOR = 0,
 	SCN_NEED_VP_PQ = 0x00000001,
 	SCN_NEED_GAME_PQ = 0x00000002,
 	SCN_TRIPLE_DISP =  0x00000004,
 	SCN_MML = 0x00000008,
 	SCN_MML_SRAM_ONLY = 0x00000010,
+	SCN_IDLE = 0x00000020,
+	SCN_CLEAR = 0x00000040,
 };
 
 struct layering_rule_ops {
 	void (*scenario_decision)(struct drm_device *dev,
-		unsigned int scn_decision_flag, unsigned int scale_num);
+		const enum SCN_FACTOR scn_decision_flag, const unsigned int scale_num);
 	int *(*get_bound_table)(enum DISP_HW_MAPPING_TB_TYPE tb_type);
-	uint16_t (*get_mapping_table)(struct drm_device *dev, int disp_idx,
+	uint16_t (*get_mapping_table)(struct drm_device *dev, int disp_idx, int disp_list,
 				      enum DISP_HW_MAPPING_TB_TYPE tb_type,
 				      int param);
 	/* should be removed */
@@ -222,6 +233,12 @@ bool mtk_is_layer_id_valid(struct drm_mtk_layering_info *disp_info,
 			   int disp_idx, int i);
 int mtk_layering_rule_ioctl(struct drm_device *drm, void *data,
 	struct drm_file *file_priv);
+#if IS_ENABLED(CONFIG_COMPAT)
+int mtk_layering_rule_ioctl_compat(struct file *file, unsigned int cmd,
+	unsigned long arg);
+#endif
 
 bool is_triple_disp(struct drm_mtk_layering_info *disp_info);
+
+int get_layering_opt(enum LYE_HELPER_OPT opt);
 #endif

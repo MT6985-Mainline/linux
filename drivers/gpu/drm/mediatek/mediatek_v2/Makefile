@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# Vendor warning policy adapted for mainline API porting
 
 mediatek-drm-y := mtk_drm_drv.o \
 		  mtk_disp_tdshp.o \
@@ -11,7 +11,9 @@ mediatek-drm-y := mtk_drm_drv.o \
 		  mtk_disp_chist.o \
 		  mtk_disp_ovl.o \
 		  mtk_disp_rdma.o \
+		  mtk_disp_mdp_rdma.o \
 		  mtk_disp_rsz.o \
+		  mtk_disp_mdp_rsz.o \
 		  mtk_disp_wdma.o \
 		  mtk_drm_crtc.o \
 		  mtk_drm_ddp.o \
@@ -42,6 +44,9 @@ mediatek-drm-y := mtk_drm_drv.o \
 		  mtk_disp_dsc.o \
 		  mtk_disp_cm.o \
 		  mtk_disp_spr.o \
+		  mtk_disp_postalign.o \
+		  mtk_disp_oddmr/mtk_disp_oddmr_parse_data.o \
+		  mtk_disp_oddmr/mtk_disp_oddmr.o \
 		  mtk_drm_arr.o \
 		  mtk_disp_merge.o \
 		  mtk_dmdp_aal.o \
@@ -50,48 +55,102 @@ mediatek-drm-y := mtk_drm_drv.o \
 		  mtk_disp_dlo_async.o \
 		  mtk_disp_dli_async.o \
 		  mtk_disp_inlinerotate.o \
-		  mtk_mmlsys_bypass_mode.o
+		  mtk_mmlsys_bypass_mode.o \
+		  mtk_lease.o \
+		  platform/mtk_drm_6835.o \
 
-# corot bring-up: GCE-D cannot execute any instruction yet, so program the
-# whole display path from the CPU.  This is the vendor's own no-CMDQ build
-# (upstream corot-t-oss Makefile has the same two lines commented out);
-# mtk_cmdq_dummy.o supplies the CMDQ API stubs and every mtk_ddp_write()
-# becomes a plain writel().
-ccflags-y += -DDRM_CMDQ_DISABLE
-mediatek-drm-y += mtk_cmdq_dummy.o
+#ccflags-y += -DDRM_CMDQ_DISABLE
+#mediatek-drm-y += mtk_cmdq_dummy.o
+
+ifeq ($(CONFIG_MI_DISP), y)
+include $(src)/mi_disp/Makefile
+endif
 
 ifeq ($(CONFIG_DRM_MEDIATEK_DEBUG_FS),y)
 mediatek-drm-y += mtk_drm_debugfs.o
 endif
 
+mediatek-drm-y += mtk_dp_intf.o \
+	mtk_dp.o \
+	mtk_dp_hal.o \
+	mtk_dp_debug.o
 
-ifeq ($(CONFIG_MI_DISP), y)
-include $(src)/mi_disp/Makefile
+#for 6382 bridge
+mediatek-drm-y += mtk_disp_bdg.o
+
+ifeq (yy, $(CONFIG_MTK_TEE_GP_SUPPORT)$(CONFIG_TRUSTONIC_TEE_SUPPORT))
+obj-y += ca/
+ccflags-y += -DDPTX_HDCP_ENABLE
+obj-y += mtk_dp_hdcp1x.o \
+	mtk_dp_hdcp2.o
 endif
+
+#ifeq ($(CONFIG_TRUSTONIC_TEE_SUPPORT),m)
+#obj-$(CONFIG_DRM_MEDIATEK) += ca/
+#ccflags-y += -DDPTX_HDCP_ENABLE
+#mediatek-drm-y += mtk_dp_hdcp1x.o \
+#	mtk_dp_hdcp2.o
+#endif
+
+# Mainline GEM DMA provides the fbdev client backend.
 
 obj-$(CONFIG_DRM_MEDIATEK) += mediatek-drm.o
 obj-$(CONFIG_DRM_MEDIATEK) += mtk_sync.o
 
 obj-$(CONFIG_DRM_MEDIATEK) += mtk_panel_ext.o
 obj-$(CONFIG_DRM_MEDIATEK) += mtk_disp_notify.o
+obj-$(CONFIG_DRM_MEDIATEK) += mtk_aod_scp.o
 
+obj-$(CONFIG_DRM_MEDIATEK) += mtk_disp_sec.o
 
-ccflags-y += -I$(srctree)/drivers/misc/mediatek/mmp/ \
-             -I$(srctree)/drivers/misc/mediatek/cmdq/mailbox/ \
-             -I$(srctree)/drivers/misc/mediatek/iommu/ \
-             -I$(srctree)/drivers/misc/mediatek/vcp/include/ \
-             -I$(srctree)/drivers/misc/mediatek/mtk-interconnect/ \
-             -I$(srctree)/drivers/misc/mediatek/slbc/ \
-             -I$(srctree)/drivers/misc/mediatek/clkbuf/v1/inc/ \
-             -I$(srctree)/drivers/misc/mediatek/scp/include/ \
-             -I$(srctree)/drivers/misc/mediatek/dramc/mt6895/ \
-             -I$(srctree)/drivers/misc/mediatek/include/ \
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/scp/include/
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/dramc/$(MTK_PLATFORM)	\
+             -I$(srctree)/drivers/misc/mediatek/smi/			\
+             -I$(srctree)/drivers/misc/mediatek/mmp/			\
+	     -I$(srctree)/drivers/misc/mediatek/spi_slave_drv/          \
+	     -I$(srctree)/drivers/misc/mediatek/base/power/include/     \
+             -I$(srctree)/drivers/misc/mediatek/mmdvfs/			\
+             -I$(srctree)/drivers/misc/mediatek/pmic/			\
+             -I$(srctree)/drivers/iommu/				\
+             -I$(srctree)/drivers/devfreq/				\
+             -I$(srctree)/drivers/gpu/drm/				\
+             -I$(srctree)/drivers/misc/mediatek/include/mt-plat/$(MTK_PLATFORM)/include/mach/				\
              -I$(srctree)/drivers/misc/mediatek/include/mt-plat/ \
-             -I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/ \
-             -I$(srctree)/drivers/gpu/drm/ \
-             -I$(srctree)/drivers/gpu/drm/mediatek
+             -I$(srctree)/drivers/misc/mediatek/leds/ \
+             -I$(srctree)/drivers/misc/mediatek/leds/$(MTK_PLATFORM) \
+             -I$(srctree)/drivers/misc/mediatek/cmdq/mailbox/        \
+             -I$(srctree)/drivers/misc/mediatek/iommu/		\
+             -I$(srctree)/drivers/misc/mediatek/mtk-interconnect/        \
+             -I$(srctree)/drivers/gpu/drm/mediatek \
+             -I$(srctree)/drivers/gpu/drm/mediatek/mml \
+             -I$(srctree)/drivers/misc/mediatek/slbc/ \
+             -I$(srctree)/drivers/misc/mediatek/vcp/rv/ \
+             -I$(srctree)/drivers/misc/mediatek/vcp/include/ \
+             -I$(srctree)/drivers/misc/mediatek/cmdq/mailbox/ \
+             -I$(srctree)/drivers/misc/mediatek/clkbuf/v1/inc/ \
+             -I$(srctree)/drivers/misc/mediatek/tinysys_scmi/ \
+             -I$(srctree)/drivers/dma-buf/heaps/ \
+
+ccflags-$(CONFIG_MTK_CMDQ_MBOX_EXT) += -I$(srctree)/drivers/misc/mediatek/cmdq/mailbox
 
 #ccflags-y += -DDRM_MMPATH
 ccflags-y += -DNOT_SUPPORT_CABC_HW
 ccflags-y += -DDISP_MDP_COLOR_ON
 ccflags-y += -DCCORR_SUPPORT
+
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/mt-plat/
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/mtk-interconnect/
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/mmp/
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/
+ifeq (${CONFIG_PXLW_IRIS},y)
+$(warning The feature of pixelworks iris will be added to the kernel)
+PWATOP=$(srctree)/..
+include $(PWATOP)/vendor/pixelworks/libpwiriskernel/display-drivers/Makefile.include
+ccflags-y += -I$(PWATOP)/vendor/pixelworks/libpwiriskernel/display-drivers/
+endif
+
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/tinysys_scmi/
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/clkbuf/v1/inc/
+
+ccflags-y += -ferror-limit=0

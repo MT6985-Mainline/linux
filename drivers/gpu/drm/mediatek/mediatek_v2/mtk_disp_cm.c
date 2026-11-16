@@ -177,15 +177,15 @@ static void mtk_cm_config(struct mtk_ddp_comp *comp,
 	struct mtk_panel_cm_params *cm_tune_params;
 	unsigned int width;
 
+	if (!comp->mtk_crtc || !comp->mtk_crtc->panel_ext)
+		return;
+	DDPFUNC();
+
 	if (comp->mtk_crtc->is_dual_pipe)
 		width = cfg->w / 2;
 	else
 		width = cfg->w;
 
-	DDPINFO("%s,\n", __func__);
-	if (!comp->mtk_crtc || !comp->mtk_crtc->panel_ext)
-		return;
-	DDPMSG("mtk_cm_config111\n");
 	cm_params = &comp->mtk_crtc->panel_ext->params->cm_params;
 	cm_tune_params = comp->mtk_crtc->panel_cm_params;
 
@@ -243,7 +243,12 @@ void mtk_cm_dump(struct mtk_ddp_comp *comp)
 	void __iomem *baddr = comp->regs;
 	int i;
 
-	DDPDUMP("== %s REGS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return;
+	}
+
+	DDPDUMP("== %s REGS ==\n", mtk_dump_comp_str(comp));
 
 	DDPDUMP("en=%d, cm_bypass=%d\n",
 		 DISP_REG_GET_FIELD(CON_FLD_DISP_CM_EN,
@@ -262,12 +267,17 @@ int mtk_cm_analysis(struct mtk_ddp_comp *comp)
 {
 	void __iomem *baddr = comp->regs;
 
-	DDPDUMP("== %s ANALYSIS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return 0;
+	}
+
+	DDPDUMP("== %s ANALYSIS ==\n", mtk_dump_comp_str(comp));
 	DDPDUMP("en=%d, cm_bypass=%d\n",
-		 DISP_REG_GET_FIELD(CON_FLD_DISP_CM_EN,
-				baddr + DISP_REG_CM_EN),
-		 DISP_REG_GET_FIELD(CON_FLD_DISP_CM_RELAY_MODE,
-				baddr + DISP_REG_CM_CFG));
+	DISP_REG_GET_FIELD(CON_FLD_DISP_CM_EN,
+		baddr + DISP_REG_CM_EN),
+	DISP_REG_GET_FIELD(CON_FLD_DISP_CM_RELAY_MODE,
+		baddr + DISP_REG_CM_CFG));
 
 	return 0;
 }
@@ -381,6 +391,11 @@ static const struct mtk_disp_cm_data mt6895_cm_driver_data = {
 	.need_bypass_shadow = true,
 };
 
+static const struct mtk_disp_cm_data mt6886_cm_driver_data = {
+	.support_shadow = false,
+	.need_bypass_shadow = true,
+};
+
 static const struct mtk_disp_cm_data mt6879_cm_driver_data = {
 	.support_shadow = false,
 	.need_bypass_shadow = true,
@@ -393,6 +408,8 @@ static const struct of_device_id mtk_disp_cm_driver_dt_match[] = {
 	  .data = &mt6983_cm_driver_data},
 	{ .compatible = "mediatek,mt6895-disp-cm",
 	  .data = &mt6895_cm_driver_data},
+	{ .compatible = "mediatek,mt6886-disp-cm",
+	  .data = &mt6886_cm_driver_data},
 	{ .compatible = "mediatek,mt6879-disp-cm",
 	  .data = &mt6879_cm_driver_data},
 	{},

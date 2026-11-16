@@ -10,7 +10,7 @@
 #include "mmprofile_function.h"
 #include "mtk_drm_ddp.h"
 
-#define MMP_CRTC_NUM 3
+#define MMP_CRTC_NUM 4
 
 /* if changed, need to update init_drm_mmp_event() */
 struct DRM_MMP_Events {
@@ -33,8 +33,13 @@ struct DRM_MMP_Events {
 	mmp_event rdma3;
 	mmp_event rdma4;
 	mmp_event rdma5;
+	mmp_event mdp_rdma;
+	mmp_event mdp_rdma0;
+	mmp_event mdp_rdma1;
 	mmp_event wdma;
 	mmp_event wdma0;
+	mmp_event wdma1;
+	mmp_event wdma12;
 	mmp_event dsi;
 	mmp_event dsi0;
 	mmp_event dsi1;
@@ -62,6 +67,7 @@ struct DRM_MMP_Events {
 	mmp_event ion_import_free;
 	mmp_event set_mode;
 	mmp_event top_clk;
+	mmp_event mml_sram;
 	mmp_event sram_alloc;
 	mmp_event sram_free;
 };
@@ -75,6 +81,7 @@ struct CRTC_MMP_Events {
 	mmp_event update_present_fence;
 	mmp_event release_present_fence;
 	mmp_event present_fence_timestamp_same;
+	mmp_event present_fence_timestamp;
 	mmp_event update_sf_present_fence;
 	mmp_event release_sf_present_fence;
 	mmp_event warn_sf_pf_0;
@@ -110,6 +117,8 @@ struct CRTC_MMP_Events {
 	mmp_event wb_dump;
 	mmp_event cwbBmpDump;
 	mmp_event cwb_dump;
+	mmp_event discrete;
+	mmp_event discrete_fill;
 	/*Msync 2.0 mmp start*/
 	mmp_event ovl_status_err;
 	mmp_event vfp_period;
@@ -124,13 +133,24 @@ struct CRTC_MMP_Events {
 	mmp_event aal_sof_thread;
 	mmp_event aal_dre30_rw;
 	mmp_event aal_dre20_rh;
-	/*DRE30 mmp mark*/
-	mmp_event aal_sof_irq;
-	mmp_event aal_sof_rw;
-	mmp_event max_hrt_layers;
 	/*Gamma mmp mark*/
 	mmp_event gamma_ioctl;
 	mmp_event gamma_sof;
+	mmp_event gamma_gain;
+	mmp_event gamma_backlight;
+	mmp_event gammawithbacklight;
+	mmp_event mml_dbg;
+	mmp_event aal_ess20_elvss;
+	mmp_event aal_ess20_gamma;
+	mmp_event aal_ess20_curve;
+	/*Clarity mmp mark*/
+	mmp_event clarity_set_regs;
+	/*ODDMR mmp mark*/
+	mmp_event oddmr_sof_thread;
+	mmp_event oddmr_ctl;
+	/*dsi underrun irq check*/
+	mmp_event dsi_underrun_irq;
+	mmp_event notify_backlight;
 };
 
 struct DRM_MMP_Events *get_drm_mmp_events(void);

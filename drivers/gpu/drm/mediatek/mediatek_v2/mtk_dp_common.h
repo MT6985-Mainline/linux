@@ -13,6 +13,7 @@
 #include <drm/drm_crtc_helper.h>
 #include "mtk_dp_hdcp.h"
 #include "mtk_dp_debug.h"
+#include "mtk_drm_drv.h"
 
 
 #ifndef BYTE
@@ -40,7 +41,8 @@
 #define ENABLE_DPTX_SSC_OUTPUT		1
 #define ENABLE_DPTX_FIX_TPS2		0
 #define AUX_WRITE_READ_WAIT_TIME        20 //us
-#define DPTX_SUPPORT_DSC                1
+#define AUX_NO_REPLY_WAIT_TIME          3200
+#define DPTX_SUPPORT_DSC                0 // confirm DSC scenario before open this.
 #define DPTX_PHY_LEVEL_COUNT            10
 #define DPTX_PHY_REG_COUNT              6
 
@@ -77,11 +79,52 @@
 #define CP2520_PATTERN3                 0x7
 #endif
 
+/****************************************/
+/*		DP SST			*/
+/****************************************/
+#define AUX_CMD_I2C_W_MOT0	0x00
+#define AUX_CMD_I2C_R_MOT0	0x01
+#define AUX_CMD_I2C_W		0x04
+#define AUX_CMD_I2C_R		0x05
+#define AUX_CMD_NATIVE_W	0x08
+#define AUX_CMD_NATIVE_R	0x09
+#define AUX_EDID_SLAVE_ADDR	0x50
+#define AUX_EDID_SEGMENT_ADDR	0x30
+#define AUX_MCCS_SLAVE_ADDR	0x37
+
+
+/****************************************/
+/* PMIC Voter offset */
+/****************************************/
+#define VS_VOTER_EN_LO 0x0
+#define VS_VOTER_EN_LO_SET 0x1
+#define VS_VOTER_EN_LO_CLR 0x2
+
+
 enum dp_cmd {
 	DP_DUMP = 0x20,
 	DP_VIDEO_UNMUTE,
 	DP_CMD_COUNT
 };
+
+enum aux_reply_cmd {
+	AUX_REPLY_ACK = 0x00,
+	AUX_DPCD_NACK = BIT(0),
+	AUX_DPCD_DEFER = BIT(1),
+	AUX_EDID_NACK = BIT(2),
+	AUX_EDID_DEFER = BIT(3),
+	AUX_HW_FAILED = BIT(4),
+	AUX_INVALID_CMD = BIT(5),
+};
+
+enum dp_usb_pin_assign_type {
+	DP_USB_PIN_ASSIGNMENT_C = 4,
+	DP_USB_PIN_ASSIGNMENT_D = 8,
+	DP_USB_PIN_ASSIGNMENT_E = 16,
+	DP_USB_PIN_ASSIGNMENT_F = 32,
+	DP_USB_PIN_ASSIGNMENT_MAX_NUM,
+};
+
 
 union PPS_T {
 	struct{
@@ -277,6 +320,13 @@ struct mtk_dp {
 	struct mtk_drm_private *priv;
 	//phy_params[10] = {L0P0,L0P1,L0P2,L0P3,L1P0,L1P1,L1P2,L2P0,L2P1,L3P0};
 	struct DPTX_PHY_PARAMETER phy_params[DPTX_PHY_LEVEL_COUNT];
+
+	/* pmic vs voter */
+	struct regmap *vsv;
+	u32 vsv_reg;
+	u32 vsv_mask;
+	u32 vsv_vers;
 };
 
 #endif /*__DRTX_TYPE_H__*/
+

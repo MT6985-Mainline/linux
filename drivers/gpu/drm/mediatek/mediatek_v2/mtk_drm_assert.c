@@ -6,10 +6,8 @@
 #include <drm/drm_gem.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
-#include <linux/semaphore.h>
 #include <linux/kmemleak.h>
 #include <drm/mediatek_drm.h>
-#include <drm/drm_fourcc.h>
 #include "mtk_drm_crtc.h"
 #include "mtk_drm_ddp_comp.h"
 #include "mtk_drm_drv.h"
@@ -31,7 +29,7 @@
 
 #define MTK_FB_ALIGNMENT 32
 
-static DEFINE_SEMAPHORE(dal_sem, 0);
+static DEFINE_SEMAPHORE(dal_sem, 1);
 
 static inline int DAL_LOCK(void)
 {
@@ -201,7 +199,7 @@ static struct mtk_ddp_comp *_handle_phy_top_plane(struct mtk_drm_crtc *mtk_crtc)
 }
 
 #ifndef DRM_CMDQ_DISABLE
-#ifndef MTK_DRM_FB_LEAK
+#ifndef MTK_DRM_ASYNC_HANDLE
 static void mtk_drm_cmdq_done(struct cmdq_cb_data data)
 {
 	struct cmdq_pkt *cmdq_handle = data.data;
@@ -318,24 +316,33 @@ int drm_show_dal(struct drm_crtc *crtc, bool enable)
 	return 0;
 #else
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct mtk_drm_private *priv = (crtc && crtc->dev) ? crtc->dev->dev_private : NULL;
 	struct mtk_plane_state *plane_state;
 	struct mtk_ddp_comp *ovl_comp = _handle_phy_top_plane(mtk_crtc);
 	struct cmdq_pkt *cmdq_handle;
 	int layer_id;
+	int ret = 0;
 
 	if (ovl_comp == NULL) {
 		DDPPR_ERR("%s: can't find ovl comp\n", __func__);
 		return 0;
 	}
+	if (IS_ERR_OR_NULL(priv)) {
+		DDPPR_ERR("%s: cant' find priv\n", __func__);
+		return 0;
+	}
+
 	layer_id = mtk_ovl_layer_num(ovl_comp) - 1;
 	if (layer_id < 0) {
 		DDPPR_ERR("%s invalid layer id:%d\n", __func__, layer_id);
 		return 0;
 	}
 
+	DDP_MUTEX_LOCK(&priv->commit.lock, __func__, __LINE__);
 	DDP_MUTEX_LOCK(&mtk_crtc->lock, __func__, __LINE__);
 	if (!mtk_crtc->enabled) {
 		DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
+		DDP_MUTEX_UNLOCK(&priv->commit.lock, __func__, __LINE__);
 		return 0;
 	}
 
@@ -343,6 +350,7 @@ int drm_show_dal(struct drm_crtc *crtc, bool enable)
 	if (!plane_state) {
 		DDPPR_ERR("%s: can't set dal plane_state\n", __func__);
 		DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
+		DDP_MUTEX_UNLOCK(&priv->commit.lock, __func__, __LINE__);
 		return 0;
 	}
 
@@ -353,22 +361,26 @@ int drm_show_dal(struct drm_crtc *crtc, bool enable)
 
 	disable_attached_layer(crtc, ovl_comp, layer_id, cmdq_handle);
 
-	if (mtk_crtc->is_dual_pipe) {
+	if (mtk_crtc->is_dual_pipe)
 		mtk_crtc_dual_layer_config(mtk_crtc, ovl_comp, layer_id, plane_state, cmdq_handle);
-	} else {
+	else
 		mtk_ddp_comp_layer_config(ovl_comp, layer_id, plane_state, cmdq_handle);
-	}
 
 	plane_state->base.crtc = NULL;
 
-#ifdef MTK_DRM_FB_LEAK
-	mtk_crtc_gce_flush(crtc, NULL, cmdq_handle, cmdq_handle);
-	cmdq_pkt_wait_complete(cmdq_handle);
-	cmdq_pkt_destroy(cmdq_handle);
+#ifdef MTK_DRM_ASYNC_HANDLE
+	ret = mtk_crtc_gce_flush(crtc, NULL, cmdq_handle, cmdq_handle);
+	if (ret == -1) {
+		DDPPR_ERR("%s mtk_crtc_gce_flush failed %d\n", __func__, __LINE__);
+	} else {
+		cmdq_pkt_wait_complete(cmdq_handle);
+		cmdq_pkt_destroy(cmdq_handle);
+	}
 #else
 	mtk_crtc_gce_flush(crtc, mtk_drm_cmdq_done, cmdq_handle, cmdq_handle);
 #endif
 	DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
+	DDP_MUTEX_UNLOCK(&priv->commit.lock, __func__, __LINE__);
 	return 0;
 #endif
 }
@@ -398,30 +410,38 @@ void drm_set_dal(struct drm_crtc *crtc, struct cmdq_pkt *cmdq_handle)
 
 	disable_attached_layer(crtc, ovl_comp, layer_id, cmdq_handle);
 
-	if (mtk_crtc->is_dual_pipe) {
+	if (mtk_crtc->is_dual_pipe)
 		mtk_crtc_dual_layer_config(mtk_crtc, ovl_comp, layer_id, plane_state, cmdq_handle);
-	} else {
+	else
 		mtk_ddp_comp_layer_config(ovl_comp, layer_id, plane_state, cmdq_handle);
-	}
 
 	plane_state->base.crtc = NULL;
 }
 
 void drm_update_dal(struct drm_crtc *crtc, struct cmdq_pkt *cmdq_handle)
 {
+	struct MFC_CONTEXT *ctxt = (struct MFC_CONTEXT *)mfc_handle;
+	unsigned int width, height;
+
 	if (!mfc_handle)
 		return;
 
 	DAL_LOCK();
-	MFC_SetWH(mfc_handle, crtc->state->mode.hdisplay,
-		     crtc->state->mode.vdisplay);
+	width = crtc->state->mode.hdisplay;
+	height = crtc->state->mode.vdisplay;
+	/* check DAL buffer size is available after width/height change */
+	if (ctxt->buffer_size < width * height * DAL_BPP) {
+		height = ctxt->buffer_size;
+		do_div(height, (DAL_BPP * width));
+	}
+	MFC_SetWH(mfc_handle, width, height);
 	DAL_SetScreenColor(DAL_COLOR_RED);
 
 	if (drm_dal_enable)
 		MFC_Print(mfc_handle, "Resolution switch, clean dal!\n");
 	DAL_UNLOCK();
 
-	if (drm_dal_enable)
+	if (drm_dal_enable && cmdq_handle)
 		drm_set_dal(crtc, cmdq_handle);
 }
 
@@ -516,9 +536,9 @@ void mtk_drm_assert_fb_init(struct drm_device *dev, u32 width, u32 height)
 
 void mtk_drm_assert_init(struct drm_device *dev)
 {
-	struct mtk_drm_gem_obj *mtk_gem;
-	struct drm_crtc *crtc;
-	u32 width, height, size;
+	struct mtk_drm_gem_obj *mtk_gem = NULL;
+	struct drm_crtc *crtc = NULL;
+	u32 width = 0, height = 0, size = 0;
 
 	crtc = list_first_entry(&(dev)->mode_config.crtc_list,
 		typeof(*crtc), head);
@@ -534,7 +554,6 @@ void mtk_drm_assert_init(struct drm_device *dev)
 	mtk_gem = mtk_drm_gem_create(dev, size, true);
 	if (IS_ERR(mtk_gem)) {
 		DDPINFO("alloc buffer fail\n");
-		drm_gem_object_release(&mtk_gem->base);
 		return;
 	}
 	//Avoid kmemleak to scan

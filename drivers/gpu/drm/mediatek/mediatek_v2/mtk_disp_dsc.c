@@ -24,6 +24,8 @@
 #include "mtk_drm_gem.h"
 #include "mtk_drm_fb.h"
 #include "mtk_dp_api.h"
+#include "mtk_disp_dsc.h"
+#include "platform/mtk_drm_platform.h"
 
 #define DISP_REG_DSC_CON			0x0000
 	#define DSC_EN BIT(0)
@@ -33,6 +35,7 @@
 	#define DSC_RELAY BIT(5)
 	#define DSC_EMPTY_FLAG_SEL REG_FLD_MSB_LSB(15, 14)
 	#define DSC_UFOE_SEL BIT(16)
+	#define DSC_OUTPUT_SWAP BIT(18)
 	#define CON_FLD_DSC_EN		REG_FLD_MSB_LSB(0, 0)
 	#define CON_FLD_DISP_DSC_BYPASS		REG_FLD_MSB_LSB(4, 4)
 
@@ -96,6 +99,11 @@
 #define DISP_REG_DSC_PPS17			0x00C4
 #define DISP_REG_DSC_PPS18			0x00C8
 #define DISP_REG_DSC_PPS19			0x00CC
+	#define RANGE_MIN_QP_EVEN			REG_FLD_MSB_LSB(4, 0)
+	#define RANGE_MAX_QP_EVEN			REG_FLD_MSB_LSB(9, 5)
+	#define RANGE_MIN_QP_ODD			REG_FLD_MSB_LSB(20, 16)
+	#define RANGE_MAX_QP_ODD			REG_FLD_MSB_LSB(25, 21)
+
 
 #define DISP_REG_DSC_SHADOW			0x0200
 #define DSC_FORCE_COMMIT	BIT(0)
@@ -103,16 +111,11 @@
 #define DSC_READ_WORKING	BIT(2)
 #define MT6983_DISP_REG_SHADOW_CTRL		0x0228
 
-struct mtk_disp_dsc_data {
-	bool support_shadow;
-	bool need_bypass_shadow;
-	bool need_obuf_sw;
-	bool dsi_buffer;
-	unsigned int shadow_ctrl_reg;
-};
+#define RC_BUF_THRESH_NUM (14)
+#define RANGE_BPG_OFS_NUM (15)
 
+#define DISP_REG_DSC1_OFFSET        0x0400
 #define DISP_REG_SHADOW_CTRL(module)	((module)->data->shadow_ctrl_reg)
-
 
 /**
  * struct mtk_disp_dsc - DISP_DSC driver structure
@@ -200,8 +203,8 @@ static void mtk_dsc_start(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 		mtk_ddp_write_mask(comp, DSC_EN, DISP_REG_DSC_CON,
 				DSC_EN, handle);
 
-	pr_err("COROT-STAGE dsc_start: CON=0x%08x INTSTA=0x%08x\n",
-	       readl(baddr + DISP_REG_DSC_CON), readl(baddr + DISP_REG_DSC_INTSTA));
+	DDPINFO("%s, dsc_start:0x%x\n",
+		mtk_dump_comp_str(comp), readl(baddr + DISP_REG_DSC_CON));
 }
 
 static void mtk_dsc_stop(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
@@ -209,8 +212,8 @@ static void mtk_dsc_stop(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle)
 	void __iomem *baddr = comp->regs;
 
 	mtk_ddp_write_mask(comp, 0x0, DISP_REG_DSC_CON, DSC_EN, handle);
-	pr_err("COROT-STAGE dsc_stop: CON=0x%08x\n",
-	       readl(baddr + DISP_REG_DSC_CON));
+	DDPINFO("%s, dsc_stop:0x%x\n",
+		mtk_dump_comp_str(comp), readl(baddr + DISP_REG_DSC_CON));
 }
 
 static void mtk_dsc_prepare(struct mtk_ddp_comp *comp)
@@ -220,9 +223,12 @@ static void mtk_dsc_prepare(struct mtk_ddp_comp *comp)
 	mtk_ddp_comp_clk_prepare(comp);
 
 	/* Bypass shadow register and read shadow register */
-	if (dsc->data->need_bypass_shadow)
+	if (dsc->data->need_bypass_shadow) {
 		mtk_ddp_write_mask_cpu(comp, DSC_BYPASS_SHADOW,
 			DISP_REG_SHADOW_CTRL(dsc), DSC_BYPASS_SHADOW);
+		mtk_ddp_write_mask_cpu(comp, DSC_BYPASS_SHADOW,
+			DISP_REG_SHADOW_CTRL(dsc) + DISP_REG_DSC1_OFFSET, DSC_BYPASS_SHADOW);
+	}
 }
 
 static void mtk_dsc_unprepare(struct mtk_ddp_comp *comp)
@@ -232,6 +238,7 @@ static void mtk_dsc_unprepare(struct mtk_ddp_comp *comp)
 
 struct mtk_panel_dsc_params *mtk_dsc_default_setting(void)
 {
+	u8 dsc_cap[16];
 	static struct mtk_panel_dsc_params dsc_params = {
 		.enable = 1,
 		.ver = 2,
@@ -267,6 +274,10 @@ struct mtk_panel_dsc_params *mtk_dsc_default_setting(void)
 		.rc_tgt_offset_hi = 3,
 		.rc_tgt_offset_lo = 3,
 	};
+
+	mtk_dp_get_dsc_capability(dsc_cap);
+	dsc_params.bp_enable = dsc_cap[6];
+	//dsc_params.ver = dsc_cap[1];
 
 	return &dsc_params;
 }
@@ -308,6 +319,12 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 	struct mtk_panel_dsc_params *dsc_params;
 	struct mtk_panel_spr_params *spr_params;
 
+	unsigned int *rc_buf_thresh;
+	unsigned int *range_min_qp;
+	unsigned int *range_max_qp;
+	int *range_bpg_ofs;
+	unsigned int i = 0;
+
 	if (!comp->mtk_crtc || (!comp->mtk_crtc->panel_ext
 				&& !comp->mtk_crtc->is_dual_pipe))
 		return;
@@ -319,25 +336,10 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 	dsc_params = &comp->mtk_crtc->panel_ext->params->dsc_params;
 	spr_params = &comp->mtk_crtc->panel_ext->params->spr_params;
 
-	pr_err("COROT-DSC-PARAMS ver=%d slice_mode=%d rgb_swap=%d dsc_cfg=%d rct=%d bpc=%d lbuf=%d bp=%d bpp=%d\n",
-	       dsc_params->ver, dsc_params->slice_mode, dsc_params->rgb_swap,
-	       dsc_params->dsc_cfg, dsc_params->rct_on, dsc_params->bit_per_channel,
-	       dsc_params->dsc_line_buf_depth, dsc_params->bp_enable,
-	       dsc_params->bit_per_pixel);
-	pr_err("COROT-DSC-PARAMS pic=%dx%d slice=%dx%d chunk=%d xmit=%d dec=%d\n",
-	       dsc_params->pic_width, dsc_params->pic_height,
-	       dsc_params->slice_width, dsc_params->slice_height,
-	       dsc_params->chunk_size, dsc_params->xmit_delay, dsc_params->dec_delay);
-	pr_err("COROT-DSC-PARAMS scale=%d incr=%d decr=%d lbpo=%d nfl=%d sbpo=%d init=%d fin=%d\n",
-	       dsc_params->scale_value, dsc_params->increment_interval,
-	       dsc_params->decrement_interval, dsc_params->line_bpg_offset,
-	       dsc_params->nfl_bpg_offset, dsc_params->slice_bpg_offset,
-	       dsc_params->initial_offset, dsc_params->final_offset);
-	pr_err("COROT-DSC-PARAMS fmin=%d fmax=%d rc=%d edge=%d q0=%d q1=%d tgt_hi=%d tgt_lo=%d\n",
-	       dsc_params->flatness_minqp, dsc_params->flatness_maxqp,
-	       dsc_params->rc_model_size, dsc_params->rc_edge_factor,
-	       dsc_params->rc_quant_incr_limit0, dsc_params->rc_quant_incr_limit1,
-	       dsc_params->rc_tgt_offset_hi, dsc_params->rc_tgt_offset_lo);
+	rc_buf_thresh = dsc_params->ext_pps_cfg.rc_buf_thresh;
+	range_min_qp = dsc_params->ext_pps_cfg.range_min_qp;
+	range_max_qp = dsc_params->ext_pps_cfg.range_max_qp;
+	range_bpg_ofs = dsc_params->ext_pps_cfg.range_bpg_ofs;
 
 	if (dsc_params->enable == 1) {
 		DDPINFO("%s, w:%d, h:%d, slice_mode:%d,slice(%d,%d),bpp:%d\n",
@@ -408,8 +410,6 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 		}
 		pad_num = (chrunk_size * (dsc_params->slice_mode + 1) + 2) / 3 * 3
 			- chrunk_size * (dsc_params->slice_mode + 1);
-		DDPMSG("%s+ pad_num:%d\n", __func__, pad_num);
-
 		mtk_ddp_write_relaxed(comp,
 			enc_pic_width << 16 | enc_slice_width,
 			DISP_REG_DSC_ENC_WIDTH, handle);
@@ -419,8 +419,15 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 		else
 			dsc_con = 0x4000;
 		dsc_con |= DSC_UFOE_SEL;
-		if (comp->mtk_crtc->is_dual_pipe)
-			dsc_con |= DSC_IN_SRC_SEL;
+		if (comp->mtk_crtc->is_dual_pipe) {
+			if (comp->mtk_crtc->panel_ext->params->output_mode
+				== MTK_PANEL_DUAL_PORT)
+				dsc_con |= DSC_DUAL_INOUT;
+			else
+				dsc_con |= DSC_IN_SRC_SEL;
+		}
+		if (comp->mtk_crtc->is_dsc_output_swap)
+			dsc_con |= DSC_OUTPUT_SWAP;
 
 		mtk_ddp_write_relaxed(comp,
 			dsc_con, DISP_REG_DSC_CON, handle);
@@ -474,8 +481,6 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 		mtk_ddp_write_mask(comp, reg_val,
 					DISP_REG_DSC_MODE, 0xFFFF, handle);
 
-		/* COROT: match the vendor (and LK's 0x28) - our tree added
-		 * bit 11 here, which LK's working configuration does not have. */
 		mtk_ddp_write_relaxed(comp,
 			(dsc_params->dsc_cfg == 0) ? 0x22 : dsc_params->dsc_cfg,
 			DISP_REG_DSC_CFG, handle);
@@ -488,7 +493,7 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 			(((dsc_params->ver & 0xf) == 2) ? 0x40 : 0x20),
 			DISP_REG_DSC_SHADOW, 0x60, handle);
 
-		reg_val = dsc_params->dsc_line_buf_depth;
+		reg_val = dsc_params->dsc_line_buf_depth & 0xF;
 		if (dsc_params->bit_per_channel == 0)
 			reg_val |= (0x8 << 4);
 		else
@@ -543,47 +548,6 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 		mtk_ddp_write_relaxed(comp,	reg_val,
 			DISP_REG_DSC_PPS5, handle);
 
-		{
-			void __iomem *baddr = comp->regs;
-
-			pr_err("COROT-DSC CON=0x%08x MODE=0x%08x ENC_W=0x%08x\n",
-				readl(baddr + DISP_REG_DSC_CON),
-				readl(baddr + DISP_REG_DSC_MODE),
-				readl(baddr + DISP_REG_DSC_ENC_WIDTH));
-			pr_err("COROT-DSC PIC_W=0x%08x PIC_H=0x%08x SLICE_W=0x%08x SLICE_H=0x%08x\n",
-				readl(baddr + DISP_REG_DSC_PIC_W),
-				readl(baddr + DISP_REG_DSC_PIC_H),
-				readl(baddr + DISP_REG_DSC_SLICE_W),
-				readl(baddr + DISP_REG_DSC_SLICE_H));
-			pr_err("COROT-DSC CHUNK=0x%08x BUF=0x%08x PPS0=0x%08x PPS1=0x%08x\n",
-				readl(baddr + DISP_REG_DSC_CHUNK_SIZE),
-				readl(baddr + DISP_REG_DSC_BUF_SIZE),
-				readl(baddr + DISP_REG_DSC_PPS0),
-				readl(baddr + DISP_REG_DSC_PPS1));
-
-			/*
-			 * COROT r340: MEASURE which range-parameter table the encoder holds.
-			 * Nothing has ever read these back after our own write -- every
-			 * DSC-FULL dump in the r331..r339 logs is LK's stale value, printed
-			 * before the CMDQ packet lands -- so "the encoder's bits-per-group
-			 * table equals the DDIC decoder's" was never verified.  These four
-			 * words decide it, and LK leaves
-			 * 0xd9c7e1a7 0xd209d9e9 0xd22bd229 0x0000d271 here (which is also
-			 * what the vendor's CONFIG_MI_DISP_DSC2712=y table programs).
-			 */
-			pr_err("COROT r340 pps: sel=0x%08x PPS12=0x%08x PPS13=0x%08x PPS14=0x%08x PPS15=0x%08x\n",
-			       dsc_params->dsc_config_panel_name,
-			       readl(baddr + DISP_REG_DSC_PPS12),
-			       readl(baddr + DISP_REG_DSC_PPS13),
-			       readl(baddr + DISP_REG_DSC_PPS14),
-			       readl(baddr + DISP_REG_DSC_PPS15));
-			pr_err("COROT r340 pps: PPS16=0x%08x PPS17=0x%08x PPS18=0x%08x PPS19=0x%08x  (LK and the vendor DSC2712 table: d9c7e1a7 d209d9e9 d22bd229 0000d271)\n",
-			       readl(baddr + DISP_REG_DSC_PPS16),
-			       readl(baddr + DISP_REG_DSC_PPS17),
-			       readl(baddr + DISP_REG_DSC_PPS18),
-			       readl(baddr + DISP_REG_DSC_PPS19));
-		}
-
 		reg_val = ((dsc_params->flatness_minqp == 0) ?
 			0x3 : dsc_params->flatness_minqp);
 		reg_val |= ((dsc_params->flatness_maxqp == 0) ?
@@ -597,121 +561,26 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 			mtk_dump_comp_str(comp), dsc_params->bit_per_channel);
 		if (dsc_params->bit_per_channel == 10) {
 			//10bpc_to_8bpp_20_slice_h
-			if (dsc_params->dsc_config_panel_name == 0x6c126101) {
-				DDPMSG("L12A CSOT dsc config\n");
-				mtk_ddp_write(comp, 0x20001007, DISP_REG_DSC_PPS6, handle);
-				mtk_ddp_write(comp, 0x330F0F06, DISP_REG_DSC_PPS7, handle);
-				mtk_ddp_write(comp, 0x382a1c0e, DISP_REG_DSC_PPS8, handle);
-				mtk_ddp_write(comp, 0x69625446, DISP_REG_DSC_PPS9, handle);
-				mtk_ddp_write(comp, 0x7b797770, DISP_REG_DSC_PPS10, handle);
-				mtk_ddp_write(comp, 0x00007e7d, DISP_REG_DSC_PPS11, handle);
-				mtk_ddp_write(comp, 0x01040900, DISP_REG_DSC_PPS12, handle);
-				mtk_ddp_write(comp, 0xF9450125, DISP_REG_DSC_PPS13, handle);
-				mtk_ddp_write(comp, 0xE967F167, DISP_REG_DSC_PPS14, handle);
-				mtk_ddp_write(comp, 0xE187E167, DISP_REG_DSC_PPS15, handle);
-				mtk_ddp_write(comp, 0xD9C7E1A7, DISP_REG_DSC_PPS16, handle);
-				mtk_ddp_write(comp, 0xD209D9E9, DISP_REG_DSC_PPS17, handle);
-				mtk_ddp_write(comp, 0xD22BD229, DISP_REG_DSC_PPS18, handle);
-				mtk_ddp_write(comp, 0x0000D271, DISP_REG_DSC_PPS19, handle);
-			} else if (dsc_params->dsc_config_panel_name == 0x6c126102) {
-				DDPMSG("L12A TM dsc config\n");
-				mtk_ddp_write(comp, 0x20001007, DISP_REG_DSC_PPS6, handle);
-				mtk_ddp_write(comp, 0x330F0F06, DISP_REG_DSC_PPS7, handle);
-				mtk_ddp_write(comp, 0x382a1c0e, DISP_REG_DSC_PPS8, handle);
-				mtk_ddp_write(comp, 0x69625446, DISP_REG_DSC_PPS9, handle);
-				mtk_ddp_write(comp, 0x7b797770, DISP_REG_DSC_PPS10, handle);
-				mtk_ddp_write(comp, 0x00007e7d, DISP_REG_DSC_PPS11, handle);
-				mtk_ddp_write(comp, 0x01040900, DISP_REG_DSC_PPS12, handle);
-				mtk_ddp_write(comp, 0xF9450125, DISP_REG_DSC_PPS13, handle);
-				mtk_ddp_write(comp, 0xE967F167, DISP_REG_DSC_PPS14, handle);
-				mtk_ddp_write(comp, 0xE187E167, DISP_REG_DSC_PPS15, handle);
-				mtk_ddp_write(comp, 0xd9c8e1a7, DISP_REG_DSC_PPS16, handle);
-				mtk_ddp_write(comp, 0xd9e9d9c9, DISP_REG_DSC_PPS17, handle);
-				mtk_ddp_write(comp, 0xd20cd1e9, DISP_REG_DSC_PPS18, handle);
-				mtk_ddp_write(comp, 0x0000d230, DISP_REG_DSC_PPS19, handle);
-			}  else if (dsc_params->dsc_config_panel_name == 0x6d126101) {
-				DDPMSG("M12A TM dsc config\n");
-				mtk_ddp_write(comp, 0x20001007, DISP_REG_DSC_PPS6, handle);
-				mtk_ddp_write(comp, 0x330F0F06, DISP_REG_DSC_PPS7, handle);
-				mtk_ddp_write(comp, 0x382a1c0e, DISP_REG_DSC_PPS8, handle);
-				mtk_ddp_write(comp, 0x69625446, DISP_REG_DSC_PPS9, handle);
-				mtk_ddp_write(comp, 0x7b797770, DISP_REG_DSC_PPS10, handle);
-				mtk_ddp_write(comp, 0x00007e7d, DISP_REG_DSC_PPS11, handle);
-				mtk_ddp_write(comp, 0x01040900, DISP_REG_DSC_PPS12, handle);
-				mtk_ddp_write(comp, 0xF9450125, DISP_REG_DSC_PPS13, handle);
-				mtk_ddp_write(comp, 0xE967F167, DISP_REG_DSC_PPS14, handle);
-				mtk_ddp_write(comp, 0xE187E167, DISP_REG_DSC_PPS15, handle);
-				mtk_ddp_write(comp, 0xd9c8e1a7, DISP_REG_DSC_PPS16, handle);
-				mtk_ddp_write(comp, 0xd9e9d9c9, DISP_REG_DSC_PPS17, handle);
-				mtk_ddp_write(comp, 0xd20cd1e9, DISP_REG_DSC_PPS18, handle);
-				mtk_ddp_write(comp, 0x0000d230, DISP_REG_DSC_PPS19, handle);
-			} else if (dsc_params->dsc_config_panel_name == 0x6d126102) {
-				DDPMSG("M12A CSOT dsc config\n");
-				mtk_ddp_write(comp, 0x20001007, DISP_REG_DSC_PPS6, handle);
-				mtk_ddp_write(comp, 0x330F0F06, DISP_REG_DSC_PPS7, handle);
-				mtk_ddp_write(comp, 0x382a1c0e, DISP_REG_DSC_PPS8, handle);
-				mtk_ddp_write(comp, 0x69625446, DISP_REG_DSC_PPS9, handle);
-				mtk_ddp_write(comp, 0x7b797770, DISP_REG_DSC_PPS10, handle);
-				mtk_ddp_write(comp, 0x00007e7d, DISP_REG_DSC_PPS11, handle);
-				mtk_ddp_write(comp, 0x01040900, DISP_REG_DSC_PPS12, handle);
-				mtk_ddp_write(comp, 0xF9450125, DISP_REG_DSC_PPS13, handle);
-				mtk_ddp_write(comp, 0xE967F167, DISP_REG_DSC_PPS14, handle);
-				mtk_ddp_write(comp, 0xE187E167, DISP_REG_DSC_PPS15, handle);
-				mtk_ddp_write(comp, 0xD9C7E1A7, DISP_REG_DSC_PPS16, handle);
-				mtk_ddp_write(comp, 0xD209D9E9, DISP_REG_DSC_PPS17, handle);
-				mtk_ddp_write(comp, 0xD22BD229, DISP_REG_DSC_PPS18, handle);
-				mtk_ddp_write(comp, 0x0000D271, DISP_REG_DSC_PPS19, handle);
-			} else if (dsc_params->dsc_config_panel_name == 0x6c026d01) {
-				DDPMSG("L2M SDC dsc config\n");
-				mtk_ddp_write(comp, 0x20001007, DISP_REG_DSC_PPS6, handle);
-				mtk_ddp_write(comp, 0x330F0F06, DISP_REG_DSC_PPS7, handle);
-				mtk_ddp_write(comp, 0x382a1c0e, DISP_REG_DSC_PPS8, handle);
-				mtk_ddp_write(comp, 0x69625446, DISP_REG_DSC_PPS9, handle);
-				mtk_ddp_write(comp, 0x7b797770, DISP_REG_DSC_PPS10, handle);
-				mtk_ddp_write(comp, 0x00007e7d, DISP_REG_DSC_PPS11, handle);
-				mtk_ddp_write(comp, 0x01040900, DISP_REG_DSC_PPS12, handle);
-				mtk_ddp_write(comp, 0xF9450125, DISP_REG_DSC_PPS13, handle);
-				mtk_ddp_write(comp, 0xE967F167, DISP_REG_DSC_PPS14, handle);
-				mtk_ddp_write(comp, 0xE187E167, DISP_REG_DSC_PPS15, handle);
-				mtk_ddp_write(comp, 0xD9C7E1A7, DISP_REG_DSC_PPS16, handle);
-				mtk_ddp_write(comp, 0xD1E9D9C9, DISP_REG_DSC_PPS17, handle);
-				mtk_ddp_write(comp, 0xD20DD1E9, DISP_REG_DSC_PPS18, handle);
-				mtk_ddp_write(comp, 0x0000D230, DISP_REG_DSC_PPS19, handle);
-			}else if(dsc_params->dsc_config_panel_name == 0x6c226101)
-			{
-				DDPMSG("dsc_config mi_disp M9 CSOT dsc config\n");
-				mtk_ddp_write(comp, 0x20001007, DISP_REG_DSC_PPS6, handle);
-				mtk_ddp_write(comp, 0x330F0F06, DISP_REG_DSC_PPS7, handle);
-				mtk_ddp_write(comp, 0x382a1c0e, DISP_REG_DSC_PPS8, handle);
-				mtk_ddp_write(comp, 0x69625446, DISP_REG_DSC_PPS9, handle);
-				mtk_ddp_write(comp, 0x7b797770, DISP_REG_DSC_PPS10, handle);
-				mtk_ddp_write(comp, 0x00007e7d, DISP_REG_DSC_PPS11, handle);
-				mtk_ddp_write(comp, 0x01040900, DISP_REG_DSC_PPS12, handle);
-				mtk_ddp_write(comp, 0xf9450125, DISP_REG_DSC_PPS13, handle);
-				mtk_ddp_write(comp, 0xe967f167, DISP_REG_DSC_PPS14, handle);
-				mtk_ddp_write(comp, 0xe187e167, DISP_REG_DSC_PPS15, handle);
-				mtk_ddp_write(comp, 0xd9c7e1a7, DISP_REG_DSC_PPS16, handle);
-				mtk_ddp_write(comp, 0xd209d9e9, DISP_REG_DSC_PPS17, handle);
-				mtk_ddp_write(comp, 0xd22bd229, DISP_REG_DSC_PPS18, handle);
-				mtk_ddp_write(comp, 0x0000d271, DISP_REG_DSC_PPS19, handle);
-			}
-			else {
-				DDPMSG("dsi default dsc config\n");
-				mtk_ddp_write(comp, 0x20001007, DISP_REG_DSC_PPS6, handle);
-				mtk_ddp_write(comp, 0x330F0F06, DISP_REG_DSC_PPS7, handle);
-				mtk_ddp_write(comp, 0x382a1c0e, DISP_REG_DSC_PPS8, handle);
-				mtk_ddp_write(comp, 0x69625446, DISP_REG_DSC_PPS9, handle);
-				mtk_ddp_write(comp, 0x7b797770, DISP_REG_DSC_PPS10, handle);
-				mtk_ddp_write(comp, 0x00007e7d, DISP_REG_DSC_PPS11, handle);
-				mtk_ddp_write(comp, 0x01040880, DISP_REG_DSC_PPS12, handle);
-				mtk_ddp_write(comp, 0xF9450125, DISP_REG_DSC_PPS13, handle);
-				mtk_ddp_write(comp, 0xE967F167, DISP_REG_DSC_PPS14, handle);
-				mtk_ddp_write(comp, 0xE187E167, DISP_REG_DSC_PPS15, handle);
-				mtk_ddp_write(comp, 0xD9C7E1A7, DISP_REG_DSC_PPS16, handle);
-				mtk_ddp_write(comp, 0xD209D9E9, DISP_REG_DSC_PPS17, handle);
-				mtk_ddp_write(comp, 0xD22BD229, DISP_REG_DSC_PPS18, handle);
-				mtk_ddp_write(comp, 0x0000D271, DISP_REG_DSC_PPS19, handle);
-	}
+			mtk_ddp_write(comp, 0x20001007, DISP_REG_DSC_PPS6, handle);
+			mtk_ddp_write(comp, 0x330F0F06, DISP_REG_DSC_PPS7, handle);
+			mtk_ddp_write(comp, 0x382a1c0e, DISP_REG_DSC_PPS8, handle);
+			mtk_ddp_write(comp, 0x69625446, DISP_REG_DSC_PPS9, handle);
+			mtk_ddp_write(comp, 0x7b797770, DISP_REG_DSC_PPS10, handle);
+			mtk_ddp_write(comp, 0x00007e7d, DISP_REG_DSC_PPS11, handle);
+			mtk_ddp_write(comp, 0x01040900, DISP_REG_DSC_PPS12, handle);
+			mtk_ddp_write(comp, 0xF9450125, DISP_REG_DSC_PPS13, handle);
+			mtk_ddp_write(comp, 0xE967F167, DISP_REG_DSC_PPS14, handle);
+			mtk_ddp_write(comp, 0xE187E167, DISP_REG_DSC_PPS15, handle);
+			mtk_ddp_write(comp, 0xD9C7E1A7, DISP_REG_DSC_PPS16, handle);
+#ifdef CONFIG_MI_DISP_DSC2712
+			mtk_ddp_write(comp, 0xD209D9E9, DISP_REG_DSC_PPS17, handle);
+			mtk_ddp_write(comp, 0xD22BD229, DISP_REG_DSC_PPS18, handle);
+			mtk_ddp_write(comp, 0x0000D271, DISP_REG_DSC_PPS19, handle);
+#else
+			mtk_ddp_write(comp, 0xD1E9D9C9, DISP_REG_DSC_PPS17, handle);
+			mtk_ddp_write(comp, 0xD20DD1E9, DISP_REG_DSC_PPS18, handle);
+			mtk_ddp_write(comp, 0x0000D230, DISP_REG_DSC_PPS19, handle);
+#endif
 		} else {
 			//8bpc_to_8bpp_20_slice_h
 			mtk_ddp_write(comp, 0x20000c03, DISP_REG_DSC_PPS6, handle);
@@ -724,28 +593,72 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 			mtk_ddp_write(comp, 0xf8c100a1, DISP_REG_DSC_PPS13, handle);
 			mtk_ddp_write(comp, 0xe8e3f0e3, DISP_REG_DSC_PPS14, handle);
 			mtk_ddp_write(comp, 0xe103e0e3, DISP_REG_DSC_PPS15, handle);
-#ifndef CONFIG_MI_DISP_DSC2712
 			mtk_ddp_write(comp, 0xd943e123,	DISP_REG_DSC_PPS16, handle);
 			mtk_ddp_write(comp, 0xd185d965,	DISP_REG_DSC_PPS17, handle);
 			mtk_ddp_write(comp, 0xd1a7d1a5,	DISP_REG_DSC_PPS18, handle);
 			mtk_ddp_write(comp, 0x0000d1ed,	DISP_REG_DSC_PPS19, handle);
-#else
-			mtk_ddp_write(comp, 0xd944e123, DISP_REG_DSC_PPS16, handle);
-			mtk_ddp_write(comp, 0xd965d945, DISP_REG_DSC_PPS17, handle);
-			mtk_ddp_write(comp, 0xd188d165, DISP_REG_DSC_PPS18, handle);
-			mtk_ddp_write(comp, 0x0000d1ac, DISP_REG_DSC_PPS19, handle);
-#endif
 		}
-
 		if (spr_params->enable && spr_params->relay == 0
 					&& disp_spr_bypass == 0) {
-			mtk_ddp_write(comp, 0x0001d822, DISP_REG_DSC_CFG, handle);//VESA1.2 needed
+			//mtk_ddp_write(comp, 0x0001d822, DISP_REG_DSC_CFG, handle);//VESA1.2 needed
 			//mtk_ddp_write(comp, 0x00014001, DISP_REG_DSC_CON, handle);
 			mtk_ddp_write(comp, 0x800840, DISP_REG_DSC_PPS12, handle);
-			mtk_ddp_write(comp, 0xd923e103,	DISP_REG_DSC_PPS16, handle);
-			mtk_ddp_write(comp, 0xd125d925,	DISP_REG_DSC_PPS17, handle);
-			mtk_ddp_write(comp, 0xd147d125,	DISP_REG_DSC_PPS18, handle);
-			mtk_ddp_write(comp, 0xd16a,	DISP_REG_DSC_PPS19, handle);
+			mtk_ddp_write(comp, 0xd923e103, DISP_REG_DSC_PPS16, handle);
+			mtk_ddp_write(comp, 0xd125d925, DISP_REG_DSC_PPS17, handle);
+			mtk_ddp_write(comp, 0xd147d125, DISP_REG_DSC_PPS18, handle);
+			mtk_ddp_write(comp, 0xd16a, DISP_REG_DSC_PPS19, handle);
+		}
+
+		if (dsc_params->ext_pps_cfg.enable) {
+			if (rc_buf_thresh) {
+				for (i = 0; i < RC_BUF_THRESH_NUM/4; i++) {
+					reg_val = 0;
+					reg_val += ((*(rc_buf_thresh+i*4+0))>>6)<<0;
+					reg_val += ((*(rc_buf_thresh+i*4+1))>>6)<<8;
+					reg_val += ((*(rc_buf_thresh+i*4+2))>>6)<<16;
+					reg_val += ((*(rc_buf_thresh+i*4+3))>>6)<<24;
+					mtk_ddp_write(comp, reg_val, DISP_REG_DSC_PPS8+i*4, handle);
+				}
+				reg_val = 0;
+				for (i = 0; i < RC_BUF_THRESH_NUM%4; i++)
+					reg_val += ((*(rc_buf_thresh +
+							RC_BUF_THRESH_NUM/4*4+i))>>6)<<(8*i);
+				mtk_ddp_write(comp, reg_val,
+					DISP_REG_DSC_PPS8+RC_BUF_THRESH_NUM/4*4, handle);
+			}
+			if (range_min_qp && range_max_qp && range_bpg_ofs) {
+				for (i = 0; i < RANGE_BPG_OFS_NUM/2; i++) {
+					reg_val = 0;
+					reg_val += (*(range_min_qp+i*2+0))<<0;
+					reg_val += (*(range_max_qp+i*2+0))<<5;
+					if (*(range_bpg_ofs+i*2+0) >= 0)
+						reg_val += (*(range_bpg_ofs+i*2+0))<<10;
+					else
+						reg_val += (64 - (*(range_bpg_ofs+i*2+0))*(-1))<<10;
+					reg_val += (*(range_min_qp+i*2+1))<<16;
+					reg_val += (*(range_max_qp+i*2+1))<<21;
+					if (*(range_bpg_ofs+i*2+1) >= 0)
+						reg_val += (*(range_bpg_ofs+i*2+1))<<26;
+					else
+						reg_val += (64 - (*(range_bpg_ofs+i*2+1))*(-1))<<26;
+					if(i == 0){
+						reg_val = reg_val >> 4;
+						DDPMSG("%s reg_val >> 4 = %x\n", __func__, reg_val);
+					}
+					mtk_ddp_write(comp, reg_val,
+						DISP_REG_DSC_PPS12+i*4, handle);
+				}
+				reg_val = 0;
+				reg_val += (*(range_min_qp+RANGE_BPG_OFS_NUM/2*2))<<0;
+				reg_val += (*(range_max_qp+RANGE_BPG_OFS_NUM/2*2))<<5;
+				if (*(range_bpg_ofs+RANGE_BPG_OFS_NUM/2*2) >= 0)
+					reg_val += (*(range_bpg_ofs+RANGE_BPG_OFS_NUM/2*2))<<10;
+				else
+					reg_val += (64 - (*(range_bpg_ofs +
+							RANGE_BPG_OFS_NUM/2*2))*(-1))<<10;
+				mtk_ddp_write(comp, reg_val,
+					DISP_REG_DSC_PPS12+RANGE_BPG_OFS_NUM/2*4, handle);
+			}
 		}
 
 #ifdef IF_ZERO
@@ -785,7 +698,15 @@ static void mtk_dsc_config(struct mtk_ddp_comp *comp,
 		/*enable dsc relay mode*/
 		mtk_ddp_write_mask(comp, DSC_RELAY, DISP_REG_DSC_CON,
 				DSC_RELAY, handle);
-		dsc->enable = false;
+		mtk_ddp_write_relaxed(comp, cfg->w, DISP_REG_DSC_PIC_W, handle);
+		mtk_ddp_write_relaxed(comp, (cfg->h - 1), DISP_REG_DSC_PIC_H, handle);
+		mtk_ddp_write_relaxed(comp, cfg->w, DISP_REG_DSC_SLICE_W, handle);
+		mtk_ddp_write_relaxed(comp, (cfg->h - 1), DISP_REG_DSC_SLICE_H, handle);
+
+		if (comp->mtk_crtc->is_dsc_output_swap)
+			mtk_ddp_write_mask(comp, DSC_OUTPUT_SWAP, DISP_REG_DSC_CON,
+				DSC_OUTPUT_SWAP, handle);
+		dsc->enable = true;    /*need to enable dsc in relay mode*/
 	}
 }
 
@@ -794,20 +715,25 @@ void mtk_dsc_dump(struct mtk_ddp_comp *comp)
 	void __iomem *baddr = comp->regs;
 	int i;
 
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return;
+	}
+
 	DDPDUMP("== %s REGS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs_pa);
 
 	DDPDUMP("(0x000)DSC_START=0x%x\n", readl(baddr + DISP_REG_DSC_CON));
-	DDPDUMP("(0x020)DSC_SLICE_WIDTH=0x%x\n",
-		readl(baddr + DISP_REG_DSC_SLICE_W));
-	DDPDUMP("(0x024)DSC_SLICE_HIGHT=0x%x\n",
-		readl(baddr + DISP_REG_DSC_SLICE_H));
-	DDPDUMP("(0x018)DSC_WIDTH=0x%x\n", readl(baddr + DISP_REG_DSC_PIC_W));
-	DDPDUMP("(0x01C)DSC_HEIGHT=0x%x\n", readl(baddr + DISP_REG_DSC_PIC_H));
+	DDPDUMP("(0x020)DSC_SLICE_WIDTH=%d\n",
+		readl(baddr + DISP_REG_DSC_SLICE_W) & 0xffff);
+	DDPDUMP("(0x024)DSC_SLICE_HIGHT=%d\n",
+		(readl(baddr + DISP_REG_DSC_SLICE_H) & 0xffff) + 1);
+	DDPDUMP("(0x018)DSC_WIDTH=%d\n", readl(baddr + DISP_REG_DSC_PIC_W) & 0xffff);
+	DDPDUMP("(0x01C)DSC_HEIGHT=%d\n", (readl(baddr + DISP_REG_DSC_PIC_H) & 0xffff) + 1);
 	DDPDUMP("(0x200)DSC_SHADOW=0x%x\n",
 		readl(baddr + DISP_REG_DSC_SHADOW));
 	DDPDUMP("-- Start dump dsc registers --\n");
 	for (i = 0; i < 204; i += 16) {
-		DDPDUMP("DSC+%x: 0x%x 0x%x 0x%x 0x%x\n", i, readl(baddr + i),
+		DDPDUMP("DSC+0x%03x: 0x%08x 0x%08x 0x%08x 0x%08x\n", i, readl(baddr + i),
 			 readl(baddr + i + 0x4), readl(baddr + i + 0x8),
 			 readl(baddr + i + 0xc));
 	}
@@ -817,18 +743,23 @@ int mtk_dsc_analysis(struct mtk_ddp_comp *comp)
 {
 	void __iomem *baddr = comp->regs;
 
+	if (!baddr) {
+		DDPDUMP("%s, %s is NULL!\n", __func__, mtk_dump_comp_str(comp));
+		return 0;
+	}
+
 	DDPDUMP("== %s ANALYSIS:0x%x ==\n", mtk_dump_comp_str(comp), comp->regs);
 	DDPDUMP("en=%d, pic_w=%d, pic_h=%d, slice_w=%d, bypass=%d\n",
-		 DISP_REG_GET_FIELD(CON_FLD_DSC_EN,
-				baddr + DISP_REG_DSC_CON),
-		 DISP_REG_GET_FIELD(CFG_FLD_PIC_WIDTH,
-				baddr + DISP_REG_DSC_PIC_W),
-		 DISP_REG_GET_FIELD(CFG_FLD_PIC_HEIGHT_M1,
-				baddr + DISP_REG_DSC_PIC_H),
-		 DISP_REG_GET_FIELD(CFG_FLD_SLICE_WIDTH,
-				baddr + DISP_REG_DSC_SLICE_W),
-		 DISP_REG_GET_FIELD(CON_FLD_DISP_DSC_BYPASS,
-				baddr + DISP_REG_DSC_CON));
+	DISP_REG_GET_FIELD(CON_FLD_DSC_EN,
+		baddr + DISP_REG_DSC_CON),
+	DISP_REG_GET_FIELD(CFG_FLD_PIC_WIDTH,
+		baddr + DISP_REG_DSC_PIC_W),
+	DISP_REG_GET_FIELD(CFG_FLD_PIC_HEIGHT_M1,
+		baddr + DISP_REG_DSC_PIC_H),
+	DISP_REG_GET_FIELD(CFG_FLD_SLICE_WIDTH,
+		baddr + DISP_REG_DSC_SLICE_W),
+	DISP_REG_GET_FIELD(CON_FLD_DISP_DSC_BYPASS,
+		baddr + DISP_REG_DSC_CON));
 
 	return 0;
 }
@@ -970,6 +901,14 @@ static const struct mtk_disp_dsc_data mt6895_dsc_driver_data = {
 	.shadow_ctrl_reg = 0x0228,
 };
 
+static const struct mtk_disp_dsc_data mt6886_dsc_driver_data = {
+	.support_shadow     = false,
+	.need_bypass_shadow = false,
+	.need_obuf_sw = false,
+	.dsi_buffer = true,
+	.shadow_ctrl_reg = 0x0228,
+};
+
 static const struct mtk_disp_dsc_data mt6873_dsc_driver_data = {
 	.support_shadow     = false,
 	.need_bypass_shadow = true,
@@ -1007,6 +946,8 @@ static const struct of_device_id mtk_disp_dsc_driver_dt_match[] = {
 	  .data = &mt6985_dsc_driver_data},
 	{ .compatible = "mediatek,mt6895-disp-dsc",
 	  .data = &mt6895_dsc_driver_data},
+	{ .compatible = "mediatek,mt6886-disp-dsc",
+	  .data = &mt6886_dsc_driver_data},
 	{ .compatible = "mediatek,mt6873-disp-dsc",
 	  .data = &mt6873_dsc_driver_data},
 	{ .compatible = "mediatek,mt6853-disp-dsc",

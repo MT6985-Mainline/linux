@@ -6,8 +6,6 @@
 #ifndef _MTK_DRM_GRAPHICS_BASE_H_
 #define _MTK_DRM_GRAPHICS_BASE_H_
 
-#include <drm/drm_fourcc.h>
-
 enum mtk_drm_dataspace {
 	MTK_DRM_DATASPACE_UNKNOWN = 0,
 	MTK_DRM_DATASPACE_ARBITRARY = 1,

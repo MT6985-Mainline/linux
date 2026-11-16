@@ -57,3 +57,4 @@ void mdrv_DPTx_HDCP1X_SetStartAuth(struct mtk_dp *mtk_dp, bool bEnable);
 
 #endif
 #endif
+

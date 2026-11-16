@@ -7,9 +7,12 @@
 #define MTK_DRM_CRTC_H
 
 #include <linux/types.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/wait.h>
 #include <linux/pm_wakeup.h>
+#include <linux/timer.h>
+
 #include <drm/drm_crtc.h>
 #include <drm/drm_writeback.h>
 
@@ -32,14 +35,15 @@
 #ifdef CONFIG_MI_DISP
 #include "mi_disp/mi_disp_esd_check.h"
 #endif
-#define MAX_CRTC 3
+#define MAX_CRTC 4
 #define OVL_LAYER_NR 12L
 #define OVL_PHY_LAYER_NR 4L
 #define RDMA_LAYER_NR 1UL
 #define EXTERNAL_INPUT_LAYER_NR 2UL
 #define MEMORY_INPUT_LAYER_NR 2UL
+#define SP_INPUT_LAYER_NR 2UL
 #define MAX_PLANE_NR                                                           \
-	((OVL_LAYER_NR) + (EXTERNAL_INPUT_LAYER_NR) + (MEMORY_INPUT_LAYER_NR))
+	((OVL_LAYER_NR) + (EXTERNAL_INPUT_LAYER_NR) + (MEMORY_INPUT_LAYER_NR) + (SP_INPUT_LAYER_NR))
 #define MTK_PLANE_INPUT_LAYER_COUNT (OVL_LAYER_NR)
 #define MTK_LUT_SIZE 512
 #define MTK_MAX_BPC 10
@@ -80,7 +84,8 @@ enum DISP_PMQOS_SLOT {
 	DISP_PMQOS_RDMA1_BW,
 	DISP_PMQOS_RDMA2_BW,
 	DISP_PMQOS_WDMA0_BW,
-	DISP_PMQOS_WDMA1_BW
+	DISP_PMQOS_WDMA1_BW,
+	DISP_PMQOS_OVLSYS_WDMA2_BW
 };
 
 #define IGNORE_MODULE_IRQ
@@ -118,12 +123,41 @@ enum DISP_PMQOS_SLOT {
 #define DISP_SLOT_DSI_STATE_DBG7_2 (DISP_SLOT_DSI_STATE_DBG7 + 0x4)
 
 #define DISP_SLOT_TE1_EN (DISP_SLOT_DSI_STATE_DBG7_2 + 0x4)
-#define DISP_SLOT_SIZE (DISP_SLOT_TE1_EN + 0x4)
+#define DISP_SLOT_REQUEST_TE_PREPARE (DISP_SLOT_TE1_EN + 0x4)
+#define DISP_SLOT_REQUEST_TE_EN (DISP_SLOT_REQUEST_TE_PREPARE + 0x4)
 
-#ifndef CONFIG_MI_DISP
+/* reset OVL log */
+#define OVL_RT_LOG_NR 10
+#define DISP_SLOT_OVL_COMP_ID(n) (DISP_SLOT_REQUEST_TE_EN + 0x4 + (0x4 * (n)))
+#define DISP_SLOT_OVL_GREQ_CNT(n) (DISP_SLOT_OVL_COMP_ID(OVL_RT_LOG_NR) + (0x4 * (n)))
+#define DISP_SLOT_OVL_RT_LOG_END DISP_SLOT_OVL_GREQ_CNT(OVL_RT_LOG_NR)
+
+#define DISP_SLOT_LAYER_AVG_RATIO(n)                                          \
+	(DISP_SLOT_OVL_RT_LOG_END + 0x14 + (0x8 * (n)))
+#define DISP_SLOT_LAYER_PEAK_RATIO(n)                                          \
+	(DISP_SLOT_LAYER_AVG_RATIO(n) + 0x4)
+
+/* Only the trigger loop writes TRIG/FRAME after a genuine image transfer. */
+#define DISP_SLOT_ESD_EPOCH \
+	(DISP_SLOT_LAYER_PEAK_RATIO(MAX_FRAME_RATIO_NUMBER*MAX_LAYER_RATIO_NUMBER) + 0x4)
+#define DISP_SLOT_ESD_TRIG_EPOCH (DISP_SLOT_ESD_EPOCH + 0x4)
+#define DISP_SLOT_ESD_FRAME_EPOCH (DISP_SLOT_ESD_TRIG_EPOCH + 0x4)
+#define DISP_SLOT_SIZE (DISP_SLOT_ESD_FRAME_EPOCH + 0x4)
+
+
+#if defined(CONFIG_PXLW_IRIS)
+#define DISP_SLOT_IRIS_READ_BASE DISP_SLOT_SIZE
+#define DISP_SLOT_IRIS_SIZE (DISP_SLOT_IRIS_READ_BASE + 0x10)
+
+#if DISP_SLOT_IRIS_SIZE > CMDQ_BUF_ALLOC_SIZE
+#error "DISP_SLOT_IRIS_SIZE exceed CMDQ_BUF_ALLOC_SIZE"
+#endif
+#endif/*CONFIG_PXLW_IRIS*/
+
+
+
 #if DISP_SLOT_SIZE > CMDQ_BUF_ALLOC_SIZE
 #error "DISP_SLOT_SIZE exceed CMDQ_BUF_ALLOC_SIZE"
-#endif
 #endif
 
 #define to_mtk_crtc(x) container_of(x, struct mtk_drm_crtc, base)
@@ -230,18 +264,30 @@ enum DISP_PMQOS_SLOT {
 
 #define MAX_CRTC_DC_FB 3
 
+#define __mtk_crtc_path_len(mtk_crtc, ddp_mode, ddp_path) \
+	((mtk_crtc)->ddp_ctx[ddp_mode].ovl_comp_nr[ddp_path] + \
+	(mtk_crtc)->ddp_ctx[ddp_mode].ddp_comp_nr[ddp_path])
+
+#define __mtk_crtc_dual_path_len(mtk_crtc, ddp_path) \
+	((mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp_nr[ddp_path] + \
+	(mtk_crtc)->dual_pipe_ddp_ctx.ddp_comp_nr[ddp_path])
+
+#define __mtk_crtc_path_comp(mtk_crtc, ddp_mode, ddp_path, __idx) \
+	((__idx) < (mtk_crtc)->ddp_ctx[ddp_mode].ovl_comp_nr[ddp_path] ? \
+	(mtk_crtc)->ddp_ctx[ddp_mode].ovl_comp[ddp_path][__idx] : \
+	(mtk_crtc)->ddp_ctx[ddp_mode].ddp_comp[ddp_path] \
+	[__idx - (mtk_crtc)->ddp_ctx[ddp_mode].ovl_comp_nr[ddp_path]])
+
 #define for_each_comp_in_target_ddp_mode_bound(comp, mtk_crtc, __i, __j,       \
 					       ddp_mode, offset)               \
 	for ((__i) = 0; (__i) < DDP_PATH_NR; (__i)++)                          \
 		for ((__j) = 0;                         \
 			(offset) <                          \
-			(mtk_crtc)->ddp_ctx[ddp_mode].ddp_comp_nr[__i] &&  \
+			(__mtk_crtc_path_len(mtk_crtc, ddp_mode, (__i))) &&  \
 			(__j) <                             \
-			(mtk_crtc)->ddp_ctx[ddp_mode].ddp_comp_nr[__i] -  \
+			(__mtk_crtc_path_len(mtk_crtc, ddp_mode, (__i))) -  \
 			offset &&                           \
-			((comp) = (mtk_crtc)->ddp_ctx[ddp_mode].ddp_comp[__i]  \
-			[__j],                              \
-			1);                                 \
+			((comp) = __mtk_crtc_path_comp(mtk_crtc, ddp_mode, (__i), (__j)), 1) ; \
 			(__j)++)                            \
 			for_each_if(comp)
 
@@ -258,83 +304,87 @@ enum DISP_PMQOS_SLOT {
 
 #define for_each_comp_in_crtc_target_path(comp, mtk_crtc, __i, ddp_path)       \
 	for ((__i) = 0;                           \
-		(__i) <                               \
-		(mtk_crtc)->ddp_ctx[mtk_crtc->ddp_mode]  \
-		.ddp_comp_nr[(ddp_path)] &&           \
-		((comp) = (mtk_crtc)                  \
-		->ddp_ctx[mtk_crtc->ddp_mode]         \
-		.ddp_comp[(ddp_path)][__i],           \
-		1);                                   \
-		(__i)++)                              \
+		(__i) < __mtk_crtc_path_len(mtk_crtc, mtk_crtc->ddp_mode, ddp_path) &&   \
+		((comp) = __mtk_crtc_path_comp(mtk_crtc, mtk_crtc->ddp_mode, \
+		ddp_path, (__i)), 1) ; (__i)++)                              \
 		for_each_if(comp)
 
 #define for_each_comp_in_crtc_target_mode(comp, mtk_crtc, __i, __j, ddp_mode)  \
 	for ((__i) = 0; (__i) < DDP_PATH_NR; (__i)++)                          \
 		for ((__j) = 0;                       \
-			(__j) <                           \
-			(mtk_crtc)->ddp_ctx[ddp_mode].ddp_comp_nr[__i] &&  \
-			((comp) = (mtk_crtc)->ddp_ctx[ddp_mode].ddp_comp[__i]  \
-			[__j],                            \
-			1);                               \
+			(__j) <  __mtk_crtc_path_len(mtk_crtc, ddp_mode, (__i)) &&  \
+			((comp) = __mtk_crtc_path_comp(mtk_crtc, ddp_mode, (__i), (__j)), 1); \
 			(__j)++)                          \
 			for_each_if(comp)
 
 #define for_each_comp_in_crtc_path_reverse(comp, mtk_crtc, __i, __j)           \
 	for ((__i) = DDP_PATH_NR - 1; (__i) >= 0; (__i)--)                     \
-		for ((__j) =                          \
-			(mtk_crtc)->ddp_ctx[mtk_crtc->ddp_mode]   \
-			.ddp_comp_nr[__i] -               \
-			1;                                \
-			(__j) >= 0 &&                     \
-			((comp) = (mtk_crtc)              \
-			->ddp_ctx[mtk_crtc->ddp_mode]     \
-			.ddp_comp[__i][__j],              \
-			1);                               \
-			(__j)--)                          \
+		for ((__j) = __mtk_crtc_path_len(mtk_crtc, mtk_crtc->ddp_mode, (__i)) - 1;     \
+			(__j) >= 0 && ((comp) = __mtk_crtc_path_comp(mtk_crtc, \
+			mtk_crtc->ddp_mode, (__i), (__j)), 1) ; (__j)--)                     \
+			for_each_if(comp)
+
+#define for_each_comp_in_dual_pipe_reverse(comp, mtk_crtc, __i, __j)           \
+	for ((__i) = DDP_SECOND_PATH - 1; (__i) >= 0; (__i)--)					   \
+		for ((__j) = ((mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp_nr[(__i)] + \
+			(mtk_crtc)->dual_pipe_ddp_ctx.ddp_comp_nr[(__i)]) - 1;	 \
+			(__j) >= 0 &&                    \
+			((comp) = ((__j) < (mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp_nr[(__i)]) ? \
+			(mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp[(__i)][(__j)] : \
+			(mtk_crtc)->dual_pipe_ddp_ctx.ddp_comp[(__i)] \
+			[(__j) - (mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp_nr[(__i)]], \
+			1) ; (__j)--)					  \
 			for_each_if(comp)
 
 #define for_each_comp_in_all_crtc_mode(comp, mtk_crtc, __i, __j, p_mode)       \
 	for ((p_mode) = 0; (p_mode) < DDP_MODE_NR; (p_mode)++)                 \
 		for ((__i) = 0; (__i) < DDP_PATH_NR; (__i)++)                  \
-			for ((__j) = 0; (__j) <           \
-				(mtk_crtc)->ddp_ctx[p_mode]   \
-				.ddp_comp_nr[__i] &&          \
-				((comp) = (mtk_crtc)          \
-				->ddp_ctx[p_mode]             \
-				.ddp_comp[__i][__j],          \
-				1);                           \
+			for ((__j) = 0; (__j) < __mtk_crtc_path_len(mtk_crtc, p_mode, (__i)) &&   \
+				((comp) = \
+					__mtk_crtc_path_comp(mtk_crtc, p_mode, (__i), (__j)), 1) ; \
 				(__j)++)                      \
 				for_each_if(comp)
+
+#define for_each_comp_in_crtc_target_mode_path(comp, mtk_crtc, __i, p_mode, ddp_path)       \
+	for ((__i) = 0;                           \
+		(__i) < __mtk_crtc_path_len(mtk_crtc, p_mode, ddp_path) &&   \
+		((comp) = __mtk_crtc_path_comp(mtk_crtc, p_mode, ddp_path, (__i)), 1) ;\
+		(__i)++)                              \
+		for_each_if(comp)
 
 #define for_each_comp_id_in_path_data(comp_id, path_data, __i, __j, p_mode)    \
 	for ((p_mode) = 0; (p_mode) < DDP_MODE_NR; (p_mode)++)        \
 		for ((__i) = 0; (__i) < DDP_PATH_NR; (__i)++)             \
 			for ((__j) = 0;                   \
-				(__j) <                       \
-				(path_data)->path_len[p_mode][__i] &&  \
-				((comp_id) = (path_data)      \
-				->path[p_mode][__i][__j],     \
+				(__j) < ((path_data)->ovl_path_len[p_mode][__i] + \
+					(path_data)->path_len[p_mode][__i]) &&  \
+				((comp_id) = (__j < (path_data)->ovl_path_len[p_mode][__i]) ? \
+					(path_data)->ovl_path[p_mode][__i][__j] : \
+					(path_data)->path[p_mode][__i] \
+					[__j - (path_data)->ovl_path_len[p_mode][__i]], \
 				1);                           \
 				(__j)++)
 
 #define for_each_comp_id_in_dual_pipe(comp_id, path_data, __i, __j)    \
 	for ((__i) = 0; (__i) < DDP_SECOND_PATH; (__i)++) \
 		for ((__j) = 0;				  \
-			(__j) <					  \
-			(path_data)->dual_path_len[__i] &&  \
-			((comp_id) = (path_data)	  \
-			->dual_path[__i][__j],	  \
+			(__j) <	((path_data)->dual_ovl_path_len[__i] + \
+				(path_data)->dual_path_len[__i]) &&  \
+			((comp_id) = (__j < (path_data)->dual_ovl_path_len[__i]) ? \
+				(path_data)->dual_ovl_path[__i][__j] : \
+				(path_data)->dual_path[__i] \
+				[__j - (path_data)->dual_ovl_path_len[__i]],	  \
 			1);						  \
 			(__j)++)
 
 #define for_each_comp_in_dual_pipe(comp, mtk_crtc, __i, __j)       \
 	for ((__i) = 0; (__i) < DDP_SECOND_PATH; (__i)++)		   \
-		for ((__j) = 0; (__j) <		  \
-			(mtk_crtc)->dual_pipe_ddp_ctx   \
-			.ddp_comp_nr[__i] &&		  \
-			((comp) = (mtk_crtc)		  \
-			->dual_pipe_ddp_ctx			  \
-			.ddp_comp[__i][__j],		  \
+		for ((__j) = 0; (__j) < ((mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp_nr[__i] + \
+				(mtk_crtc)->dual_pipe_ddp_ctx.ddp_comp_nr[__i]) &&		  \
+			((comp) = (__j < (mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp_nr[__i]) ? \
+				(mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp[__i][__j] : \
+				(mtk_crtc)->dual_pipe_ddp_ctx.ddp_comp[__i] \
+				[__j - (mtk_crtc)->dual_pipe_ddp_ctx.ovl_comp_nr[__i]], \
 			1);						  \
 			(__j)++)					  \
 			for_each_if(comp)
@@ -359,6 +409,8 @@ enum MTK_CRTC_PROP {
 	CRTC_PROP_OUTPUT_Y,
 	CRTC_PROP_OUTPUT_WIDTH,
 	CRTC_PROP_OUTPUT_HEIGHT,
+	CRTC_PROP_OUTPUT_DST_WIDTH,
+	CRTC_PROP_OUTPUT_DST_HEIGHT,
 	CRTC_PROP_OUTPUT_FB_ID,
 	CRTC_PROP_INTF_FENCE_IDX,
 	CRTC_PROP_DISP_MODE_IDX,
@@ -368,9 +420,10 @@ enum MTK_CRTC_PROP {
 	CRTC_PROP_HDR_ENABLE,
 	/*Msync 2.0*/
 	CRTC_PROP_MSYNC2_0_ENABLE,
-	CRTC_PROP_SKIP_CONFIG,
 	CRTC_PROP_OVL_DSI_SEQ,
 	CRTC_PROP_OUTPUT_SCENARIO,
+	CRTC_PROP_CAPS_BLOB_ID,
+	CRTC_PROP_AOSP_CCORR_LINEAR,
 #ifdef CONFIG_MI_DISP_FOD_SYNC
 	/*MI FOD SYNC*/
 	CRTC_PROP_MI_FOD_SYNC_INFO,
@@ -379,6 +432,8 @@ enum MTK_CRTC_PROP {
 };
 
 #define USER_SCEN_BLANK (BIT(0))
+#define USER_SCEN_SKIP_PANEL_SWITCH (BIT(1))
+#define USER_SCEN_SAME_POWER_MODE (BIT(2))
 
 enum MTK_CRTC_COLOR_FMT {
 	CRTC_COLOR_FMT_UNKNOWN = 0,
@@ -435,11 +490,18 @@ enum MTK_CRTC_COLOR_FMT {
 		MAKE_CRTC_COLOR_FMT(1, 32, 0, 0, 3, 0, 0, 45),
 };
 
+/*
+ * use CLIENT_DSI_CFG guideline :
+ * 1. send DSI VM CMD
+ * 2. process register operation which not invovle stop DSI &
+ *    enable DSI and intend process with lower priority
+ */
 /* CLIENT_SODI_LOOP for sw workaround to fix gce hw bug */
 #define DECLARE_GCE_CLIENT(EXPR)                                               \
 	EXPR(CLIENT_CFG)                                                       \
 	EXPR(CLIENT_TRIG_LOOP)                                                 \
 	EXPR(CLIENT_SODI_LOOP)                                                 \
+	EXPR(CLIENT_EVENT_LOOP)                                                 \
 	EXPR(CLIENT_SUB_CFG)                                                   \
 	EXPR(CLIENT_DSI_CFG)                                                   \
 	EXPR(CLIENT_PQ)                                                        \
@@ -460,12 +522,23 @@ enum CRTC_GCE_EVENT_TYPE {
 	EVENT_WDMA1_EOF,
 	EVENT_STREAM_BLOCK,
 	EVENT_CABC_EOF,
-	EVENT_DSI0_SOF,
+	EVENT_DSI_SOF,
 	/*Msync 2.0*/
 	EVENT_SYNC_TOKEN_VFP_PERIOD,
+	EVENT_GPIO_TE0,
 	EVENT_GPIO_TE1,
 	EVENT_SYNC_TOKEN_DISP_VA_START,
 	EVENT_SYNC_TOKEN_DISP_VA_END,
+	EVENT_SYNC_TOKEN_TE,
+	EVENT_SYNC_TOKEN_PREFETCH_TE,
+	EVENT_DSI0_TARGET_LINE,
+	EVENT_OVLSYS_WDMA0_EOF,
+	EVENT_OVLSYS1_WDMA0_EOF,
+	EVENT_SYNC_TOKEN_VIDLE_POWER_ON,
+	EVENT_SYNC_TOKEN_CHECK_TRIGGER_MERGE,
+	EVENT_OVLSYS_WDMA1_EOF,
+	EVENT_MDP_RDMA0_EOF,
+	EVENT_MDP_RDMA1_EOF,
 	EVENT_TYPE_MAX,
 };
 
@@ -493,17 +566,46 @@ enum CWB_BUFFER_TYPE {
 	BUFFER_TYPE_NR,
 };
 
+enum MML_IR_STATE {
+	NOT_MML_IR,
+	MML_IR_ENTERING,
+	MML_IR_RACING,
+	MML_IR_LEAVING,
+	MML_IR_IDLE,
+};
+
+enum PF_TS_TYPE {
+	IRQ_RDMA_EOF,
+	IRQ_DSI_EOF,
+	IRQ_CMDQ_CB,
+	NOT_SPECIFIED,
+};
+
+enum SLBC_STATE {
+	SLBC_UNREGISTER,
+	SLBC_NEED_FREE,
+	SLBC_CAN_ALLOC,
+};
+
 struct mtk_crtc_path_data {
+	bool is_fake_path;
+	bool is_discrete_path;
+	const enum mtk_ddp_comp_id *ovl_path[DDP_MODE_NR][DDP_PATH_NR];
+	unsigned int ovl_path_len[DDP_MODE_NR][DDP_PATH_NR];
 	const enum mtk_ddp_comp_id *path[DDP_MODE_NR][DDP_PATH_NR];
 	unsigned int path_len[DDP_MODE_NR][DDP_PATH_NR];
 	bool path_req_hrt[DDP_MODE_NR][DDP_PATH_NR];
 	const enum mtk_ddp_comp_id *wb_path[DDP_MODE_NR];
 	unsigned int wb_path_len[DDP_MODE_NR];
 	const struct mtk_addon_scenario_data *addon_data;
+	const enum mtk_ddp_comp_id *scaling_data;
 	//for dual path
+	const enum mtk_ddp_comp_id *dual_ovl_path[DDP_PATH_NR];
+	unsigned int dual_ovl_path_len[DDP_PATH_NR];
 	const enum mtk_ddp_comp_id *dual_path[DDP_PATH_NR];
 	unsigned int dual_path_len[DDP_PATH_NR];
 	const struct mtk_addon_scenario_data *addon_data_dual;
+	const enum mtk_ddp_comp_id *scaling_data_dual;
 };
 
 struct mtk_crtc_gce_obj {
@@ -527,6 +629,8 @@ struct mtk_crtc_gce_obj {
  */
 struct mtk_crtc_ddp_ctx {
 	struct mtk_disp_mutex *mutex;
+	unsigned int ovl_comp_nr[DDP_PATH_NR];
+	struct mtk_ddp_comp **ovl_comp[DDP_PATH_NR];
 	unsigned int ddp_comp_nr[DDP_PATH_NR];
 	struct mtk_ddp_comp **ddp_comp[DDP_PATH_NR];
 	bool req_hrt[DDP_PATH_NR];
@@ -535,6 +639,13 @@ struct mtk_crtc_ddp_ctx {
 	struct drm_framebuffer *wb_fb;
 	struct drm_framebuffer *dc_fb;
 	unsigned int dc_fb_idx;
+};
+
+struct mtk_scaling_ctx {
+	bool scaling_en;
+	int lcm_width;
+	int lcm_height;
+	struct drm_display_mode *scaling_mode;
 };
 
 struct mtk_drm_fake_vsync {
@@ -626,10 +737,10 @@ struct mtk_cwb_info {
 
 #define MSYNC_MAX_RECORD 5
 #define MSYNC_LOWFRAME_THRESHOLD 3
-#define MSYNC_MIN_FPS 46.1
+#define MSYNC_MIN_FPS_X10 461
 
 enum MSYNC_RECORD_TYPE {
-	INVALID,
+	INVALID_TYPE,
 	ENABLE_MSYNC,
 	DISABLE_MSYNC,
 	FRAME_TIME,
@@ -652,7 +763,15 @@ struct mtk_msync2 {
 	bool msync_disabled;
 	bool LFR_disabled;
 	bool msync_on;
+	bool msync_frame_status;
 	atomic_t LFR_final_state;
+};
+
+struct mtk_pre_te_cfg {
+	bool prefetch_te_en;
+	bool vidle_apsrc_off_en;
+	bool vidle_dsi_pll_off_en;
+	bool merge_trigger_en;
 };
 
 struct dual_te {
@@ -665,6 +784,19 @@ struct dual_te {
 struct mtk_mml_cb_para {
 	atomic_t mml_job_submit_done;
 	wait_queue_head_t mml_job_submit_wq;
+};
+
+struct mtk_drm_sram_list {
+	struct list_head head;
+	unsigned int hrt_idx;
+};
+
+struct mtk_drm_sram {
+	struct slbc_data data;
+	struct mutex lock;
+	struct kref ref;
+	unsigned int bk_hrt_idx;
+	struct mtk_drm_sram_list list;
 };
 
 /**
@@ -684,7 +816,25 @@ struct mtk_mml_cb_para {
  * @esd_ctx: ESD check task context
  * @qos_ctx: BW Qos task context
  */
+enum mtk_esd_check_source {
+	MTK_ESD_CHECK_GENERIC = BIT(0),
+	MTK_ESD_CHECK_MI = BIT(1),
+};
+
+struct mtk_crtc_esd_gate {
+	struct work_struct work;
+	spinlock_t lock;
+	u32 epoch;
+	u32 frame_epoch;
+	u32 requested;
+	bool enabled;
+	bool output_enabled;
+	bool ready;
+	bool shutting_down;
+};
+
 struct mtk_drm_crtc {
+	struct mtk_crtc_esd_gate esd_gate;
 	struct drm_crtc base;
 	bool enabled;
 	unsigned int bpc;
@@ -694,10 +844,16 @@ struct mtk_drm_crtc {
 	struct mtk_crtc_gce_obj gce_obj;
 	struct cmdq_pkt *trig_loop_cmdq_handle;
 	struct cmdq_pkt *sodi_loop_cmdq_handle;
+	struct cmdq_pkt *event_loop_cmdq_handle;
 	struct mtk_drm_plane *planes;
 	unsigned int layer_nr;
 	bool pending_planes;
-
+	unsigned int ovl_usage_status;
+	void __iomem *ovlsys0_regs;
+	resource_size_t ovlsys0_regs_pa;
+	void __iomem *ovlsys1_regs;
+	resource_size_t ovlsys1_regs_pa;
+	unsigned int ovlsys_num;
 	void __iomem *config_regs;
 	resource_size_t config_regs_pa;
 	unsigned int dispsys_num;
@@ -713,6 +869,7 @@ struct mtk_drm_crtc {
 	bool wb_enable;
 	bool wb_hw_enable;
 
+	struct mtk_drm_crtc_caps crtc_caps;
 	const struct mtk_crtc_path_data *path_data;
 	struct mtk_crtc_ddp_ctx dual_pipe_ddp_ctx;
 	bool is_dual_pipe;
@@ -764,10 +921,10 @@ struct mtk_drm_crtc {
 	bool layer_rec_en;
 	unsigned int mode_change_index;
 	int mode_idx;
-	bool res_switch;
-	bool res_change;
-	unsigned int original_width;
-	unsigned int original_height;
+	int mode_chg;
+	enum RES_SWITCH_TYPE res_switch;
+	struct mtk_scaling_ctx scaling_ctx;
+	int fbt_layer_id;
 
 	wait_queue_head_t state_wait_queue;
 	bool crtc_blank;
@@ -789,11 +946,13 @@ struct mtk_drm_crtc {
 	atomic_t cwb_task_active;
 
 	ktime_t pf_time;
-	ktime_t prev_pf_time;
+	ktime_t sof_time;
 	struct task_struct *signal_present_fece_task;
 	struct cmdq_cb_data cb_data;
 	atomic_t cmdq_done;
 	wait_queue_head_t signal_fence_task_wq;
+
+	struct mtk_pre_te_cfg pre_te_cfg;
 
 	struct mtk_msync2 msync2;
 	struct mtk_panel_spr_params *panel_spr_params;
@@ -801,29 +960,41 @@ struct mtk_drm_crtc {
 	struct dual_te d_te;
 
 	// MML inline rotate SRAM
-	struct slbc_data *mml_ir_sram;
+	struct mtk_drm_sram mml_ir_sram;
 	struct mml_submit *mml_cfg;
 	struct mml_submit *mml_cfg_pq;
 	struct mtk_mml_cb_para mml_cb;
 
-	atomic_t mml_last_job_is_flushed;
+	atomic_t wait_mml_last_job_is_flushed;
 	wait_queue_head_t signal_mml_last_job_is_flushed_wq;
 	bool is_mml;
-	bool last_is_mml;
-	bool is_mml_debug;
+	unsigned int mml_debug;
 	bool is_force_mml_scen;
-	bool need_stop_last_mml_job;
 	bool mml_cmd_ir;
-	bool leave_mml_scn;
+	bool mml_ir_enable;
+	enum MML_IR_STATE mml_ir_state;
+	enum SLBC_STATE slbc_state;
 
 	atomic_t signal_irq_for_pre_fence;
 	wait_queue_head_t signal_irq_for_pre_fence_wq;
+	enum PF_TS_TYPE pf_ts_type;
+	struct list_head lyeblob_head;
+	unsigned long long last_aee_trigger_ts;
 
 	atomic_t force_high_step;
 	int force_high_enabled;
+	struct total_tile_overhead tile_overhead;
+
+	//discrete
+	struct cmdq_pkt *pending_handle;
+
+	bool skip_frame;
+	bool is_dsc_output_swap;
 #ifdef CONFIG_MI_DISP_ESD_CHECK
 	struct mi_esd_ctx *mi_esd_ctx;
 #endif
+
+	bool dsi_null_pkt_postpone;
 };
 
 struct mtk_crtc_state {
@@ -838,9 +1009,13 @@ struct mtk_crtc_state {
 	struct mtk_lye_ddp_state lye_state;
 	struct mtk_rect rsz_src_roi;
 	struct mtk_rect rsz_dst_roi;
+	struct mtk_rect mml_src_roi[2];
 	struct mtk_rect mml_dst_roi;
+	struct mtk_rect mml_dst_roi_dual[2];
 	struct mtk_rsz_param rsz_param[2];
 	atomic_t plane_enabled_num;
+	bool pending_usage_update;
+	unsigned int pending_usage_list;
 
 	/* property */
 	unsigned int prop_val[CRTC_PROP_MAX];
@@ -859,13 +1034,19 @@ struct mtk_cmdq_cb_data {
 	void __iomem *disp_mutex_reg_va;
 	void __iomem *mmlsys_reg_va;
 	bool is_mml;
-	bool leave_mml_scn;
 	unsigned int pres_fence_idx;
 	struct drm_framebuffer *wb_fb;
 	unsigned int wb_fence_idx;
+	unsigned int hrt_idx;
+	struct mtk_lcm_dsi_cmd_packet *ddic_packet;
+	ktime_t signal_ts;
+	struct cb_data_store *store_cb_data;
 };
-
+#define TIGGER_INTERVAL_S(x) ((unsigned long long)x*1000*1000*1000)
 extern unsigned int disp_spr_bypass;
+extern unsigned int g_left_pipe_overhead[2];
+extern unsigned int g_right_pipe_overhead[2];
+
 
 int mtk_drm_crtc_enable_vblank(struct drm_crtc *crtc);
 void mtk_drm_crtc_disable_vblank(struct drm_crtc *crtc);
@@ -883,14 +1064,32 @@ void mtk_drm_crtc_plane_update(struct drm_crtc *crtc, struct drm_plane *plane,
 void mtk_drm_crtc_plane_disable(struct drm_crtc *crtc, struct drm_plane *plane,
 			       struct mtk_plane_state *state);
 
-
+void mtk_drm_crtc_mini_dump(struct drm_crtc *crtc);
 void mtk_drm_crtc_dump(struct drm_crtc *crtc);
+void mtk_drm_crtc_mini_analysis(struct drm_crtc *crtc);
 void mtk_drm_crtc_analysis(struct drm_crtc *crtc);
 bool mtk_crtc_is_frame_trigger_mode(struct drm_crtc *crtc);
+void mtk_crtc_clr_comp_done(struct mtk_drm_crtc *mtk_crtc,
+			      struct cmdq_pkt *cmdq_handle,
+			      struct mtk_ddp_comp *comp,
+			      int clear_event);
+void mtk_crtc_wait_comp_done(struct mtk_drm_crtc *mtk_crtc,
+			      struct cmdq_pkt *cmdq_handle,
+			      struct mtk_ddp_comp *comp,
+			      int clear_event);
 void mtk_crtc_wait_frame_done(struct mtk_drm_crtc *mtk_crtc,
 			      struct cmdq_pkt *cmdq_handle,
 			      enum CRTC_DDP_PATH ddp_path,
 			      int clear_event);
+struct mtk_ddp_comp *mtk_crtc_get_comp(struct drm_crtc *crtc,
+				       unsigned int mode_id,
+				       unsigned int path_id,
+				       unsigned int comp_idx);
+
+struct mtk_ddp_comp *mtk_crtc_get_dual_comp(struct drm_crtc *crtc,
+				       unsigned int path_id,
+				       unsigned int comp_idx);
+
 
 struct mtk_ddp_comp *mtk_ddp_comp_request_output(struct mtk_drm_crtc *mtk_crtc);
 
@@ -899,6 +1098,8 @@ int mtk_drm_crtc_getfence_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file_priv);
 int mtk_drm_crtc_get_sf_fence_ioctl(struct drm_device *dev, void *data,
 				    struct drm_file *file_priv);
+int mtk_drm_crtc_fence_release_ioctl(struct drm_device *dev, void *data,
+				struct drm_file *file_priv);
 
 long mtk_crtc_wait_status(struct drm_crtc *crtc, bool status, long timeout);
 void mtk_crtc_cwb_path_disconnect(struct drm_crtc *crtc);
@@ -906,7 +1107,7 @@ int mtk_crtc_path_switch(struct drm_crtc *crtc, unsigned int path_sel,
 			 int need_lock);
 void mtk_need_vds_path_switch(struct drm_crtc *crtc);
 
-void mtk_drm_crtc_first_enable(struct drm_crtc *crtc);
+int mtk_drm_crtc_first_enable(struct drm_crtc *crtc);
 void mtk_drm_crtc_enable(struct drm_crtc *crtc);
 void mtk_drm_crtc_disable(struct drm_crtc *crtc, bool need_wait);
 bool mtk_crtc_with_sub_path(struct drm_crtc *crtc, unsigned int ddp_mode);
@@ -965,6 +1166,12 @@ void mtk_crtc_check_trigger(struct mtk_drm_crtc *mtk_crtc, bool delay,
 bool mtk_crtc_is_dc_mode(struct drm_crtc *crtc);
 void mtk_crtc_clear_wait_event(struct drm_crtc *crtc);
 void mtk_crtc_hw_block_ready(struct drm_crtc *crtc);
+void mtk_crtc_esd_check_request(struct drm_crtc *crtc, u32 check, bool enable);
+bool mtk_crtc_esd_check_ready(struct drm_crtc *crtc, u32 check);
+void mtk_crtc_esd_check_reset(struct drm_crtc *crtc);
+void mtk_crtc_esd_check_output_enable(struct drm_crtc *crtc);
+u32 mtk_crtc_esd_check_epoch(struct drm_crtc *crtc);
+void mtk_crtc_esd_check_frame_done(struct drm_crtc *crtc, u32 epoch);
 int mtk_crtc_lcm_ATA(struct drm_crtc *crtc);
 int mtk_crtc_mipi_freq_switch(struct drm_crtc *crtc, unsigned int en,
 			unsigned int userdata);
@@ -992,6 +1199,10 @@ bool mtk_crtc_with_sodi_loop(struct drm_crtc *crtc);
 void mtk_crtc_stop_sodi_loop(struct drm_crtc *crtc);
 void mtk_crtc_start_sodi_loop(struct drm_crtc *crtc);
 
+bool mtk_crtc_with_event_loop(struct drm_crtc *crtc);
+void mtk_crtc_stop_event_loop(struct drm_crtc *crtc);
+void mtk_crtc_start_event_loop(struct drm_crtc *crtc);
+
 void mtk_crtc_change_output_mode(struct drm_crtc *crtc, int aod_en);
 int mtk_crtc_user_cmd(struct drm_crtc *crtc, struct mtk_ddp_comp *comp,
 		unsigned int cmd, void *params);
@@ -1006,7 +1217,7 @@ void mtk_drm_crtc_init_para(struct drm_crtc *crtc);
 void trigger_without_cmdq(struct drm_crtc *crtc);
 void mtk_crtc_set_dirty(struct mtk_drm_crtc *mtk_crtc);
 void mtk_drm_layer_dispatch_to_dual_pipe(
-	unsigned int mmsys_id,
+	struct mtk_drm_crtc *mtk_crtc, unsigned int mmsys_id,
 	struct mtk_plane_state *plane_state,
 	struct mtk_plane_state *plane_state_l,
 	struct mtk_plane_state *plane_state_r,
@@ -1020,23 +1231,50 @@ int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en);
 int mtk_drm_crtc_hbm_wait(struct drm_crtc *crtc, bool en);
 
 unsigned int mtk_get_mmsys_id(struct drm_crtc *crtc);
-
+int mtk_crtc_ability_chk(struct mtk_drm_crtc *mtk_crtc, enum MTK_CRTC_ABILITY ability);
 unsigned int *mtk_get_gce_backup_slot_va(struct mtk_drm_crtc *mtk_crtc,
 			unsigned int slot_index);
 
 dma_addr_t mtk_get_gce_backup_slot_pa(struct mtk_drm_crtc *mtk_crtc,
 			unsigned int slot_index);
-unsigned int mtk_read_dummy_backup_slot_table(struct mtk_drm_crtc *mtk_crtc,
-			unsigned int slot_index);
 
 unsigned int mtk_get_plane_slot_idx(struct mtk_drm_crtc *mtk_crtc, unsigned int idx);
-void mtk_gce_backup_slot_backup(struct mtk_drm_crtc *mtk_crtc);
-void mtk_gce_backup_slot_restore(struct mtk_drm_crtc *mtk_crtc);
+void mtk_gce_backup_slot_init(struct mtk_drm_crtc *mtk_crtc);
 
-//CWB
-int mtk_drm_cwb_copy_buf(struct drm_crtc *crtc,
-			  struct mtk_cwb_info *cwb_info,
-			  void *buffer, unsigned int buf_idx);
+void mtk_crtc_mml_racing_resubmit(struct drm_crtc *crtc, struct cmdq_pkt *_cmdq_handle);
+void mtk_crtc_mml_racing_stop_sync(struct drm_crtc *crtc, struct cmdq_pkt *_cmdq_handle,
+				   bool force);
+
+bool mtk_crtc_alloc_sram(struct mtk_drm_crtc *mtk_crtc, unsigned int hrt_idx);
+int mtk_crtc_attach_ddp_comp(struct drm_crtc *crtc, int ddp_mode, bool is_attach);
+void mtk_crtc_addon_connector_connect(struct drm_crtc *crtc, struct cmdq_pkt *handle);
+
+void mtk_crtc_store_total_overhead(struct mtk_drm_crtc *mtk_crtc,
+	struct total_tile_overhead info);
+struct total_tile_overhead mtk_crtc_get_total_overhead(struct mtk_drm_crtc *mtk_crtc);
+bool mtk_crtc_check_is_scaling_comp(struct mtk_drm_crtc *mtk_crtc,
+		enum mtk_ddp_comp_id comp_id);
+void mtk_crtc_divide_default_path_by_rsz(struct mtk_drm_crtc *mtk_crtc);
+struct drm_display_mode *mtk_crtc_get_display_mode_by_comp(
+	const char *source,
+	struct drm_crtc *crtc,
+	struct mtk_ddp_comp *comp,
+	bool in_scaling_path);
+unsigned int mtk_crtc_get_width_by_comp(
+	const char *source,
+	struct drm_crtc *crtc,
+	struct mtk_ddp_comp *comp,
+	bool in_scaling_path);
+unsigned int mtk_crtc_get_height_by_comp(
+	const char *source,
+	struct drm_crtc *crtc,
+	struct mtk_ddp_comp *comp,
+	bool in_scaling_path);
+void mtk_crtc_set_width_height(
+	int *w,
+	int *h,
+	struct drm_crtc *crtc,
+	bool is_scaling_path);
 
 /* ********************* Legacy DISP API *************************** */
 unsigned int DISP_GetScreenWidth(void);
@@ -1046,13 +1284,15 @@ void mtk_crtc_disable_secure_state(struct drm_crtc *crtc);
 int mtk_crtc_check_out_sec(struct drm_crtc *crtc);
 struct golden_setting_context *
 	__get_golden_setting_context(struct mtk_drm_crtc *mtk_crtc);
+struct golden_setting_context *
+	__get_scaling_golden_setting_context(struct mtk_drm_crtc *mtk_crtc);
 /***********************  PanelMaster  ********************************/
 void mtk_crtc_start_for_pm(struct drm_crtc *crtc);
 void mtk_crtc_stop_for_pm(struct mtk_drm_crtc *mtk_crtc, bool need_wait);
 bool mtk_crtc_frame_buffer_existed(void);
 
 /* ********************* Legacy DRM API **************************** */
-int mtk_drm_format_plane_cpp(uint32_t format, int plane);
+int mtk_drm_format_plane_cpp(uint32_t format, unsigned int plane);
 
 int mtk_drm_switch_te(struct drm_crtc *crtc, int te_num, bool need_lock);
 int mtk_drm_ioctl_get_pq_caps(struct drm_device *dev, void *data,
@@ -1062,4 +1302,17 @@ int mtk_drm_ioctl_set_pq_caps(struct drm_device *dev, void *data,
 void mtk_crtc_prepare_instr(struct drm_crtc *crtc);
 unsigned int check_dsi_underrun_event(void);
 void clear_dsi_underrun_event(void);
+
+int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
+			unsigned int panel_ext_param, unsigned int cfg_flag);
+int mtk_drm_setbacklight_grp(struct drm_crtc *crtc, unsigned int level,
+			unsigned int panel_ext_param, unsigned int cfg_flag);
+void mtk_crtc_update_gce_event(struct mtk_drm_crtc *mtk_crtc);
+void mtk_crtc_cwb_addon_rst(struct drm_crtc *crtc, struct cmdq_pkt *cmdq_handle);
+void mtk_crtc_wb_addon_rst(struct drm_crtc *crtc, struct cmdq_pkt *cmdq_handle);
+void mtk_crtc_lye_addon_module_rst(struct drm_crtc *crtc, struct cmdq_pkt *cmdq_handle);
+void mtk_crtc_addon_connector_rst(struct drm_crtc *crtc, struct cmdq_pkt *cmdq_handle);
+void mtk_crtc_default_path_rst(struct drm_crtc *crtc, struct cmdq_pkt *cmdq_handle);
+void mtk_crtc_rst_module(struct drm_crtc *crtc);
+
 #endif /* MTK_DRM_CRTC_H */

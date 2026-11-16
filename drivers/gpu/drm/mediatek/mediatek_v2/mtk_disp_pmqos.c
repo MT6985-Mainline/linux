@@ -9,21 +9,59 @@
 #include "mtk_drm_mmp.h"
 #include "mtk_drm_drv.h"
 #include "mtk_dump.h"
+#include <linux/clk.h>
+#include <linux/of.h>
 #include <linux/pm_opp.h>
-#include <linux/vmalloc.h>
 #include <linux/regulator/consumer.h>
+#include <linux/soc/mediatek/mtk_mmdvfs.h>
 
 #include <dt-bindings/interconnect/mtk,mmqos.h>
 #include <soc/mediatek/mmqos.h>
+#include <soc/mediatek/mmdvfs_v3.h>
 
+#if defined(CONFIG_PXLW_IRIS)
+#include "dsi_iris_mtk_api.h"
+#endif
 
-#define CRTC_NUM		3
+#define CRTC_NUM		4
 static struct drm_crtc *dev_crtc;
 /* add for mm qos */
+static struct clk *mm_clk;
 static struct regulator *mm_freq_request;
-static u32 *g_freq_steps;
-static int g_freq_level[CRTC_NUM] = {-1};
-static int step_size = 1;
+static unsigned long *g_freq_steps;
+static struct device *mmdvfs_dev;
+static unsigned int lp_freq;
+static int g_freq_level[CRTC_NUM] = {-1, -1, -1, -1};
+static bool g_freq_lp[CRTC_NUM] = {false, false, false, false};
+static long g_freq;
+static int step_size;
+
+static void mtk_disp_pmqos_put_path(void *path)
+{
+	mtk_icc_put(path);
+}
+
+int mtk_disp_pmqos_get_path(struct device *dev, const char *name,
+			  struct mtk_icc_path **request)
+{
+	struct mtk_icc_path *path;
+	int ret;
+
+	/* Preserve the OEM error marker for optional, undeclared channels. */
+	*request = ERR_PTR(-ENOENT);
+	if (of_property_match_string(dev->of_node, "interconnect-names", name) < 0)
+		return 0;
+	path = of_mtk_icc_get(dev, name);
+	if (IS_ERR_OR_NULL(path))
+		return dev_err_probe(dev, path ? PTR_ERR(path) : -ENODEV,
+				     "Required display QoS path %s is unavailable\n", name);
+	/* Component bind devres groups release these on failure and unbind. */
+	ret = devm_add_action_or_reset(dev, mtk_disp_pmqos_put_path, path);
+	if (ret)
+		return ret;
+	*request = path;
+	return 0;
+}
 
 void mtk_disp_pmqos_get_icc_path_name(char *buf, int buf_len,
 				struct mtk_ddp_comp *comp, char *qos_event)
@@ -31,6 +69,8 @@ void mtk_disp_pmqos_get_icc_path_name(char *buf, int buf_len,
 	int len;
 
 	len = snprintf(buf, buf_len, "%s_%s", mtk_dump_comp_str(comp), qos_event);
+	if (!(len > -1 && len < buf_len))
+		DDPINFO("%s: snprintf return error", __func__);
 }
 
 int __mtk_disp_pmqos_slot_look_up(int comp_id, int mode)
@@ -88,6 +128,8 @@ int __mtk_disp_pmqos_slot_look_up(int comp_id, int mode)
 		return DISP_PMQOS_WDMA0_BW;
 	case DDP_COMPONENT_WDMA1:
 		return DISP_PMQOS_WDMA1_BW;
+	case DDP_COMPONENT_OVLSYS_WDMA2:
+		return DISP_PMQOS_OVLSYS_WDMA2_BW;
 	default:
 		DDPPR_ERR("%s, unknown comp %d\n", __func__, comp_id);
 		break;
@@ -96,26 +138,37 @@ int __mtk_disp_pmqos_slot_look_up(int comp_id, int mode)
 	return -EINVAL;
 }
 
-int __mtk_disp_set_module_bw(struct icc_path *request, int comp_id,
+int __mtk_disp_set_module_bw(struct mtk_icc_path *request, int comp_id,
 			     unsigned int bandwidth, unsigned int bw_mode)
 {
+	int ret;
+
 	DDPINFO("%s set %d bw = %u\n", __func__, comp_id, bandwidth);
 	bandwidth = bandwidth * 133 / 100;
 
-	mtk_icc_set_bw(request, MBps_to_icc(bandwidth), 0);
+	ret = mtk_icc_set_bw(request, MBps_to_icc(bandwidth), 0);
+	if (ret) {
+		DDPPR_ERR("%s: component %d bandwidth request failed: %d\n",
+			  __func__, comp_id, ret);
+		return ret;
+	}
 
 	DRM_MMP_MARK(pmqos, comp_id, bandwidth);
 
 	return 0;
 }
 
-void __mtk_disp_set_module_hrt(struct icc_path *request,
+void __mtk_disp_set_module_hrt(struct mtk_icc_path *request,
 			       unsigned int bandwidth)
 {
+	int ret;
+
 	if (bandwidth > 0)
-		mtk_icc_set_bw(request, 0, MTK_MMQOS_MAX_BW);
+		ret = mtk_icc_set_bw(request, 0, MTK_MMQOS_MAX_BW);
 	else
-		mtk_icc_set_bw(request, 0, MBps_to_icc(bandwidth));
+		ret = mtk_icc_set_bw(request, 0, MBps_to_icc(bandwidth));
+	if (ret)
+		DDPPR_ERR("%s: HRT bandwidth request failed: %d\n", __func__, ret);
 }
 
 static bool mtk_disp_check_segment(struct mtk_drm_crtc *mtk_crtc,
@@ -125,54 +178,34 @@ static bool mtk_disp_check_segment(struct mtk_drm_crtc *mtk_crtc,
 	int hact = 0;
 	int vact = 0;
 	int vrefresh = 0;
+	int bpc = 0;
 
 	if (IS_ERR_OR_NULL(mtk_crtc)) {
 		DDPPR_ERR("%s, mtk_crtc is NULL\n", __func__);
 		return ret;
 	}
-
 	if (IS_ERR_OR_NULL(priv)) {
 		DDPPR_ERR("%s, private is NULL\n", __func__);
 		return ret;
 	}
-
 	hact = mtk_crtc->base.state->adjusted_mode.hdisplay;
 	vact = mtk_crtc->base.state->adjusted_mode.vdisplay;
 	vrefresh = drm_mode_vrefresh(&mtk_crtc->base.state->adjusted_mode);
+	bpc = mtk_crtc->bpc;
 
-	switch (priv->seg_id) {
-	case 1:
-		if (hact >= 1440)
+	if (priv->seg_id == 1) {
+		if (hact <= 800 && vact <= 1700 && bpc <= 8)
+			ret = true;
+		else
 			ret = false;
-		else if (hact >= 1080 && vrefresh > 168)
-			ret = false;
-		break;
-	case 2:
-		if (hact >= 1440 && vrefresh > 120)
-			ret = false;
-		else if (hact >= 1080 && vrefresh > 168)
-			ret = false;
-		break;
-	case 3:
-		if (hact >= 1440 && vrefresh > 120)
-			ret = false;
-		else if (hact >= 1080 && vrefresh > 180)
-			ret = false;
-		break;
-	default:
-		ret = true;
-		break;
 	}
-
 /*
  *	DDPMSG("%s, segment:%d, mode(%d, %d, %d)\n",
  *			__func__, priv->seg_id, hact, vact, vrefresh);
  */
-
 	if (ret == false)
 		DDPPR_ERR("%s, check sement fail: segment:%d, mode(%d, %d, %d)\n",
 			__func__, priv->seg_id, hact, vact, vrefresh);
-
 	return ret;
 }
 
@@ -181,10 +214,19 @@ int mtk_disp_set_hrt_bw(struct mtk_drm_crtc *mtk_crtc, unsigned int bw)
 	struct drm_crtc *crtc = &mtk_crtc->base;
 	struct mtk_drm_private *priv = crtc->dev->dev_private;
 	struct mtk_ddp_comp *comp;
-	unsigned int tmp;
-	int i, j, ret = 0;
+	unsigned int tmp, total = 0, previous;
+	unsigned int crtc_idx = drm_crtc_index(crtc);
+	int i, j, ret = 0, err;
 
 	tmp = bw;
+
+	if (priv->data->mmsys_id == MMSYS_MT6835) {
+		if (mtk_disp_check_segment(mtk_crtc, priv) == false) {
+			mtk_icc_set_bw(priv->hrt_bw_request, 0, MBps_to_icc(1));
+			DRM_MMP_MARK(hrt_bw, 0, 1);
+			return 0;
+		}
+	}
 
 	for (i = 0; i < DDP_PATH_NR; i++) {
 		if (!(mtk_crtc->ddp_ctx[mtk_crtc->ddp_mode].req_hrt[i]))
@@ -202,15 +244,26 @@ int mtk_disp_set_hrt_bw(struct mtk_drm_crtc *mtk_crtc, unsigned int bw)
 
 	if (ret == RDMA_REQ_HRT)
 		tmp = mtk_drm_primary_frame_bw(crtc);
+	else if (ret == MDP_RDMA_REQ_HRT)
+		return 0;
 
-	if (priv->data->mmsys_id == MMSYS_MT6895) {
-		if (mtk_disp_check_segment(mtk_crtc, priv) == false)
-			tmp = 1;
+	/* skip same HRT BW */
+	if (priv->req_hrt[crtc_idx] == tmp)
+		return 0;
+
+	previous = priv->req_hrt[crtc_idx];
+	priv->req_hrt[crtc_idx] = tmp;
+
+	for (i = 0; i < MAX_CRTC; ++i)
+		total += priv->req_hrt[i];
+
+	err = mtk_icc_set_bw(priv->hrt_bw_request, 0, MBps_to_icc(total));
+	if (err) {
+		priv->req_hrt[crtc_idx] = previous;
+		return err;
 	}
-
-	mtk_icc_set_bw(priv->hrt_bw_request, 0, MBps_to_icc(tmp));
 	DRM_MMP_MARK(hrt_bw, 0, tmp);
-	DDPINFO("set HRT bw %u\n", tmp);
+	DDPINFO("set CRTC %d HRT bw %u %u\n", crtc_idx, tmp, total);
 
 	return ret;
 }
@@ -221,8 +274,19 @@ void mtk_drm_pan_disp_set_hrt_bw(struct drm_crtc *crtc, const char *caller)
 	struct drm_display_mode *mode;
 	unsigned int bw = 0;
 
+#if defined(CONFIG_PXLW_IRIS)
+	if (is_mi_dev_support_iris()) {
+		if (drm_crtc_index(crtc) == 0)
+			dev_crtc = crtc;
+		mtk_crtc = to_mtk_crtc(crtc);
+	} else {
+		dev_crtc = crtc;
+		mtk_crtc = to_mtk_crtc(dev_crtc);
+	}
+#else
 	dev_crtc = crtc;
 	mtk_crtc = to_mtk_crtc(dev_crtc);
+#endif
 	mode = &crtc->state->adjusted_mode;
 
 	bw = _layering_get_frame_bw(crtc, mode);
@@ -245,13 +309,17 @@ int mtk_disp_hrt_cond_change_cb(struct notifier_block *nb, unsigned long value,
 
 		return 0;
 	}
+	if (drm_crtc_index(&mtk_crtc->base) != 0) {
+		DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
+		return 0;
+	}
 
 	switch (value) {
 	case BW_THROTTLE_START: /* CAM on */
 		DDPMSG("DISP BW Throttle start\n");
 		/* TODO: concider memory session */
 		DDPINFO("CAM trigger repaint\n");
-		hrt_idx = _layering_rule_get_hrt_idx();
+		hrt_idx = _layering_rule_get_hrt_idx(drm_crtc_index(dev_crtc));
 		hrt_idx++;
 		DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
 		drm_trigger_repaint(DRM_REPAINT_FOR_IDLE, dev_crtc->dev);
@@ -298,8 +366,17 @@ int mtk_disp_hrt_cond_init(struct drm_crtc *crtc)
 	struct mtk_drm_crtc *mtk_crtc;
 	struct mtk_drm_private *priv;
 
+#if defined(CONFIG_PXLW_IRIS)
+	// ALPS-MP-T0.MP1.RC-V11.PRE.A_K6985V1_64_PRE_INHOUSE
+	/* dev_crtc is for crtc0(primary display) only */
+	if (drm_crtc_index(crtc) == 0)
+		dev_crtc = crtc;
+
+	mtk_crtc = to_mtk_crtc(crtc);
+#else
 	dev_crtc = crtc;
 	mtk_crtc = to_mtk_crtc(dev_crtc);
+#endif
 
 	if (IS_ERR_OR_NULL(mtk_crtc)) {
 		DDPPR_ERR("%s:mtk_crtc is NULL\n", __func__);
@@ -313,41 +390,118 @@ int mtk_disp_hrt_cond_init(struct drm_crtc *crtc)
 		DDPPR_ERR("%s:allocate qos_ctx failed\n", __func__);
 		return -ENOMEM;
 	}
-	memset(mtk_crtc->qos_ctx, 0, sizeof(struct mtk_drm_qos_ctx));
-	if (mtk_drm_helper_get_opt(priv->helper_opt,
+	atomic_set(&mtk_crtc->qos_ctx->last_hrt_idx, 0);
+	mtk_crtc->qos_ctx->last_hrt_req = 0;
+	mtk_crtc->qos_ctx->last_mmclk_req_idx = 0;
+
+	if (drm_crtc_index(crtc) == 0 && mtk_drm_helper_get_opt(priv->helper_opt,
 			MTK_DRM_OPT_MMQOS_SUPPORT))
 		mtk_mmqos_register_bw_throttle_notifier(&pmqos_hrt_notifier);
 
 	return 0;
 }
 
-static void mtk_drm_mmdvfs_get_avail_freq(struct device *dev)
+static int mtk_drm_mmdvfs_get_avail_freq(struct device *dev)
 {
 	int i = 0;
 	struct dev_pm_opp *opp;
 	unsigned long freq;
+	int ret;
 
 	step_size = dev_pm_opp_get_opp_count(dev);
-	if (step_size <= 0) {
-		g_freq_steps = NULL;
-		return;
-	}
-	g_freq_steps = kcalloc(step_size, sizeof(u32), GFP_KERNEL);
+	if (step_size <= 0)
+		return step_size < 0 ? step_size : -ENODEV;
+	g_freq_steps = kcalloc(step_size, sizeof(unsigned long), GFP_KERNEL);
+	if (!g_freq_steps)
+		return -ENOMEM;
 	freq = 0;
-	while (!IS_ERR(opp = dev_pm_opp_find_freq_ceil(dev, &freq))) {
+	while (i < step_size) {
+		opp = dev_pm_opp_find_freq_ceil(dev, &freq);
+		if (IS_ERR(opp))
+			return PTR_ERR(opp);
 		g_freq_steps[i] = freq;
 		freq++;
 		i++;
 		dev_pm_opp_put(opp);
 	}
+
+	ret = of_property_read_u32(dev->of_node, "lp-mmclk-freq", &lp_freq);
+	DDPINFO("%s lp_freq = %d\n", __func__, lp_freq);
+	return 0;
 }
 
-void mtk_drm_mmdvfs_init(struct device *dev)
+void mtk_drm_mmdvfs_fini(struct device *dev)
 {
-	dev_pm_opp_of_add_table(dev);
-	mm_freq_request = devm_regulator_get(dev, "dvfsrc-vcore");
+	int i;
 
-	mtk_drm_mmdvfs_get_avail_freq(dev);
+	if (mmdvfs_dev != dev)
+		return;
+	if (mm_clk)
+		clk_put(mm_clk);
+	if (mm_freq_request)
+		regulator_put(mm_freq_request);
+	kfree(g_freq_steps);
+	dev_pm_opp_of_remove_table(dev);
+	mm_clk = NULL;
+	mm_freq_request = NULL;
+	g_freq_steps = NULL;
+	mmdvfs_dev = NULL;
+	step_size = 0;
+	lp_freq = 0;
+	g_freq = 0;
+	for (i = 0; i < CRTC_NUM; i++) {
+		g_freq_level[i] = -1;
+		g_freq_lp[i] = false;
+	}
+}
+
+int mtk_drm_mmdvfs_init(struct device *dev)
+{
+	struct device_node *node = dev->of_node;
+	unsigned int index;
+	int ret = 0;
+
+	if (mmdvfs_dev)
+		return mmdvfs_dev == dev ? 0 : -EBUSY;
+	if (!of_find_property(node, "dvfs_clk_idx", NULL) &&
+	    !mmdvfs_is_ready())
+		return -EPROBE_DEFER;
+
+	ret = dev_pm_opp_of_add_table(dev);
+	if (ret)
+		return ret;
+	mmdvfs_dev = dev;
+	ret = mtk_drm_mmdvfs_get_avail_freq(dev);
+	if (ret)
+		goto fail;
+
+	/* MMDVFS V3 */
+	if (of_find_property(node, "dvfs_clk_idx", NULL)) {
+		ret = of_property_read_u32(node, "dvfs_clk_idx", &index);
+		if (ret)
+			goto fail;
+		mm_clk = of_clk_get(node, index);
+		if (IS_ERR(mm_clk)) {
+			ret = PTR_ERR(mm_clk);
+			mm_clk = NULL;
+			goto fail;
+		}
+		return 0;
+	}
+
+	/* MMDVFS V2 */
+	DDPINFO("%s, try to use MMDVFS V2\n", __func__);
+	mm_freq_request = regulator_get(dev, "mmdvfs-dvfsrc-vcore");
+	if (IS_ERR(mm_freq_request)) {
+		ret = PTR_ERR(mm_freq_request);
+		mm_freq_request = NULL;
+		goto fail;
+	}
+	return 0;
+
+fail:
+	mtk_drm_mmdvfs_fini(dev);
+	return ret;
 }
 
 unsigned int mtk_drm_get_mmclk_step_size(void)
@@ -355,59 +509,106 @@ unsigned int mtk_drm_get_mmclk_step_size(void)
 	return step_size;
 }
 
-void mtk_drm_set_mmclk(struct drm_crtc *crtc, int level,
+void mtk_drm_set_mmclk(struct drm_crtc *crtc, int level, bool lp_mode,
 			const char *caller)
 {
 	struct dev_pm_opp *opp;
 	unsigned long freq;
-	int volt, ret, idx, i;
+	int volt, ret, idx, i, previous_level;
+	bool previous_lp;
+	int final_lp_mode = true;
+	int final_level = -1;
+	int cnt = 0;
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct mtk_ddp_comp *output_comp;
 
 	idx = drm_crtc_index(crtc);
-
-	DDPINFO("%s[%d] g_freq_level[idx=%d]: %d\n",
-		__func__, __LINE__, idx, level);
-
-	/* only for crtc = 0, 1 */
-	if (idx > 2)
+	if (idx >= CRTC_NUM || !g_freq_steps || step_size <= 0) {
+		DDPPR_ERR("%s: display frequency provider is unavailable\n", __func__);
 		return;
+	}
 
-	if (!g_freq_steps || step_size <= 0)
+	if (IS_ERR_OR_NULL(mtk_crtc)) {
+		DDPPR_ERR("%s invalid mtk_crtc\n", __func__);
 		return;
+	}
+
+	/* memory session do not use */
+	output_comp = mtk_ddp_comp_request_output(mtk_crtc);
+	if (IS_ERR_OR_NULL(output_comp) ||
+		mtk_ddp_comp_get_type(output_comp->id) == MTK_DISP_WDMA) {
+		DDPINFO("crtc%d not support set mmclk\n", idx);
+		return;
+	}
+
+	DDPINFO("%s[%d] g_freq_level[idx=%d]: %d, g_freq_lp[idx=%d]: %d\n",
+		__func__, __LINE__, idx, level, idx, lp_mode);
 
 	if (level < 0 || level > (step_size - 1))
 		level = -1;
 
-	if (level == g_freq_level[idx])
+	if (level == g_freq_level[idx] && lp_mode == g_freq_lp[idx])
 		return;
 
+	previous_level = g_freq_level[idx];
+	previous_lp = g_freq_lp[idx];
+	g_freq_lp[idx] = lp_mode;
 	g_freq_level[idx] = level;
 
-	for (i = 0 ; i < CRTC_NUM; i++) {
-		if (g_freq_level[i] > g_freq_level[idx]) {
-			DDPINFO("%s[%d] g_freq_level[i=%d]=%d > g_freq_level[idx=%d]=%d\n",
-				__func__, __LINE__, i, g_freq_level[i], idx, g_freq_level[idx]);
-			// Note: The following change is temporary, and the
-			// formal change is subject to the new MTK baseline.
-			//return;
-		}
+	for (i = 0; i < CRTC_NUM; i++) {
+		if (g_freq_level[i] == -1)
+			cnt++;
+
+		if (g_freq_level[i] != -1 && !g_freq_lp[i])
+			final_lp_mode = false;
+
+		if (g_freq_level[i] > final_level)
+			final_level = g_freq_level[i];
 	}
 
-	if (g_freq_level[idx] >= 0)
-		freq = g_freq_steps[g_freq_level[idx]];
+	if (cnt == CRTC_NUM)
+		final_lp_mode = false;
+
+	DDPINFO("%s set lp mode:%d\n", __func__, final_lp_mode);
+	mmdvfs_set_lp_mode(final_lp_mode);
+
+	if (final_level >= 0)
+		freq = g_freq_steps[final_level];
 	else
 		freq = g_freq_steps[0];
 
-	DDPINFO("%s[%d] g_freq_level[idx=%d](freq=%d)\n",
-		__func__, __LINE__, idx, g_freq_level[idx], freq);
+	DDPINFO("%s[%d] final_level(freq=%d, %lu)\n",
+		__func__, __LINE__, final_level, freq);
+
+	if (!IS_ERR_OR_NULL(mm_clk)) {
+		ret = clk_set_rate(mm_clk, freq);
+		if (ret)
+			goto apply_failed;
+		return;
+	}
 
 	opp = dev_pm_opp_find_freq_ceil(crtc->dev->dev, &freq);
+	if (IS_ERR(opp)) {
+		ret = PTR_ERR(opp);
+		goto apply_failed;
+	}
 	volt = dev_pm_opp_get_voltage(opp);
 	dev_pm_opp_put(opp);
+	if (!mm_freq_request) {
+		ret = -ENODEV;
+		goto apply_failed;
+	}
 	ret = regulator_set_voltage(mm_freq_request, volt, INT_MAX);
 
 	if (ret)
-		DDPPR_ERR("%s:regulator_set_voltage fail\n", __func__);
+		goto apply_failed;
+	return;
 
+apply_failed:
+	g_freq_level[idx] = previous_level;
+	g_freq_lp[idx] = previous_lp;
+	DDPPR_ERR("%s: frequency request from %s failed: %d\n",
+		  __func__, caller, ret);
 }
 
 void mtk_drm_set_mmclk_by_pixclk(struct drm_crtc *crtc,
@@ -416,25 +617,65 @@ void mtk_drm_set_mmclk_by_pixclk(struct drm_crtc *crtc,
 	int i;
 	unsigned long freq = pixclk * 1000000;
 
-	if (!g_freq_steps || step_size <= 0)
+	if (!g_freq_steps || step_size <= 0) {
+		DDPPR_ERR("%s: no display OPP table\n", caller);
 		return;
+	}
+
+	g_freq = freq;
 
 	if (freq > g_freq_steps[step_size - 1]) {
-		DDPMSG("%s:error:pixleclk (%d) is to big for mmclk (%llu)\n",
+		DDPPR_ERR("%s:pixleclk (%d) is to big for mmclk (%llu)\n",
 			caller, freq, g_freq_steps[step_size - 1]);
-		mtk_drm_set_mmclk(crtc, step_size - 1, caller);
+		mtk_drm_set_mmclk(crtc, step_size - 1, false, caller);
 		return;
 	}
 	if (!freq) {
-		mtk_drm_set_mmclk(crtc, -1, caller);
+		mtk_drm_set_mmclk(crtc, -1, false, caller);
+		return;
+	}
+	if (step_size == 1) {
+		mtk_drm_set_mmclk(crtc, 0, false, caller);
 		return;
 	}
 	for (i = step_size - 2 ; i >= 0; i--) {
 		if (freq > g_freq_steps[i]) {
-			mtk_drm_set_mmclk(crtc, i + 1, caller);
+			mtk_drm_set_mmclk(crtc, i + 1, false, caller);
 			break;
 		}
-		if (i == 0)
-			mtk_drm_set_mmclk(crtc, 0, caller);
+		if (i == 0) {
+			if (!lp_freq || (lp_freq && (freq > lp_freq)))
+				mtk_drm_set_mmclk(crtc, 0, false, caller);
+			else
+				mtk_drm_set_mmclk(crtc, 0, true, caller);
+		}
 	}
+}
+
+unsigned long mtk_drm_get_freq(struct drm_crtc *crtc, const char *caller)
+{
+	return g_freq;
+}
+
+unsigned long mtk_drm_get_mmclk(struct drm_crtc *crtc, const char *caller)
+{
+	int idx;
+	unsigned long freq;
+
+	if (!crtc || !g_freq_steps)
+		return 0;
+
+	idx = drm_crtc_index(crtc);
+	if (idx >= CRTC_NUM)
+		return 0;
+
+	if (g_freq_level[idx] >= 0)
+		freq = g_freq_steps[g_freq_level[idx]];
+	else
+		freq = g_freq_steps[0];
+
+	DDPINFO("%s[%d]g_freq_level[idx=%d]: %d (freq=%d)\n",
+		__func__, __LINE__, idx, g_freq_level[idx], freq);
+
+	return freq;
 }

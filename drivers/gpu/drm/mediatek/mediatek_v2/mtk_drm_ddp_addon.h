@@ -20,6 +20,8 @@
 #include "../mml/mtk-mml.h"
 #include "../mml/mtk-mml-drm.h"
 
+#define DISP_PIPE_NUM 2
+
 enum addon_scenario {
 	NONE,
 	ONE_SCALING,
@@ -30,8 +32,9 @@ enum addon_scenario {
 	VP_PQ,
 	TRIPLE_DISP,
 	MML_WITH_PQ,
-	MML,
-	MML_SRAM_ONLY,
+	MML_RSZ,       /* MML Inline Rotate and MML RSZ */
+	MML_DL,	       /* MML Direct Link */
+	MML_SRAM_ONLY, /* MML Inline Rotate */
 	ADDON_SCN_NR,
 };
 
@@ -42,17 +45,27 @@ enum addon_module {
 	DISP_RSZ_v4,
 	DISP_RSZ_v5,
 	DISP_RSZ_v6,
+	OVL_RSZ,         /* OVL_2L pq out, pq in OVL_2L */
+	OVL_RSZ_1,
 	DISP_WDMA0,
 	DISP_WDMA0_v2,
+	DISP_WDMA0_v3,
 	DISP_WDMA1,
+	DISP_WDMA1_v2,
 	DISP_WDMA2,
+	DISP_OVLSYS_WDMA0,
+	DISP_OVLSYS_WDMA2,
 	DISP_WDMA2_v2,
-	MML_RSZ,
-	MML_RSZ_v2,
 	DMDP_PQ_WITH_RDMA,
-	DISP_INLINE_ROTATE,
-	DISP_INLINE_ROTATE_SRAM_ONLY,
-	DISP_INLINE_ROTATE_SRAM_ONLY_1,
+	DISP_MML_DL,     /* pq in OVL_2L */
+	DISP_MML_DL_1,
+	DISP_MML_IR_PQ,    /* OVL_2L blend out, ufod in OVL_4L */
+	DISP_MML_IR_PQ_1,
+	DISP_MML_IR_PQ_v2, /* OVL_2L pq out, pq in OVL_2L */
+	DISP_MML_IR_PQ_v2_1,
+	DISP_MML_SRAM_ONLY,
+	DISP_MML_SRAM_ONLY_1,
+	DISP_MML_IR_PQ_v3,
 	ADDON_MODULE_NUM,
 };
 
@@ -62,23 +75,25 @@ enum addon_type {
 	ADDON_AFTER,
 	ADDON_CONNECT,
 	ADDON_DISCONNECT,
+	ADDON_EMBED,
 };
 
 struct mtk_lye_ddp_state {
 	enum addon_scenario scn[HRT_DISP_TYPE_NUM];
 	uint8_t lc_tgt_layer;
 	uint8_t dmdp_tgt_layer;
+	bool need_repaint;
 };
 
 struct mtk_addon_path_data {
-	const int *path;
+	const unsigned int *path;
 	unsigned int path_len;
 };
 
 struct mtk_addon_module_data {
 	enum addon_module module;
 	enum addon_type type;
-	int attach_comp;
+	unsigned int attach_comp;
 };
 
 struct mtk_addon_scenario_data {
@@ -122,11 +137,15 @@ struct mtk_addon_wdma_config {
 
 struct mtk_addon_mml_config {
 	struct mtk_addon_config_type config_type;
-	struct mml_mutex_ctl mutex;	/* [IN] display mode and output port */
-	struct mml_submit submit;	/* [IN] mml_drm_split_info submit_pq */
-	struct mml_task *task;		/* [OUT] task and config for mml */
-	struct mtk_rect mml_src_roi;	/* [OUT] roi for source OVL */
-	struct mtk_rect mml_dst_roi;	/* for display to calc 2nd OVL ROI */
+	struct mml_mutex_ctl mutex;		    /* [IN] display mode and output port */
+	struct mml_submit submit;		    /* [IN] mml_drm_split_info submit_pq */
+	bool dual;				    /* [IN] set true if display uses dual pipe */
+	struct mml_task *task;			    /* [OUT] task and config for mml */
+	struct mtk_rect mml_src_roi[DISP_PIPE_NUM]; /* [OUT] src roi for OVL */
+	struct mtk_rect mml_dst_roi[DISP_PIPE_NUM]; /* [OUT] dst roi for OVL */
+	bool is_yuv;				    /* [OUT] src format */
+	bool is_entering;			    /* [OUT] state of entering or leaving */
+	u8 pipe;				    /* [OUT] pipe indicator 0:left 1:right*/
 };
 
 union mtk_addon_config {
@@ -184,4 +203,12 @@ void mtk_addon_disconnect_external(
 	const struct mtk_addon_module_data *module_data,
 	union mtk_addon_config *addon_config, struct cmdq_pkt *cmdq_handle);
 
+void mtk_addon_connect_embed(struct drm_crtc *crtc, unsigned int ddp_mode,
+			     const struct mtk_addon_module_data *module_data,
+			     union mtk_addon_config *addon_config, struct cmdq_pkt *cmdq_handle);
+void mtk_addon_disconnect_embed(struct drm_crtc *crtc, unsigned int ddp_mode,
+				const struct mtk_addon_module_data *module_data,
+				union mtk_addon_config *addon_config, struct cmdq_pkt *cmdq_handle);
+
 #endif
+

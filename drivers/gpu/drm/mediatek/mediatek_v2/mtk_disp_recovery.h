@@ -6,10 +6,8 @@
 #ifndef _MTK_DRM_RECOVERY_H
 #define _MTK_DRM_RECOVERY_H
 
-#include <drm/drm_crtc.h>
-#include "mtk_panel_ext.h"
-
 struct mtk_drm_private;
+struct mtk_dsi;
 
 enum mtk_esd_chk_mode {
 	READ_EINT,
@@ -18,6 +16,9 @@ enum mtk_esd_chk_mode {
 
 struct mtk_drm_esd_ctx {
 	struct task_struct *disp_esd_chk_task;
+	struct drm_crtc *crtc;
+	struct mtk_dsi *dsi;
+	struct timer_list esd_timer;
 	wait_queue_head_t check_task_wq;
 	wait_queue_head_t ext_te_wq;
 	atomic_t ext_te_event;
@@ -28,15 +29,17 @@ struct mtk_drm_esd_ctx {
 	u32 chk_mode;
 	u32 chk_sta;
 	u32 chk_en;
-#ifdef CONFIG_MI_DISP_ESD_CHECK
-	struct task_struct *mi_disp_esd_chk_task;
-	bool panel_init;
-	char esd_read_result [ESD_CHECK_NUM][10];
-#endif
+	u32 recovery_count;
+	bool recovery_pending;
+	bool eint_requested;
+	bool stopping;
 };
+int mtk_drm_esd_testing_process(struct mtk_drm_esd_ctx *esd_ctx, bool need_lock);
 
 void mtk_disp_esd_check_switch(struct drm_crtc *crtc, bool enable);
+void mtk_disp_esd_check_arm(struct drm_crtc *crtc, bool enable);
 void mtk_disp_chk_recover_init(struct drm_crtc *crtc);
+void mtk_disp_chk_recover_deinit(struct drm_crtc *crtc);
 long disp_dts_gpio_init(struct device *dev, struct mtk_drm_private *private);
 long _set_state(struct drm_crtc *crtc, const char *name);
 

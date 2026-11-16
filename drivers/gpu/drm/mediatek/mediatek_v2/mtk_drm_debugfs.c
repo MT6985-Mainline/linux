@@ -415,10 +415,6 @@ static ssize_t debug_write(struct file *file, const char __user *ubuf,
 static struct dentry *mtkdrm_dbgfs;
 #endif
 
-#if 0
-static struct proc_dir_entry *mtkdrm_dbgfs;
-#endif
-
 static const struct file_operations debug_fops = {
 	.read = debug_read, .write = debug_write, .open = debug_open,
 };
@@ -445,15 +441,7 @@ void mtk_drm_debugfs_init(struct drm_device *dev, struct mtk_drm_private *priv)
 	mtkdrm_dbgfs = debugfs_create_file("mtkdrm", 0644, NULL, (void *)0,
 					   &debug_fops);
 #endif
-#if 0
-	mtkdrm_dbgfs = proc_create("mtkdrm", S_IFREG | 0644, NULL,
-					   &debug_fops);
-	if (!mtkdrm_dbgfs) {
-		DDPPR_ERR("[%s %d]failed to create mtkdrm in /proc\n",
-			__func__, __LINE__);
-		goto out;
-	}
-#endif
+
 	/* TODO: The debugfs_init would be different in latest kernel version,
 	 * so we will refine the debugfs with multiple path in latest verion.
 	 */
@@ -513,11 +501,5 @@ void mtk_drm_debugfs_deinit(void)
 {
 #if IS_ENABLED(CONFIG_DEBUG_FS)
 	debugfs_remove(mtkdrm_dbgfs);
-#endif
-#if 0
-	if (mtkdrm_dbgfs) {
-		proc_remove(mtkdrm_dbgfs);
-		mtkdrm_dbgfs = NULL;
-	}
 #endif
 }

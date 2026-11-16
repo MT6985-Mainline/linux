@@ -3,14 +3,21 @@
  * Copyright (c) 2021 MediaTek Inc.
  */
 
+#include <linux/mm.h>
+#include <linux/overflow.h>
+#include <linux/vmalloc.h>
 #include <drm/drm_gem.h>
-#include <drm/drm_gem_dma_helper.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <drm/mediatek_drm.h>
 #include <linux/iommu.h>
+#include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_prime.h>
 #include <linux/kmemleak.h>
+#include <linux/dma-heap.h>
+#include <uapi/linux/dma-heap.h>
+#include <linux/dma-direction.h>
+#include <linux/scatterlist.h>
 
 #include "mtk_drm_drv.h"
 #include "mtk_drm_gem.h"
@@ -28,31 +35,30 @@
 #include "../mml/mtk-mml-driver.h"
 #include <linux/of_platform.h>
 
-extern bool g_mml_debug;
-
 static int mtk_drm_gem_object_mmap(struct drm_gem_object *obj,
-				   struct vm_area_struct *vma);
+                                   struct vm_area_struct *vma);
 
-static int mtk_drm_gem_object_vmap(struct drm_gem_object *obj,
-				   struct iosys_map *map)
+static int mtk_drm_gem_object_vmap(struct drm_gem_object *obj, struct iosys_map *map)
 {
-	struct mtk_drm_gem_obj *mtk_gem = to_mtk_gem_obj(obj);
+    struct mtk_drm_gem_obj *gem = to_mtk_gem_obj(obj);
 
-	iosys_map_set_vaddr(map, mtk_gem->kvaddr);
-	return 0;
+    if (!gem->kvaddr)
+        return -ENXIO;
+    iosys_map_set_vaddr(map, gem->kvaddr);
+    return 0;
 }
 
-static void mtk_drm_gem_object_vunmap(struct drm_gem_object *obj,
-				      struct iosys_map *map)
+static void mtk_drm_gem_object_vunmap(struct drm_gem_object *obj, struct iosys_map *map)
 {
+    iosys_map_clear(map);
 }
 
 static const struct drm_gem_object_funcs mtk_drm_gem_object_funcs = {
 	.free = mtk_drm_gem_free_object,
-	.get_sg_table = mtk_gem_prime_get_sg_table,
 	.mmap = mtk_drm_gem_object_mmap,
 	.vmap = mtk_drm_gem_object_vmap,
 	.vunmap = mtk_drm_gem_object_vunmap,
+	.get_sg_table = mtk_gem_prime_get_sg_table,
 	.vm_ops = &drm_gem_dma_vm_ops,
 };
 
@@ -69,6 +75,7 @@ static struct mtk_drm_gem_obj *mtk_drm_gem_init(struct drm_device *dev,
 		return ERR_PTR(-ENOMEM);
 
 	mtk_gem_obj->base.funcs = &mtk_drm_gem_object_funcs;
+
 	ret = drm_gem_object_init(dev, &mtk_gem_obj->base, size);
 	if (ret != 0) {
 		DDPPR_ERR("failed to initialize gem object\n");
@@ -79,53 +86,90 @@ static struct mtk_drm_gem_obj *mtk_drm_gem_init(struct drm_device *dev,
 	return mtk_gem_obj;
 }
 
-/* Following function is not used in mtk_drm_fb_gem_insert() so far,*/
-/* Need verify before use it. */
-static struct sg_table *mtk_gem_vmap_pa(struct mtk_drm_gem_obj *mtk_gem,
-					phys_addr_t pa, int cached,
-					struct device *dev,
-					dma_addr_t *fb_pa)
+/* Boot framebuffer RAM is supplied by the bootloader, not dma_alloc_attrs(). */
+static struct sg_table *mtk_gem_vmap_pa(struct mtk_drm_gem_obj *gem,
+				      phys_addr_t pa, struct device *dma_dev,
+				      dma_addr_t *dma_addr)
 {
-	phys_addr_t pa_align;
-	//phys_addr_t addr;
-	uint size, sz_align, npages, i;
 	struct page **pages;
-	pgprot_t pgprot;
-	void *va_align;
 	struct sg_table *sgt;
-	unsigned long attrs;
+	phys_addr_t end;
+	size_t size = gem->base.size;
+	unsigned int npages, i;
+	void *vaddr;
+	int ret;
 
-	size = mtk_gem->size;
-	pa_align = round_down(pa, PAGE_SIZE);
-	sz_align = ALIGN(pa + size - pa_align, PAGE_SIZE);
-	npages = sz_align / PAGE_SIZE;
-
-	pages = kmalloc_array(npages, sizeof(struct page *), GFP_KERNEL);
+	if (!size || !IS_ALIGNED(pa, PAGE_SIZE) ||
+	    check_add_overflow(pa, (phys_addr_t)size, &end))
+		return ERR_PTR(-EINVAL);
+	npages = size >> PAGE_SHIFT;
+	if (!npages || npages != size >> PAGE_SHIFT)
+		return ERR_PTR(-E2BIG);
+	pages = kmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
 	if (!pages)
-		return NULL;
+		return ERR_PTR(-ENOMEM);
+	for (i = 0; i < npages; i++) {
+		unsigned long pfn = PHYS_PFN(pa) + i;
 
-	pgprot = cached ? PAGE_KERNEL : pgprot_writecombine(PAGE_KERNEL);
-	for (i = 0; i < npages; i++)
-		pages[i] = phys_to_page(pa_align + i * PAGE_SIZE);
-
-	va_align = vmap(pages, npages, VM_MAP, pgprot);
-
+		if (!pfn_valid(pfn)) {
+			ret = -EINVAL;
+			goto free_pages;
+		}
+		pages[i] = pfn_to_page(pfn);
+	}
+	vaddr = vmap(pages, npages, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+	if (!vaddr) {
+		ret = -ENOMEM;
+		goto free_pages;
+	}
 	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
 	if (!sgt) {
-		DDPPR_ERR("sgt creation failed\n");
-		return NULL;
+		ret = -ENOMEM;
+		goto unmap_vaddr;
 	}
-
-	sg_alloc_table_from_pages(sgt, pages, npages, 0, size, GFP_KERNEL);
-	attrs = DMA_ATTR_SKIP_CPU_SYNC;
-	dma_map_sg_attrs(dev, sgt->sgl, sgt->nents, 0, attrs);
-	*fb_pa = sg_dma_address(sgt->sgl);
-
-	mtk_gem->cookie = va_align;
-
+	ret = sg_alloc_table_from_pages(sgt, pages, npages, 0, size, GFP_KERNEL);
+	if (ret)
+		goto free_sgt;
+	ret = dma_map_sgtable(dma_dev, sgt, DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+	if (ret)
+		goto free_table;
+	if (drm_prime_get_contiguous_size(sgt) < size) {
+		ret = -EINVAL;
+		goto unmap_dma;
+	}
+	*dma_addr = sg_dma_address(sgt->sgl);
+	gem->cookie = vaddr;
+	gem->kvaddr = vaddr;
 	kfree(pages);
-
 	return sgt;
+
+unmap_dma:
+	dma_unmap_sgtable(dma_dev, sgt, DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+free_table:
+	sg_free_table(sgt);
+free_sgt:
+	kfree(sgt);
+unmap_vaddr:
+	vunmap(vaddr);
+free_pages:
+	kfree(pages);
+	return ERR_PTR(ret);
+}
+
+int mtk_drm_boot_fb_free_pages(phys_addr_t base, size_t size)
+{
+	phys_addr_t end, pa;
+
+	if (!size || !IS_ALIGNED(base, PAGE_SIZE) || !IS_ALIGNED(size, PAGE_SIZE) ||
+	    check_add_overflow(base, (phys_addr_t)size, &end))
+		return -EINVAL;
+	/* Validate the complete region before releasing any reserved page. */
+	for (pa = base; pa < end; pa += PAGE_SIZE)
+		if (!pfn_valid(PHYS_PFN(pa)) || !PageReserved(pfn_to_page(PHYS_PFN(pa))))
+			return -EINVAL;
+	for (pa = base; pa < end; pa += PAGE_SIZE)
+		free_reserved_page(pfn_to_page(PHYS_PFN(pa)));
+	return 0;
 }
 
 static inline void *mtk_gem_dma_alloc(struct device *dev, size_t size,
@@ -165,71 +209,56 @@ struct mtk_drm_gem_obj *mtk_drm_fb_gem_insert(struct drm_device *dev,
 					      size_t size, phys_addr_t fb_base,
 					      unsigned int vramsize)
 {
-	struct mtk_drm_gem_obj *mtk_gem;
-	struct drm_gem_object *obj;
-	struct sg_table *sgt;
-	dma_addr_t fb_pa = 0;
 	struct mtk_drm_private *private = dev->dev_private;
+	struct mtk_drm_gem_obj *gem;
+	struct device *dma_dev;
+	struct sg_table *sgt;
+	dma_addr_t fb_dma;
+	size_t bytes = vramsize ? vramsize : size;
+	int ret;
 
-	DDPINFO("%s+\n", __func__);
-	mtk_gem = mtk_drm_gem_init(dev, vramsize);
-	if (IS_ERR(mtk_gem))
-		return ERR_CAST(mtk_gem);
-
-	obj = &mtk_gem->base;
-
-	mtk_gem->size = size;
-	mtk_gem->dma_attrs = DMA_ATTR_WRITE_COMBINE;
-
-	sgt = mtk_gem_vmap_pa(mtk_gem, fb_base, 0, dev->dev, &fb_pa);
-
-	mtk_gem->sec = false;
-
-	if (!mtk_drm_helper_get_opt(private->helper_opt,
-			MTK_DRM_OPT_USE_M4U))
-		mtk_gem->dma_addr = fb_base;
-	else
-		mtk_gem->dma_addr = fb_pa;
-
-	mtk_gem->kvaddr = mtk_gem->cookie;
-	mtk_gem->sg = sgt;
-
-	/*
-	 * The LK-configured OVL layers still point at the bootloader
-	 * framebuffer region (e.g. 0xff5c3000 / 0xfeb89000). Our kernel rebuilt
-	 * the display M4U page tables, so identity-map the whole region into the
-	 * display IOMMU domain to keep those fetches alive until the driver
-	 * reprograms the planes with its own GEM buffers.
-	 */
-	{
-		struct mtk_ddp_comp *comp = private->ddp_comp[DDP_COMPONENT_OVL0];
-		struct iommu_domain *domain =
-			comp ? iommu_get_domain_for_dev(comp->dev) : NULL;
-		int map_ret = domain ? iommu_map(domain, fb_base, fb_base, vramsize,
-				IOMMU_READ | IOMMU_WRITE, GFP_KERNEL) : -ENODEV;
-
-		pr_err("COROT-FBIOMMU: comp=%p domain=%p map_ret=%d fb_base=%pa vram=0x%x\n",
-			comp, domain, map_ret, &fb_base, vramsize);
-		if (map_ret == -EEXIST)
-			pr_err("COROT-FBIOMMU: already mapped (LK region re-attach?)\n");
+	if (!bytes || !fb_base || (vramsize && size > vramsize))
+		return ERR_PTR(-EINVAL);
+	if (!private->dma_dev)
+		return ERR_PTR(-EPROBE_DEFER);
+	dma_dev = get_device(private->dma_dev);
+	gem = mtk_drm_gem_init(dev, bytes);
+	if (IS_ERR(gem)) {
+		put_device(dma_dev);
+		return gem;
 	}
+	gem->size = gem->base.size;
+	sgt = mtk_gem_vmap_pa(gem, fb_base, dma_dev, &fb_dma);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		goto release_gem;
+	}
+	gem->boot_fb = true;
+	gem->boot_dma_dev = dma_dev;
+	gem->boot_fb_base = fb_base;
+	gem->sg = sgt;
+	gem->dma_attrs = DMA_ATTR_WRITE_COMBINE;
+	gem->dma_addr = mtk_drm_helper_get_opt(private->helper_opt, MTK_DRM_OPT_USE_M4U)
+			? fb_dma : fb_base;
+	DDPINFO("%s: pa=%pa dma=%pad size=%zu\n", __func__, &fb_base,
+		&gem->dma_addr, gem->size);
+	return gem;
 
-	DDPINFO("%s cookie = %p dma_addr = %pad size = %zu\n", __func__,
-		mtk_gem->cookie, &mtk_gem->dma_addr, size);
-
-	return mtk_gem;
+release_gem:
+	drm_gem_object_release(&gem->base);
+	kfree(gem);
+	put_device(dma_dev);
+	return ERR_PTR(ret);
 }
 
 void mtk_drm_fb_gem_release(struct drm_device *dev)
 {
 	struct mtk_drm_private *priv = dev->dev_private;
-	struct mtk_drm_gem_obj *mtk_gem = priv->fb_info.fb_gem;
+	struct mtk_drm_gem_obj *gem = priv->fb_info.fb_gem;
 
-	sg_free_table(mtk_gem->sg);
-	drm_gem_object_release(&mtk_gem->base);
-
-	kfree(mtk_gem->sg);
-	kfree(mtk_gem);
+	priv->fb_info.fb_gem = NULL;
+	if (!IS_ERR_OR_NULL(gem))
+		drm_gem_object_put(&gem->base);
 }
 
 struct mtk_drm_gem_obj *mtk_drm_gem_create(struct drm_device *dev, size_t size,
@@ -248,7 +277,9 @@ struct mtk_drm_gem_obj *mtk_drm_gem_create(struct drm_device *dev, size_t size,
 
 	mtk_gem->dma_attrs = DMA_ATTR_WRITE_COMBINE;
 
-	(void)alloc_kmap;
+	if (!alloc_kmap)
+		mtk_gem->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
+	//	mtk_gem->dma_attrs |= DMA_ATTR_NO_WARN;
 	mtk_gem->cookie =
 		mtk_gem_dma_alloc(priv->dma_dev, obj->size, &mtk_gem->dma_addr,
 				GFP_KERNEL, mtk_gem->dma_attrs, __func__,
@@ -260,7 +291,8 @@ struct mtk_drm_gem_obj *mtk_drm_gem_create(struct drm_device *dev, size_t size,
 	}
 	mtk_gem->size = obj->size;
 
-	mtk_gem->kvaddr = mtk_gem->cookie;
+	if (alloc_kmap)
+		mtk_gem->kvaddr = mtk_gem->cookie;
 
 	pr_debug("cookie = %p dma_addr = %pad size = %zu\n",
 			 mtk_gem->cookie, &mtk_gem->dma_addr, mtk_gem->size);
@@ -273,13 +305,89 @@ err_gem_free:
 	return ERR_PTR(ret);
 }
 
+struct mtk_drm_gem_obj *mtk_drm_gem_create_from_heap(struct drm_device *dev,
+                                       const char *heap, size_t size)
+{
+    struct mtk_drm_private *priv = dev->dev_private;
+    struct mtk_drm_gem_obj *gem;
+    struct dma_buf *buf;
+    struct dma_buf_attachment *attach;
+    struct sg_table *sg;
+    struct iosys_map map = IOSYS_MAP_INIT_VADDR(NULL);
+    int ret;
+
+    gem = mtk_drm_gem_init(dev, size);
+    if (IS_ERR(gem))
+        return gem;
+    buf = dma_heap_buffer_alloc_by_name(heap, size, O_RDWR | O_CLOEXEC, 0);
+    if (IS_ERR(buf)) {
+        ret = PTR_ERR(buf);
+        goto release_gem;
+    }
+    attach = dma_buf_attach(buf, priv->dma_dev);
+    if (IS_ERR(attach)) {
+        ret = PTR_ERR(attach);
+        goto put_buf;
+    }
+    sg = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
+    if (IS_ERR(sg)) {
+        ret = PTR_ERR(sg);
+        goto detach;
+    }
+    ret = dma_buf_vmap_unlocked(buf, &map);
+    if (ret)
+        iosys_map_clear(&map); /* Secure heaps can be inaccessible to the CPU. */
+    gem->heap_buf = buf;
+    gem->heap_attach = attach;
+    gem->heap_map = map;
+    gem->sg = sg;
+    gem->dma_addr = sg_dma_address(sg->sgl);
+    gem->size = buf->size;
+    gem->kvaddr = map.is_iomem ? NULL : map.vaddr;
+    return gem;
+
+detach:
+    dma_buf_detach(buf, attach);
+put_buf:
+    dma_buf_put(buf);
+release_gem:
+    drm_gem_object_release(&gem->base);
+    kfree(gem);
+    return ERR_PTR(ret);
+}
+
 void mtk_drm_gem_free_object(struct drm_gem_object *obj)
 {
 	struct mtk_drm_gem_obj *mtk_gem = to_mtk_gem_obj(obj);
 	struct mtk_drm_private *priv = obj->dev->dev_private;
+	DRM_MMP_MARK(ion_import_free,
+		(unsigned long)mtk_gem->dma_addr,
+		(unsigned long)((unsigned long long)(mtk_gem->dma_addr >> 4 & 0x030000000ul)
+		| mtk_gem->size));
 
-	if (mtk_gem->sg)
-		drm_prime_gem_destroy(obj, mtk_gem->sg);
+	if (mtk_gem->boot_fb) {
+		int ret;
+
+		dma_unmap_sgtable(mtk_gem->boot_dma_dev, mtk_gem->sg,
+				DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+		sg_free_table(mtk_gem->sg);
+		kfree(mtk_gem->sg);
+		vunmap(mtk_gem->cookie);
+		if (mtk_gem->boot_reclaim) {
+			ret = mtk_drm_boot_fb_free_pages(mtk_gem->boot_fb_base, obj->size);
+			if (ret)
+				dev_warn(obj->dev->dev, "Boot framebuffer RAM could not be reclaimed: %d\n", ret);
+		}
+		put_device(mtk_gem->boot_dma_dev);
+	} else if (mtk_gem->heap_buf) {
+        if (!iosys_map_is_null(&mtk_gem->heap_map))
+            dma_buf_vunmap_unlocked(mtk_gem->heap_buf, &mtk_gem->heap_map);
+        dma_buf_unmap_attachment_unlocked(mtk_gem->heap_attach, mtk_gem->sg,
+                                         DMA_BIDIRECTIONAL);
+        dma_buf_detach(mtk_gem->heap_buf, mtk_gem->heap_attach);
+        dma_buf_put(mtk_gem->heap_buf);
+    } else if (mtk_gem->sg)
+        drm_prime_gem_destroy(obj, mtk_gem->sg);
 	else if (!mtk_gem->sec)
 		mtk_gem_dma_free(priv->dma_dev, obj->size, mtk_gem->cookie,
 			       mtk_gem->dma_addr, mtk_gem->dma_attrs,
@@ -300,7 +408,7 @@ int mtk_drm_gem_dumb_create(struct drm_file *file_priv, struct drm_device *dev,
 	args->pitch = DIV_ROUND_UP(args->width * args->bpp, 8);
 	args->size = (__u64)args->pitch * (__u64)args->height;
 
-	mtk_gem = mtk_drm_gem_create(dev, args->size, false);
+	mtk_gem = mtk_drm_gem_create(dev, args->size, true);
 	if (IS_ERR(mtk_gem))
 		return PTR_ERR(mtk_gem);
 
@@ -362,25 +470,51 @@ static int mtk_drm_gem_object_mmap(struct drm_gem_object *obj,
 	 * VM_PFNMAP flag that was set by drm_gem_mmap_obj()/drm_gem_mmap().
 	 */
 	vm_flags_clear(vma, VM_PFNMAP);
-	vm_flags_set(vma, VM_DONTEXPAND);
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_pgoff = 0;
 
+	if (mtk_gem->boot_fb) {
+		vm_flags_set(vma, VM_IO | VM_PFNMAP);
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+		return remap_pfn_range(vma, vma->vm_start, PHYS_PFN(mtk_gem->boot_fb_base),
+				       vma->vm_end - vma->vm_start, vma->vm_page_prot);
+	}
+	if (mtk_gem->heap_buf) {
+        ret = dma_buf_mmap(mtk_gem->heap_buf, vma, 0);
+        /* A successful dma-buf mapping owns its file, not this GEM object. */
+        if (!ret)
+            drm_gem_object_put(obj);
+        return ret;
+    }
 	ret = dma_mmap_attrs(priv->dma_dev, vma, mtk_gem->cookie,
 			     mtk_gem->dma_addr, obj->size, mtk_gem->dma_attrs);
-	if (ret)
-		drm_gem_vm_close(vma);
-
+	/* drm_gem_mmap_obj() releases its mapping reference on failure. */
 	return ret;
 }
 
 int mtk_drm_gem_mmap_buf(struct drm_gem_object *obj, struct vm_area_struct *vma)
 {
-	return mtk_drm_gem_object_mmap(obj, vma);
+	int ret;
+
+	ret = drm_gem_mmap_obj(obj, obj->size, vma);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
 int mtk_drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	return drm_gem_mmap(filp, vma);
+	struct drm_gem_object *obj;
+	int ret;
+
+	ret = drm_gem_mmap(filp, vma);
+	if (ret)
+		return ret;
+
+	obj = vma->vm_private_data;
+
+	return 0;
 }
 
 void mtk_drm_gem_ion_free_handle(struct dma_buf *buf_hnd,
@@ -444,6 +578,23 @@ struct sg_table *mtk_gem_prime_get_sg_table(struct drm_gem_object *obj)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	if (mtk_gem->boot_fb) {
+		struct scatterlist *src, *dst;
+		unsigned int i;
+
+		ret = sg_alloc_table(sgt, mtk_gem->sg->orig_nents, GFP_KERNEL);
+		if (ret) {
+			kfree(sgt);
+			return ERR_PTR(ret);
+		}
+		dst = sgt->sgl;
+		for_each_sg(mtk_gem->sg->sgl, src, mtk_gem->sg->orig_nents, i) {
+			sg_set_page(dst, sg_page(src), src->length, src->offset);
+			dst = sg_next(dst);
+		}
+		return sgt;
+	}
+
 	ret = dma_get_sgtable_attrs(priv->dma_dev, sgt, mtk_gem->cookie,
 				    mtk_gem->dma_addr, obj->size,
 				    mtk_gem->dma_attrs);
@@ -466,7 +617,7 @@ mtk_gem_prime_import_sg_table(struct drm_device *dev,
 			      struct dma_buf_attachment *attach,
 			      struct sg_table *sg)
 {
-	struct mtk_drm_gem_obj *mtk_gem;
+	struct mtk_drm_gem_obj *mtk_gem = NULL;
 #ifdef IF_ZERO
 	int ret;
 	struct scatterlist *s;
@@ -479,13 +630,19 @@ mtk_gem_prime_import_sg_table(struct drm_device *dev,
 			dev,
 			attach,
 			sg);
-	mtk_gem = mtk_drm_gem_init(dev, attach->dmabuf->size);
+	if (attach && attach->dmabuf)
+		mtk_gem = mtk_drm_gem_init(dev, attach->dmabuf->size);
 
 	if (IS_ERR(mtk_gem)) {
 		DDPPR_ERR("%s:%d mtk_gem error:0x%p\n",
 				__func__, __LINE__,
 				mtk_gem);
 		return ERR_PTR(PTR_ERR(mtk_gem));
+	} else if (!mtk_gem) {
+		DDPPR_ERR("%s:%d mtk_gem error:0x%p\n",
+				__func__, __LINE__,
+				mtk_gem);
+		return ERR_PTR(-ENOMEM);
 	}
 
 #ifdef IF_ZERO
@@ -510,11 +667,17 @@ mtk_gem_prime_import_sg_table(struct drm_device *dev,
 		goto err_gem_free;
 	}
 #endif
-
-	mtk_gem->sec = false;
+	if (disp_sec_cb.cb != NULL && attach->dmabuf)
+		mtk_gem->sec = disp_sec_cb.cb(DISP_SEC_CHECK, NULL, 0, attach->dmabuf);
+	else
+		mtk_gem->sec = false;
 	mtk_gem->dma_addr = sg_dma_address(sg->sgl);
 	mtk_gem->size = attach->dmabuf->size;
 	mtk_gem->sg = sg;
+	DRM_MMP_MARK(ion_import_dma,
+		(unsigned long)mtk_gem->dma_addr,
+		(unsigned long)((unsigned long long)(mtk_gem->dma_addr >> 4 & 0x030000000ul)
+		| mtk_gem->size));
 
 	DDPDBG("%s:%d sec:%d, addr:0x%llx, size:%ld, sg:0x%p -\n",
 			__func__, __LINE__,
@@ -557,7 +720,7 @@ int mtk_gem_create_ioctl(struct drm_device *dev, void *data,
 		return 0;
 	}
 
-	mtk_gem = mtk_drm_gem_create(dev, args->size, false);
+	mtk_gem = mtk_drm_gem_create(dev, args->size, true);
 	if (IS_ERR(mtk_gem))
 		return PTR_ERR(mtk_gem);
 
@@ -596,7 +759,7 @@ static void prepare_output_buffer(struct drm_device *dev,
 
 	/* create second fence for WDMA when decouple mirror mode */
 	buf->layer_id = mtk_fence_get_interface_timeline_id();
-	output_buf = mtk_fence_prepare_buf(dev, buf);
+	output_buf = mtk_fence_prepare_buf(dev, buf, false, NULL);
 	if (output_buf) {
 		buf->interface_fence_fd = output_buf->fence;
 		buf->interface_index = output_buf->idx;
@@ -621,7 +784,7 @@ int mtk_gem_submit_ioctl(struct drm_device *dev, void *data,
 		args->layer_id = mtk_fence_get_output_timeline_id();
 
 	if (args->layer_en) {
-		buf = mtk_fence_prepare_buf(dev, args);
+		buf = mtk_fence_prepare_buf(dev, args, false, NULL);
 		if (buf != NULL) {
 			args->fence_fd = buf->fence;
 			args->index = buf->idx;
@@ -770,8 +933,9 @@ int mtk_drm_ioctl_mml_gem_submit(struct drm_device *dev, void *data,
 	struct mml_submit *submit_user = (struct mml_submit *)data;
 	struct mtk_drm_private *priv = dev->dev_private;
 	struct mml_drm_ctx *mml_ctx = NULL;
-	struct mml_submit* submit_kernel;
+	struct mml_submit *submit_kernel;
 	struct drm_crtc *crtc;
+	struct mtk_drm_crtc *mtk_crtc;
 
 	DDPINFO("%s:%d +\n", __func__, __LINE__);
 
@@ -780,34 +944,62 @@ int mtk_drm_ioctl_mml_gem_submit(struct drm_device *dev, void *data,
 		return -EINVAL;
 	}
 
-	submit_kernel = kzalloc(sizeof(struct mml_submit), GFP_KERNEL);
-	memcpy(submit_kernel, submit_user, sizeof(struct mml_submit));
-	submit_kernel->job = kzalloc(sizeof(struct mml_job), GFP_KERNEL);
+	if (!submit_user)
+		return -EFAULT;
 
-	if (submit_user->job) {
-		copy_from_user(submit_kernel->job, submit_user->job, sizeof(struct mml_job));
-	} else {
-		DDPMSG("mtk_drm_ioctl_mml_gem_submit submit_user->job is null\n");
+	submit_kernel = kzalloc(sizeof(struct mml_submit), GFP_KERNEL);
+	if (!submit_kernel) {
+		DDPMSG("[%s][%d][%d] kzalloc fail\n", __func__, __LINE__, ret);
+		return -EFAULT;
 	}
 
-	for (i = 0; i < MML_MAX_OUTPUTS; i++)
-	{
+	memcpy(submit_kernel, submit_user, sizeof(struct mml_submit));
+	submit_kernel->job = kzalloc(sizeof(struct mml_job), GFP_KERNEL);
+	if (!submit_kernel->job) {
+		ret = -EFAULT;
+		DDPMSG("[%s][%d][%d] kzalloc fail\n", __func__, __LINE__, ret);
+		goto err_handle_create;
+	}
+
+	if (submit_user->job) {
+		ret = copy_from_user(submit_kernel->job, submit_user->job, sizeof(struct mml_job));
+		if (ret) {
+			DDPMSG("[%s][%d][%d] copy_from_user fail\n", __func__, __LINE__, ret);
+			goto err_handle_create;
+		}
+	} else
+		DDPMSG("[%s] submit_user->job is null\n", __func__);
+
+	for (i = 0; i < MML_MAX_OUTPUTS; i++) {
 		if (submit_user->pq_param[i]) {
-			submit_kernel->pq_param[i] = kzalloc(sizeof(struct mml_pq_param), GFP_KERNEL);
-			copy_from_user(submit_kernel->pq_param[i], submit_user->pq_param[i],
+			submit_kernel->pq_param[i] =
+				kzalloc(sizeof(struct mml_pq_param), GFP_KERNEL);
+			if (!submit_kernel->pq_param[i]) {
+				ret = -EFAULT;
+				DDPMSG("[%s][%d][%d] kzalloc fail\n", __func__, __LINE__, ret);
+				goto err_handle_create;
+			}
+
+			ret = copy_from_user(submit_kernel->pq_param[i], submit_user->pq_param[i],
 				sizeof(struct mml_pq_param));
+			if (ret) {
+				DDPMSG("[%s][%d][%d] copy_from_user fail\n",
+				__func__, __LINE__, ret);
+				goto err_handle_create;
+			}
 			//copy_from_user(submit_kernel->pq_param[i]->gralloc_extra_handle,
 			//	submit_user->pq_param[i]->gralloc_extra_handle, sizeof(void *));
 		} else {
-			DDPMSG("mtk_drm_ioctl_mml_gem_submit submit_user->pq_param[i] is null\n");
+			DDPMSG("%s submit_user->pq_param[i] is null\n", __func__);
 		}
 	}
 
 	crtc = list_first_entry(&(dev)->mode_config.crtc_list,
 		typeof(*crtc), head);
+	mtk_crtc = to_mtk_crtc(crtc);
 	mml_ctx = mtk_drm_get_mml_drm_ctx(dev, crtc);
 
-	if (g_mml_debug) {
+	if (mtk_crtc->mml_debug & DISP_MML_DBG_LOG) {
 		DDPINFO("%s:%d\n", __func__, __LINE__);
 		print_mml_submit(submit_kernel);
 		DDPINFO("%s:%d\n", __func__, __LINE__);
@@ -819,20 +1011,20 @@ int mtk_drm_ioctl_mml_gem_submit(struct drm_device *dev, void *data,
 		DDPINFO("%s:%d mml_drm_submit - ret:%d, job(id,fence):(%d,%d)\n",
 			__func__, __LINE__, ret,
 			submit_kernel->job->jobid, submit_kernel->job->fence);
-		if (ret) {
+		if (ret)
 			DDPMSG("submit failed: %d\n", ret);
-		}
 	}
 
-	if (submit_user && submit_user->job) {
-		copy_to_user(submit_user->job, submit_kernel->job, sizeof(struct mml_job));
+	if (submit_user->job) {
+		ret = copy_to_user(submit_user->job, submit_kernel->job, sizeof(struct mml_job));
+		if (ret)
+			DDPMSG("[%s][%d][%d] copy_to_user fail\n", __func__, __LINE__, ret);
 	}
 
-	for (i = 0; i < MML_MAX_OUTPUTS; i++)
-	{
-		if (submit_user->pq_param[i]) {
+err_handle_create:
+	for (i = 0; i < MML_MAX_OUTPUTS; i++) {
+		if (submit_kernel->pq_param[i])
 			kfree(submit_kernel->pq_param[i]);
-		}
 	}
 	kfree(submit_kernel->job);
 	kfree(submit_kernel);

@@ -11,6 +11,7 @@
 #include <linux/wait.h>
 #include <linux/file.h>
 #include <linux/sched/clock.h>
+#include <linux/sync_file.h>
 
 #include <drm/mediatek_drm.h>
 
@@ -62,6 +63,8 @@ char *mtk_fence_session_mode_spy(unsigned int session_id)
 		return "E";
 	case MTK_SESSION_MEMORY:
 		return "M";
+	case MTK_SESSION_SP:
+		return "N";
 	default:
 		return "Unknown";
 	}
@@ -78,7 +81,8 @@ _get_session_sync_info(unsigned int session_id)
 
 	if ((MTK_SESSION_TYPE(session_id) != MTK_SESSION_PRIMARY) &&
 	    (MTK_SESSION_TYPE(session_id) != MTK_SESSION_EXTERNAL) &&
-	    (MTK_SESSION_TYPE(session_id) != MTK_SESSION_MEMORY)) {
+	    (MTK_SESSION_TYPE(session_id) != MTK_SESSION_MEMORY) &&
+	    (MTK_SESSION_TYPE(session_id) != MTK_SESSION_SP)) {
 		DDPFENCE("invalid session id:0x%08x\n", session_id);
 		return NULL;
 	}
@@ -150,6 +154,10 @@ _get_session_sync_info(unsigned int session_id)
 				else if (MTK_SESSION_TYPE(session_id) ==
 				    MTK_SESSION_MEMORY)
 					sprintf(name, "-M_%d_%d-",
+						MTK_SESSION_DEV(session_id), j);
+				else if (MTK_SESSION_TYPE(session_id) ==
+				    MTK_SESSION_SP)
+					sprintf(name, "-N_%d_%d-",
 						MTK_SESSION_DEV(session_id), j);
 				else
 					sprintf(name, "-NA_%d_%d-",
@@ -547,8 +555,10 @@ int mtk_release_present_fence(unsigned int session_id, unsigned int fence_idx, k
 		idx = 0;
 	else if (MTK_SESSION_TYPE(session_id) == MTK_SESSION_EXTERNAL)
 		idx = 1;
-	else
+	else if (MTK_SESSION_TYPE(session_id) == MTK_SESSION_MEMORY)
 		idx = 2;
+	else
+		idx = 3;
 
 	CRTC_MMP_MARK(idx, release_present_fence, 0, fence_idx);
 
@@ -578,8 +588,10 @@ int mtk_release_sf_present_fence(unsigned int session_id,
 		idx = 0;
 	else if (MTK_SESSION_TYPE(session_id) == MTK_SESSION_EXTERNAL)
 		idx = 1;
-	else
+	else if (MTK_SESSION_TYPE(session_id) == MTK_SESSION_MEMORY)
 		idx = 2;
+	else
+		idx = 3;
 
 	mutex_lock(&layer_info->sync_lock);
 
@@ -640,6 +652,8 @@ int mtk_fence_get_present_timeline_id(unsigned int session_id)
 		return MTK_TIMELINE_PRIMARY_PRESENT_TIMELINE_ID;
 	if (MTK_SESSION_TYPE(session_id) == MTK_SESSION_EXTERNAL)
 		return MTK_TIMELINE_SECONDARY_PRESENT_TIMELINE_ID;
+	if (MTK_SESSION_TYPE(session_id) == MTK_SESSION_SP)
+		return MTK_TIMELINE_SP_PRESENT_TIMELINE_ID;
 
 	DDPFENCE("session id is wrong, session=0x%x!!\n", session_id);
 	return -1;
@@ -764,7 +778,8 @@ int mtk_fence_convert_input_to_fence_layer_info(
  * @return struct @mtk_fence_buf_info
  */
 struct mtk_fence_buf_info *mtk_fence_prepare_buf(struct drm_device *dev,
-						 struct drm_mtk_gem_submit *buf)
+						 struct drm_mtk_gem_submit *buf, bool is_implicit,
+						 struct dma_resv *resv)
 {
 	int ret = 0;
 	unsigned int session_id = 0;
@@ -773,6 +788,7 @@ struct mtk_fence_buf_info *mtk_fence_prepare_buf(struct drm_device *dev,
 	struct fence_data data;
 	struct mtk_fence_info *layer_info = NULL;
 	struct mtk_fence_session_sync_info *session_info = NULL;
+	struct dma_fence *fence = NULL;
 
 	if (buf == NULL) {
 		DDPPR_ERR("Prepare Buffer, buf is NULL!!\n");
@@ -802,7 +818,10 @@ struct mtk_fence_buf_info *mtk_fence_prepare_buf(struct drm_device *dev,
 	data.value = ++(layer_info->fence_idx);
 	mutex_unlock(&(layer_info->sync_lock));
 
-	ret = mtk_sync_fence_create(layer_info->timeline, &data);
+	if (is_implicit)
+		ret = mtk_sync_share_fence_create(layer_info->timeline, &data, resv);
+	else
+		ret = mtk_sync_fence_create(layer_info->timeline, &data);
 	if (ret != 0) {
 		/* Does this really happened? */
 		DDPPR_ERR("%s%d,layer%d create Fence Object failed ret=%d!\n",
@@ -826,16 +845,21 @@ struct mtk_fence_buf_info *mtk_fence_prepare_buf(struct drm_device *dev,
 	list_add_tail(&buf_info->list, &layer_info->buf_list);
 	mutex_unlock(&layer_info->sync_lock);
 
+	fence = sync_file_get_fence(buf_info->fence);
 	if (buf_info->buf_hnd)
-		DDPFENCE("P+/%s%d/L%d/id%d/fd%d/hnd0x%8p\n",
+		DDPFENCE("P+/%s%d/L%d/id%d/fd%d/hnd0x%8p/pt0x%lx\n",
 			 mtk_fence_session_mode_spy(session_id),
 			 MTK_SESSION_DEV(session_id), timeline_id, buf_info->idx,
-			 buf_info->fence, buf_info->buf_hnd);
+			 buf_info->fence, buf_info->buf_hnd,
+			 IS_ERR_OR_NULL(fence) ? 0x0 : (unsigned long)fence);
 	else
-		DDPFENCE("P+/%s%d/L%d/id%d/fd%d\n",
+		DDPFENCE("P+/%s%d/L%d/id%d/fd%d/pt0x%lx\n",
 			 mtk_fence_session_mode_spy(session_id),
 			 MTK_SESSION_DEV(session_id), timeline_id, buf_info->idx,
-			 buf_info->fence);
+			 buf_info->fence,
+			 IS_ERR_OR_NULL(fence) ? 0x0 : (unsigned long)fence);
+	if (!IS_ERR_OR_NULL(fence))
+		dma_fence_put(fence);
 
 	return buf_info;
 }

@@ -151,7 +151,7 @@ union tcicmdBody_t {
 	struct cmdHDCPCompare_t cmdHDCPCompare;
 	/* for test only */
 	struct cryptokeys_t cryptokeys;
-} __attribute__ ((__packed__));
+} __packed;
 
 struct cmdHDCP_t {
 	/* request tci header */
@@ -177,6 +177,7 @@ union tciMessage_t {
 struct tci_t {
 	union tciMessage_t message; /**< TCI message */
 };
-const static uint64_t TCI_LENGTH = sizeof(struct tci_t);
+static const uint64_t TCI_LENGTH = sizeof(struct tci_t);
 
 #endif //__TCI_H__
+
