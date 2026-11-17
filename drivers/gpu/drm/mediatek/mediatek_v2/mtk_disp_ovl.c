@@ -468,6 +468,7 @@ struct mtk_disp_ovl {
 	int bg_w, bg_h;
 	struct clk *fbdc_clk;
 	struct mtk_ovl_backup_info backup_info[MAX_LAYER_NUM];
+	atomic_t corot_config_traces;
 };
 
 static inline struct mtk_disp_ovl *comp_to_ovl(struct mtk_ddp_comp *comp)
@@ -2171,6 +2172,15 @@ static void mtk_ovl_layer_config(struct mtk_ddp_comp *comp, unsigned int idx,
 	frame_idx = mtk_crtc_state->prop_val[CRTC_PROP_OVL_DSI_SEQ];
 	priv = crtc->dev->dev_private;
 	crtc_idx = (unsigned long)drm_crtc_index(crtc);
+	if (!crtc_idx && pending->enable &&
+	    of_machine_is_compatible("xiaomi,corot") &&
+	    atomic_inc_return(&ovl->corot_config_traces) <= 8)
+		DDPMSG("COROT-OVL: comp=%s layer=%u fmt=%p4cc pitch=%u bytes=%#lx dma=%#llx src=%u,%u dst=%u,%u %ux%u roi=%dx%d queued\n",
+		       mtk_dump_comp_str(comp), idx, &fmt, pending->pitch,
+		       (unsigned long)pending->size,
+		       (unsigned long long)pending->addr,
+		       pending->src_x, pending->src_y, pending->dst_x, pending->dst_y,
+		       pending->width, pending->height, ovl->bg_w, ovl->bg_h);
 
 	/* handle dim layer for compression flag & color dim*/
 	if (fmt == DRM_FORMAT_C8) {
@@ -4461,7 +4471,7 @@ static void mtk_ovl_unprepare(struct mtk_ddp_comp *comp)
 	mtk_ddp_comp_clk_unprepare(comp);
 }
 
-static void
+static int
 mtk_ovl_config_trigger(struct mtk_ddp_comp *comp, struct cmdq_pkt *pkt,
 		       enum mtk_ddp_comp_trigger_flag flag)
 {
@@ -4493,19 +4503,19 @@ mtk_ovl_config_trigger(struct mtk_ddp_comp *comp, struct cmdq_pkt *pkt,
 		struct mtk_drm_private *priv = NULL;
 
 		if (!comp->mtk_crtc)
-			return;
+			return 0;
 
 		priv = comp->mtk_crtc->base.dev->dev_private;
 		if (!mtk_drm_helper_get_opt(priv->helper_opt,
 					   MTK_DRM_OPT_LAYER_REC))
-			return;
+			return 0;
 
 		if (comp->id == DDP_COMPONENT_OVL0_2L)
 			offset = DISP_SLOT_LAYER_REC_OVL0_2L;
 		else if (comp->id == DDP_COMPONENT_OVL0)
 			offset = DISP_SLOT_LAYER_REC_OVL0;
 		else
-			return;
+			return 0;
 
 		qbuf = &comp->mtk_crtc->gce_obj.buf;
 
@@ -4567,6 +4577,8 @@ mtk_ovl_config_trigger(struct mtk_ddp_comp *comp, struct cmdq_pkt *pkt,
 	default:
 		break;
 	}
+
+	return 0;
 }
 
 static const struct mtk_ddp_comp_funcs mtk_disp_ovl_funcs = {

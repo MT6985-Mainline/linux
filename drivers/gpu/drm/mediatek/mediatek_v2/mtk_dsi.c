@@ -14,6 +14,7 @@
 #include <linux/delay.h>
 #include <linux/ktime.h>
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/vmalloc.h>
 #include <linux/string.h>
 #include <linux/clocksource.h>
@@ -4749,6 +4750,8 @@ int mtk_dsi_start_vdo_mode(struct mtk_ddp_comp *comp, void *handle)
 
 int mtk_dsi_trigger(struct mtk_ddp_comp *comp, void *handle)
 {
+	int ret;
+
 	if (!handle) {
 		struct mtk_dsi *dsi = container_of(comp, struct mtk_dsi, ddp_comp);
 
@@ -4757,13 +4760,13 @@ int mtk_dsi_trigger(struct mtk_ddp_comp *comp, void *handle)
 		return 0;
 	}
 
-	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_START, 0,
-		       ~0);
+	ret = cmdq_pkt_write(handle, comp->cmdq_base,
+			     comp->regs_pa + DSI_START, 0, ~0);
+	if (ret)
+		return ret;
 
-	cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_START, 1,
-		       ~0);
-
-	return 0;
+	return cmdq_pkt_write(handle, comp->cmdq_base,
+			      comp->regs_pa + DSI_START, 1, ~0);
 }
 
 int mtk_dsi_read_gce(struct mtk_ddp_comp *comp, void *handle,
@@ -5417,18 +5420,19 @@ static void mtk_dsi_ddp_unprepare(struct mtk_ddp_comp *comp)
 	mtk_dsi_poweroff(dsi);
 }
 
-static void mtk_dsi_config_trigger(struct mtk_ddp_comp *comp,
-				   struct cmdq_pkt *handle,
-				   enum mtk_ddp_comp_trigger_flag flag)
+static int mtk_dsi_config_trigger(struct mtk_ddp_comp *comp,
+				  struct cmdq_pkt *handle,
+				  enum mtk_ddp_comp_trigger_flag flag)
 {
 	struct mtk_dsi *dsi = container_of(comp, struct mtk_dsi, ddp_comp);
 	struct mtk_drm_crtc *mtk_crtc = comp->mtk_crtc;
 	struct mtk_panel_ext *ext = dsi->ext;
 	struct mtk_drm_private *priv = NULL;
+	int ret;
 
-	if (!mtk_crtc) {
-		DDPPR_ERR("%s dsi comp not configure CRTC yet", __func__);
-		return;
+	if (!mtk_crtc || !ext || !ext->params) {
+		DDPPR_ERR("%s dsi component has no CRTC or panel parameters\n", __func__);
+		return -EINVAL;
 	}
 
 	if (mtk_crtc->base.dev)
@@ -5437,50 +5441,57 @@ static void mtk_dsi_config_trigger(struct mtk_ddp_comp *comp,
 	switch (flag) {
 	case MTK_TRIG_FLAG_TRIGGER:
 		mtk_dsi_poll_for_idle(dsi, handle);
-		/* TODO: avoid hardcode: 0xF0 register offset  */
 		if (ext->params->lp_perline_en == 0 &&
-			mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
-			// hs mode
-			if (priv && priv->data && (priv->data->mmsys_id == MMSYS_MT6855))
-				cmdq_pkt_write(handle, comp->cmdq_base,
-						comp->regs_pa + DSI_CON_CTRL,
-						DSI_CM_MODE_WAIT_DATA_EVERY_LINE_EN,
-						DSI_CM_MODE_WAIT_DATA_EVERY_LINE_EN);
-			else {
-				cmdq_pkt_write(handle, comp->cmdq_base,
+		    mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base)) {
+			if (priv && priv->data && priv->data->mmsys_id == MMSYS_MT6855)
+				ret = cmdq_pkt_write(handle, comp->cmdq_base,
+					comp->regs_pa + DSI_CON_CTRL,
+					DSI_CM_MODE_WAIT_DATA_EVERY_LINE_EN,
+					DSI_CM_MODE_WAIT_DATA_EVERY_LINE_EN);
+			else
+				ret = cmdq_pkt_write(handle, comp->cmdq_base,
 					comp->regs_pa + DSI_CMD_TYPE1_HS,
-					CMD_HS_HFP_BLANKING_HS_EN, CMD_HS_HFP_BLANKING_HS_EN);
-			}
+					CMD_HS_HFP_BLANKING_HS_EN,
+					CMD_HS_HFP_BLANKING_HS_EN);
+			if (ret)
+				return ret;
 		}
 
-		if (priv && priv->data && priv->data->mmsys_id != MMSYS_MT6985)
-			cmdq_pkt_write(handle, comp->cmdq_base,
+		if (priv && priv->data && priv->data->mmsys_id != MMSYS_MT6985) {
+			ret = cmdq_pkt_write(handle, comp->cmdq_base,
 				comp->mtk_crtc->config_regs_pa + 0xF0, 0x1, 0x1);
+			if (ret)
+				return ret;
+		}
 
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + dsi->driver_data->reg_cmdq0_ofs,
-			       0x002c3909, ~0);
-		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_CMDQ_SIZE,
-				1, CMDQ_SIZE);
-		cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_CMDQ_SIZE,
-				CMDQ_SIZE_SEL, CMDQ_SIZE_SEL);
+		ret = cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + dsi->driver_data->reg_cmdq0_ofs,
+			0x002c3909, ~0);
+		if (ret)
+			return ret;
+		ret = cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DSI_CMDQ_SIZE, 1, CMDQ_SIZE);
+		if (ret)
+			return ret;
+		ret = cmdq_pkt_write(handle, comp->cmdq_base,
+			comp->regs_pa + DSI_CMDQ_SIZE, CMDQ_SIZE_SEL, CMDQ_SIZE_SEL);
+		if (ret)
+			return ret;
 
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DSI_START, 0, ~0);
-		cmdq_pkt_write(handle, comp->cmdq_base,
-			       comp->regs_pa + DSI_START, 1, ~0);
-		break;
+		return mtk_dsi_trigger(comp, handle);
 	case MTK_TRIG_FLAG_EOF:
 		mtk_dsi_poll_for_idle(dsi, handle);
-
 		if (ext->params->lp_perline_en == 0 &&
-			mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base))
-			cmdq_pkt_write(handle, comp->cmdq_base, comp->regs_pa + DSI_CMD_TYPE1_HS, 0,
-					CMD_HS_HFP_BLANKING_HS_EN);
+		    mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base))
+			return cmdq_pkt_write(handle, comp->cmdq_base,
+				comp->regs_pa + DSI_CMD_TYPE1_HS, 0,
+				CMD_HS_HFP_BLANKING_HS_EN);
 		break;
 	default:
 		break;
 	}
+
+	return 0;
 }
 
 static int mtk_dsi_is_busy(struct mtk_ddp_comp *comp)
@@ -7944,6 +7955,75 @@ static void mtk_corot_dsi_link_state(struct mtk_dsi *dsi, const char *phase)
 		       readl(tx->regs + pad * 0x100 + 0x60));
 }
 
+/* The caller holds commit/CRTC locks and an active DSI power reference. */
+static void mtk_corot_pipeline_readback(struct mtk_drm_crtc *mtk_crtc,
+				      const char *phase)
+{
+	static const struct {
+		enum mtk_ddp_comp_id id;
+		resource_size_t address;
+		bool ovl;
+	} targets[] = {
+		{ DDP_COMPONENT_OVL0_2L, 0x14402000, true },
+		{ DDP_COMPONENT_OVL4_2L, 0x14602000, true },
+		{ DDP_COMPONENT_DSC0, 0x1400c000, false },
+		{ DDP_COMPONENT_DSC1, 0x1420c000, false },
+	};
+	struct mtk_drm_private *priv = mtk_crtc->base.dev->dev_private;
+	unsigned int i;
+
+	if (drm_crtc_index(&mtk_crtc->base) || !mtk_crtc->enabled)
+		return;
+	for (i = 0; i < ARRAY_SIZE(targets); i++) {
+		struct mtk_ddp_comp *comp = priv->ddp_comp[targets[i].id];
+		void __iomem *r;
+		int active;
+		bool runtime_vote = false;
+
+		if (!comp || !comp->dev || !comp->regs ||
+		    comp->regs_pa != targets[i].address)
+			continue;
+		if (!targets[i].ovl && !pm_runtime_enabled(comp->dev)) {
+			/* DSC prepare owns its clock directly, without device runtime PM. */
+			if (comp->mtk_crtc != mtk_crtc || comp->blank_mode ||
+			    !comp->clk || !__clk_get_enable_count(comp->clk)) {
+				DDPMSG("COROT-REG: %s %s has no active path clock\n",
+				       phase, mtk_dump_comp_str(comp));
+				continue;
+			}
+			DDPMSG("COROT-REG: %s %s path-clock-refs=%u\n", phase,
+			       mtk_dump_comp_str(comp), __clk_get_enable_count(comp->clk));
+		} else {
+			active = pm_runtime_get_if_active(comp->dev);
+			if (active <= 0) {
+				DDPMSG("COROT-REG: %s %s inactive=%d\n", phase,
+				       mtk_dump_comp_str(comp), active);
+				continue;
+			}
+			runtime_vote = true;
+		}
+		r = comp->regs;
+		if (targets[i].ovl) {
+			DDPMSG("COROT-REG: %s %s en=%#x roi=%#x src=%#x con=%#x size=%#x offset=%#x pitch=%#x/%#x\n",
+			       phase, mtk_dump_comp_str(comp), readl(r + 0x0c),
+			       readl(r + 0x20), readl(r + 0x2c), readl(r + 0x30),
+			       readl(r + 0x38), readl(r + 0x3c), readl(r + 0x44),
+			       readl(r + 0x40));
+			DDPMSG("COROT-REG: %s %s addr=%#x/%#x rdma=%#x flow=%#x dbg=%#x fmt=%#x\n",
+			       phase, mtk_dump_comp_str(comp), readl(r + 0xf40),
+			       readl(r + 0xf4c), readl(r + 0xc0), readl(r + 0x240),
+			       readl(r + 0x24c), readl(r + 0x25c));
+		} else {
+			DDPMSG("COROT-REG: %s %s con=%#x pic=%#x/%#x slice=%#x/%#x chunk=%#x\n",
+			       phase, mtk_dump_comp_str(comp), readl(r),
+			       readl(r + 0x18), readl(r + 0x1c), readl(r + 0x20),
+			       readl(r + 0x24), readl(r + 0x28));
+		}
+		if (runtime_vote)
+			pm_runtime_put(comp->dev);
+	}
+}
+
 /* Timeout work must not race manual DSI clock gating or wait on commit locks. */
 void mtk_dsi_corot_link_readback(struct mtk_ddp_comp *comp, const char *phase)
 {
@@ -7966,8 +8046,19 @@ void mtk_dsi_corot_link_readback(struct mtk_ddp_comp *comp, const char *phase)
 	}
 	active = pm_runtime_get_if_in_use(dsi->host.dev);
 	if (active > 0) {
-		if (dsi->clk_refcnt > 0 && dsi->ext && dsi->ext->params)
+		if (dsi->clk_refcnt > 0 && dsi->ext && dsi->ext->params) {
 			mtk_corot_dsi_link_state(dsi, phase);
+			DDPMSG("COROT-REG: %s DSI0 start=%#x con=%#x mode=%#x inten=%#x sta=%#x ps=%#x size=%#x\n",
+			       phase, readl(dsi->regs + DSI_START),
+			       readl(dsi->regs + DSI_CON_CTRL), readl(dsi->regs + DSI_MODE_CTRL),
+			       readl(dsi->regs + DSI_INTEN), readl(dsi->regs + DSI_INTSTA),
+			       readl(dsi->regs + DSI_PSCTRL), readl(dsi->regs + DSI_SIZE_CON));
+			DDPMSG("COROT-REG: %s DSI0 type1=%#x mem=%#x gce=%#x\n",
+			       phase, readl(dsi->regs + DSI_CMD_TYPE1_HS),
+			       readl(dsi->regs + DSI_MEM_CONTI),
+			       mtk_crtc->config_regs ? readl(mtk_crtc->config_regs + 0x308) : 0);
+			mtk_corot_pipeline_readback(mtk_crtc, phase);
+		}
 		pm_runtime_put(dsi->host.dev);
 	}
 	mutex_unlock(&mtk_crtc->lock);

@@ -7360,7 +7360,7 @@ static int mtk_drm_probe(struct platform_device *pdev)
 	const __be32 *ranges = NULL;
 	bool mml_found = false;
 
-	pr_info("COROT r360 marker: complete MT6985 DRM, M12 panels and mi_disp\n");
+	pr_info("COROT r367 marker: complete MT6985 DRM, M12 panels and mi_disp\n");
 	disp_dbg_probe();
 	PanelMaster_probe();
 	DDPINFO("%s+\n", __func__);

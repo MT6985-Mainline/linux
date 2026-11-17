@@ -10,12 +10,14 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_domain.h>
+#include <linux/rculist.h>
 #include <soc/mediatek/smi.h>
 #include <dt-bindings/memory/mt2701-larb-port.h>
 #include <dt-bindings/memory/mtk-memory-port.h>
@@ -164,6 +166,8 @@ struct mtk_smi {
 	const struct mtk_smi_common_plat *plat;
 	int			commid;
 	atomic_t		ref_count;
+	struct list_head	init_power_node;
+	bool			init_power_vote;
 };
 
 #define LARB_MAX_COMMON		(2)
@@ -201,6 +205,7 @@ struct mtk_smi_pd {
 	struct notifier_block nb;
 	bool	is_main;
 	struct mtk_smi_pd_log	last_pd_log;
+	struct list_head	registry_node;
 };
 
 static u32 log_level;
@@ -210,15 +215,40 @@ enum smi_log_level {
 	log_pd_callback,
 };
 
-#define MAX_INIT_POWER_ON_DEV	(5)
-static struct mtk_smi *init_power_on_dev[MAX_INIT_POWER_ON_DEV];
-static unsigned int init_power_on_num;
-
-#define MAX_PD_CTRL_NUM	(8)
-static struct mtk_smi_pd *smi_pd_ctrl[MAX_PD_CTRL_NUM];
-static unsigned int smi_pd_ctrl_num;
+/* MT6985 has eleven boot holds and eighteen PD controllers. */
+static LIST_HEAD(init_power_on_devices);
+static DEFINE_MUTEX(init_power_lock);
+static bool init_power_released;
+static LIST_HEAD(smi_pd_controllers);
+static DEFINE_MUTEX(smi_pd_registry_lock);
+static unsigned int smi_pd_controller_count;
 
 static struct mtk_smi_larb *larb_clamp_ctrl[MTK_LARB_NR_MAX];
+
+static void mtk_smi_pd_registry_add(struct mtk_smi_pd *smi_pd)
+{
+	INIT_LIST_HEAD(&smi_pd->registry_node);
+	mutex_lock(&smi_pd_registry_lock);
+	list_add_tail_rcu(&smi_pd->registry_node, &smi_pd_controllers);
+	smi_pd_controller_count++;
+	dev_info(smi_pd->dev, "COROT-SMI: PD controller registered count=%u\n",
+		 smi_pd_controller_count);
+	mutex_unlock(&smi_pd_registry_lock);
+}
+
+static void mtk_smi_pd_registry_del(struct mtk_smi_pd *smi_pd)
+{
+	mutex_lock(&smi_pd_registry_lock);
+	list_del_rcu(&smi_pd->registry_node);
+	smi_pd_controller_count--;
+	mutex_unlock(&smi_pd_registry_lock);
+	synchronize_rcu();
+}
+
+static void mtk_smi_put_device(void *data)
+{
+	put_device(data);
+}
 
 static void power_reset_imp(struct mtk_smi_pd *smi_pd)
 {
@@ -305,7 +335,13 @@ static void mtk_smi_larb_clamp_update(struct mtk_smi_larb *larb, bool on)
 
 void mtk_smi_larb_clamp(u32 larb_id, bool on)
 {
-	struct mtk_smi_larb *larb = larb_clamp_ctrl[larb_id];
+	struct mtk_smi_larb *larb;
+
+	if (larb_id >= ARRAY_SIZE(larb_clamp_ctrl)) {
+		pr_warn("%s: invalid larb %u\n", __func__, larb_id);
+		return;
+	}
+	larb = READ_ONCE(larb_clamp_ctrl[larb_id]);
 
 	if (!larb) {
 		pr_notice("%s: larb %d not enable clamp ctrl\n", __func__, larb_id);
@@ -420,26 +456,66 @@ void mtk_smi_check_larb_ref_cnt(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(mtk_smi_check_larb_ref_cnt);
 
+static int mtk_smi_init_power_get(struct mtk_smi *smi)
+{
+	int ret = 0;
+
+	mutex_lock(&init_power_lock);
+	if (init_power_released || smi->init_power_vote)
+		goto out;
+	ret = pm_runtime_resume_and_get(smi->dev);
+	if (ret < 0)
+		goto out;
+	INIT_LIST_HEAD(&smi->init_power_node);
+	smi->init_power_vote = true;
+	list_add_tail(&smi->init_power_node, &init_power_on_devices);
+	dev_info(smi->dev, "COROT-SMI: boot runtime-PM hold registered\n");
+out:
+	mutex_unlock(&init_power_lock);
+	return ret;
+}
+
+static void mtk_smi_init_power_put_locked(struct mtk_smi *smi)
+{
+	if (!smi->init_power_vote)
+		return;
+	list_del_init(&smi->init_power_node);
+	smi->init_power_vote = false;
+	pm_runtime_put_sync(smi->dev);
+}
+
+static void mtk_smi_init_power_put(struct mtk_smi *smi)
+{
+	mutex_lock(&init_power_lock);
+	mtk_smi_init_power_put_locked(smi);
+	mutex_unlock(&init_power_lock);
+}
+
 void mtk_smi_init_power_off(void)
 {
-	int i;
-	struct mtk_smi *smi;
+	struct mtk_smi *smi, *next;
+	unsigned int count = 0;
 
-	for (i = 0; i < init_power_on_num; i++) {
-		smi = init_power_on_dev[i];
-		pm_runtime_put_sync(smi->dev);
+	mutex_lock(&init_power_lock);
+	init_power_released = true;
+	list_for_each_entry_safe(smi, next, &init_power_on_devices,
+				 init_power_node) {
+		mtk_smi_init_power_put_locked(smi);
+		count++;
 	}
+	mutex_unlock(&init_power_lock);
+	pr_info("COROT-SMI: released %u boot runtime-PM holds\n", count);
 }
 EXPORT_SYMBOL_GPL(mtk_smi_init_power_off);
 
 void mtk_smi_dump_last_pd(const char *user)
 {
-	int i, j;
+	int j;
 	struct mtk_smi_pd *smi_pd;
 
 	pr_info("%s: check caller:%s\n", __func__, user);
-	for (i = 0; i < smi_pd_ctrl_num; i++) {
-		smi_pd = smi_pd_ctrl[i];
+	rcu_read_lock();
+	list_for_each_entry_rcu(smi_pd, &smi_pd_controllers, registry_node) {
 		dev_notice(smi_pd->dev, "power status = %d\n", smi_pd->last_pd_log.power_status);
 		dev_notice(smi_pd->dev, "time = %18llu\n", smi_pd->last_pd_log.time);
 		for (j = 0; j < MAX_COMMON_FOR_CLAMP; j++) {
@@ -457,6 +533,7 @@ void mtk_smi_dump_last_pd(const char *user)
 			}
 		}
 	}
+	rcu_read_unlock();
 }
 EXPORT_SYMBOL_GPL(mtk_smi_dump_last_pd);
 
@@ -538,7 +615,6 @@ int mtk_smi_larb_get(struct device *larbdev)
 	if (ret < 0) {
 		dev_notice(larbdev, "Unable to enable SMI LARB%d. ret:%d\n",
 			larb->larbid, ret);
-		pm_runtime_put_sync(larbdev);
 	}
 
 	return (ret < 0) ? ret : 0;
@@ -1865,6 +1941,9 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
 	}
 	larb->smi.dev = dev;
 	atomic_set(&larb->smi.ref_count, 0);
+	of_property_read_u32(dev->of_node, "mediatek,larb-id", &larb->larbid);
+	if (larb->larbid < 0 || larb->larbid >= MTK_LARB_NR_MAX)
+		return dev_err_probe(dev, -EINVAL, "Invalid SMI larb ID\n");
 
 	for (i = 0; i < LARB_MAX_COMMON; i++) {
 		smi_node = of_parse_phandle(dev->of_node, "mediatek,smi", i);
@@ -1922,31 +2001,38 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
 
 	pm_runtime_enable(dev);
 	platform_set_drvdata(pdev, larb);
-	ret = component_add(dev, &mtk_smi_larb_component_ops);
-	of_property_read_u32(dev->of_node, "mediatek,larb-id", &larb->larbid);
-
-	if (of_property_read_bool(dev->of_node, "larb-clamp-ctrl-enable")) {
-		larb_clamp_ctrl[larb->larbid] = larb;
-		dev_notice(dev, "Found clamp SMI LARB%d\n", larb->larbid);
-	}
 
 	if (of_property_read_bool(dev->of_node, "init-power-on")) {
-		ret = pm_runtime_get_sync(dev);
-		init_power_on_dev[init_power_on_num++] = &larb->smi;
-		if (ret < 0) {
-			dev_notice(dev, "Unable to enable SMI LARB%d. ret:%d\n",
-				larb->larbid, ret);
-			pm_runtime_put_sync(dev);
-		}
+		ret = mtk_smi_init_power_get(&larb->smi);
+		if (ret < 0)
+			goto disable_pm;
 	}
 
+	ret = component_add(dev, &mtk_smi_larb_component_ops);
+	if (ret)
+		goto put_initial_power;
+	if (of_property_read_bool(dev->of_node, "larb-clamp-ctrl-enable")) {
+		WRITE_ONCE(larb_clamp_ctrl[larb->larbid], larb);
+		dev_notice(dev, "Found clamp SMI LARB%d\n", larb->larbid);
+	}
+	return 0;
+
+put_initial_power:
+	mtk_smi_init_power_put(&larb->smi);
+disable_pm:
+	pm_runtime_disable(dev);
 	return ret;
 }
 
 static void mtk_smi_larb_remove(struct platform_device *pdev)
 {
-	pm_runtime_disable(&pdev->dev);
+	struct mtk_smi_larb *larb = platform_get_drvdata(pdev);
+
 	component_del(&pdev->dev, &mtk_smi_larb_component_ops);
+	if (READ_ONCE(larb_clamp_ctrl[larb->larbid]) == larb)
+		WRITE_ONCE(larb_clamp_ctrl[larb->larbid], NULL);
+	mtk_smi_init_power_put(&larb->smi);
+	pm_runtime_disable(&pdev->dev);
 }
 
 static int __maybe_unused mtk_smi_larb_resume(struct device *dev)
@@ -2639,12 +2725,10 @@ static int mtk_smi_common_probe(struct platform_device *pdev)
 		kthr = kthread_run(smi_cmdq, dev, __func__);
 
 	if (of_property_read_bool(dev->of_node, "init-power-on")) {
-		ret = pm_runtime_get_sync(dev);
-		init_power_on_dev[init_power_on_num++] = common;
+		ret = mtk_smi_init_power_get(common);
 		if (ret < 0) {
-			dev_notice(dev, "Unable to enable SMI COMM%d. ret:%d\n",
-				common->commid, ret);
-			pm_runtime_put_sync(dev);
+			pm_runtime_disable(dev);
+			return dev_err_probe(dev, ret, "Failed SMI initial runtime-PM hold\n");
 		}
 	}
 
@@ -2653,6 +2737,9 @@ static int mtk_smi_common_probe(struct platform_device *pdev)
 
 static void mtk_smi_common_remove(struct platform_device *pdev)
 {
+	struct mtk_smi *common = platform_get_drvdata(pdev);
+
+	mtk_smi_init_power_put(common);
 	pm_runtime_disable(&pdev->dev);
 }
 
@@ -2752,6 +2839,7 @@ static int mtk_smi_pd_probe(struct platform_device *pdev)
 	struct platform_device *smi_pdev;
 	int ret, i;
 	u32 reset_tmp, reset_num, offset;
+	int reset_cells;
 
 	smi_pd = devm_kzalloc(&pdev->dev, sizeof(*smi_pd), GFP_KERNEL);
 	if (!smi_pd)
@@ -2771,9 +2859,15 @@ static int mtk_smi_pd_probe(struct platform_device *pdev)
 		smi_pdev = of_find_device_by_node(smi_node);
 		of_node_put(smi_node);
 		if (smi_pdev) {
-			if (!platform_get_drvdata(smi_pdev))
+			if (!platform_get_drvdata(smi_pdev)) {
+				put_device(&smi_pdev->dev);
 				return -EPROBE_DEFER;
+			}
 			smi_pd->smi_common_dev[i] = &smi_pdev->dev;
+			ret = devm_add_action_or_reset(dev, mtk_smi_put_device,
+						     &smi_pdev->dev);
+			if (ret)
+				return ret;
 		} else {
 			dev_notice(dev, "Failed to get smi_comm dev for setting clamp:%d\n", i);
 			return -EINVAL;
@@ -2783,34 +2877,54 @@ static int mtk_smi_pd_probe(struct platform_device *pdev)
 						i, &smi_pd->set_comm_port_range[i]);
 	}
 
-	if (of_get_property(dev->of_node, "power-reset", &reset_tmp)) {
-		reset_num = reset_tmp / (sizeof(u32) * RESET_CELL_NUM);
+	if (of_find_property(dev->of_node, "power-reset", NULL)) {
+		reset_cells = of_property_count_u32_elems(dev->of_node, "power-reset");
+		if (reset_cells <= 0 || reset_cells % RESET_CELL_NUM ||
+		    reset_cells / RESET_CELL_NUM > MAX_LARB_FOR_CLAMP)
+			return dev_err_probe(dev, -EINVAL, "Invalid SMI power-reset pairs\n");
+		reset_num = reset_cells / RESET_CELL_NUM;
 		for (i = 0; i < reset_num; i++) {
 			offset = i * RESET_CELL_NUM;
 			if (of_property_read_u32_index(dev->of_node,
 					"power-reset", offset, &reset_tmp))
 				break;
 			smi_pd->power_reset_pa[i] = reset_tmp;
-			smi_pd->power_reset_reg[i] = ioremap(reset_tmp, 4);
+			smi_pd->power_reset_reg[i] = devm_ioremap(dev, reset_tmp, 4);
+			if (!smi_pd->power_reset_reg[i])
+				return -ENOMEM;
 
 			if (of_property_read_u32_index(dev->of_node,
 					"power-reset", offset + 1, &reset_tmp))
-				break;
+				return -EINVAL;
+			if (reset_tmp >= 32)
+				return -EINVAL;
 			smi_pd->power_reset_value[i] = 1 << reset_tmp;
 		}
 	}
 
 	smi_pd->nb.notifier_call = mtk_smi_pd_callback;
 	ret = dev_pm_genpd_add_notifier(dev, &smi_pd->nb);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed SMI genpd notifier registration\n");
 	pm_runtime_enable(dev);
-
-	smi_pd_ctrl[smi_pd_ctrl_num++] = smi_pd;
+	platform_set_drvdata(pdev, smi_pd);
+	mtk_smi_pd_registry_add(smi_pd);
 
 	return 0;
 }
 
+static void mtk_smi_pd_remove(struct platform_device *pdev)
+{
+	struct mtk_smi_pd *smi_pd = platform_get_drvdata(pdev);
+
+	dev_pm_genpd_remove_notifier(&pdev->dev);
+	mtk_smi_pd_registry_del(smi_pd);
+	pm_runtime_disable(&pdev->dev);
+}
+
 static struct platform_driver mtk_smi_pd_driver = {
 	.probe	= mtk_smi_pd_probe,
+	.remove = mtk_smi_pd_remove,
 	.driver	= {
 		.name = "mtk-smi-pd",
 		.of_match_table = mtk_smi_pd_of_ids,

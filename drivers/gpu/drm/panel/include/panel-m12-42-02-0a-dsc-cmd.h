@@ -239,6 +239,23 @@ static struct LCM_setting_table sleep_out_setting[] = {
 	{0x11, 01, {0x00}},
 	{REGFLAG_DELAY, 120, {}},
 	{0x29, 01, {0x00}},
+	// Cold boot resets the panel; 0x35 issued before sleep-out is ignored.
+	// Re-assert TE after display-on so the first normal trigger can see TE.
+	{REGFLAG_DELAY, 20, {}},
+	{0x35, 01, {0x00}},
+	{0x44, 02, {0x0A, 0x70}},
+	{REGFLAG_END_OF_TABLE, 0x00, {}}
+};
+
+/* Re-run only display-on/TE after the first init; never sleep the panel. */
+static struct LCM_setting_table cold_te_on_setting[] = {
+	{REGFLAG_DELAY, 20, {}},
+	{0x11, 01, {0x00}},
+	{REGFLAG_DELAY, 120, {}},
+	{0x29, 01, {0x00}},
+	{REGFLAG_DELAY, 20, {}},
+	{0x35, 01, {0x00}},
+	{0x44, 02, {0x0A, 0x70}},
 	{REGFLAG_END_OF_TABLE, 0x00, {}}
 };
 

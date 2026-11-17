@@ -4170,7 +4170,7 @@ static void mtk_oddmr_odr_get_status(struct mtk_ddp_comp *comp, struct cmdq_pkt 
 	*inst = *inst | CMDQ_REG_SHIFT_ADDR(jump_pa);
 }
 
-static void mtk_oddmr_config_trigger(struct mtk_ddp_comp *comp,
+static int mtk_oddmr_config_trigger(struct mtk_ddp_comp *comp,
 				   struct cmdq_pkt *handle,
 				   enum mtk_ddp_comp_trigger_flag flag)
 {
@@ -4179,10 +4179,10 @@ static void mtk_oddmr_config_trigger(struct mtk_ddp_comp *comp,
 
 	if (!mtk_crtc) {
 		DDPPR_ERR("%s oddmr comp not configure CRTC yet\n", __func__);
-		return;
+		return 0;
 	}
 	if (!mtk_crtc->base.dev)
-		return;
+		return 0;
 	priv = mtk_crtc->base.dev->dev_private;
 	ODDMRFLOW_LOG("%d\n", flag);
 	switch (flag) {
@@ -4197,6 +4197,8 @@ static void mtk_oddmr_config_trigger(struct mtk_ddp_comp *comp,
 	default:
 		break;
 	}
+
+	return 0;
 }
 
 static const struct mtk_ddp_comp_funcs mtk_disp_oddmr_funcs = {

@@ -7732,21 +7732,29 @@ static void mtk_crtc_ddp_config(struct drm_crtc *crtc)
 	}
 }
 
-static void mtk_crtc_comp_trigger(struct mtk_drm_crtc *mtk_crtc,
-				  struct cmdq_pkt *cmdq_handle,
-				  enum mtk_ddp_comp_trigger_flag trig_flag)
+static int mtk_crtc_comp_trigger(struct mtk_drm_crtc *mtk_crtc,
+				 struct cmdq_pkt *cmdq_handle,
+				 enum mtk_ddp_comp_trigger_flag trig_flag)
 {
-	int i, j;
+	int i, j, ret;
 	struct mtk_ddp_comp *comp;
 
-	for_each_comp_in_cur_crtc_path(comp, mtk_crtc, i, j)
-		mtk_ddp_comp_config_trigger(comp, cmdq_handle, trig_flag);
-
-	/* aware there might be redudant operation if same comp in dual pipe path */
-	if (mtk_crtc->is_dual_pipe) {
-		for_each_comp_in_dual_pipe(comp, mtk_crtc, i, j)
-			mtk_ddp_comp_config_trigger(comp, cmdq_handle, trig_flag);
+	for_each_comp_in_cur_crtc_path(comp, mtk_crtc, i, j) {
+		ret = mtk_ddp_comp_config_trigger(comp, cmdq_handle, trig_flag);
+		if (ret)
+			return ret;
 	}
+
+	/* A component can be shared by both pipe paths. */
+	if (mtk_crtc->is_dual_pipe) {
+		for_each_comp_in_dual_pipe(comp, mtk_crtc, i, j) {
+			ret = mtk_ddp_comp_config_trigger(comp, cmdq_handle, trig_flag);
+			if (ret)
+				return ret;
+		}
+	}
+
+	return 0;
 }
 
 int mtk_crtc_comp_is_busy(struct mtk_drm_crtc *mtk_crtc)
@@ -8346,10 +8354,9 @@ static void cmdq_pkt_reset_ovl(struct cmdq_pkt *cmdq_handle,
 
 #ifndef DRM_CMDQ_DISABLE
 /*
- * The vendor loop inherits LK's resident type-1 image command. A freshly
- * initialized corot panel has only DCS commands, so its first image must be
- * queued before waiting on the image engine's TE event. Hardware EXT_TE stays
- * enabled; only a real CMD_EOF can publish FRAME_EPOCH for later iterations.
+ * Prime an uncompleted corot enable generation without waiting for an idle
+ * TE engine. Regular images retain the real TE wait, EXT_TE and CMD_EOF.
+ * A revoked output releases its software fences without issuing an image.
  */
 static int mtk_crtc_first_frame_patch(struct cmdq_pkt *pkt, u32 assignment,
 				    u32 destination)
@@ -8400,17 +8407,18 @@ static int mtk_crtc_first_frame_wait(struct cmdq_pkt *pkt,
 				      &epoch, &zero, CMDQ_EQUAL);
 }
 
-static int mtk_crtc_first_frame_begin(struct cmdq_pkt *pkt,
-				    struct mtk_drm_crtc *mtk_crtc,
-				    u32 *skip_assignment)
+static int mtk_crtc_cmd_te_begin(struct cmdq_pkt *pkt,
+				struct mtk_drm_crtc *mtk_crtc,
+				u32 *skip_assignment)
 {
 	struct cmdq_operand epoch = { .reg = true, .idx = CMDQ_THR_SPR_IDX3 };
 	struct cmdq_operand zero = { .reg = false, .value = 0 };
 	struct cmdq_operand frame = { .reg = true, .idx = CMDQ_THR_SPR_IDX2 };
-	u32 zero_assignment, normal_label;
+	u32 assignment, normal_label;
+	dma_addr_t loop;
 	int ret;
 
-	/* Recheck generation after the normal stream fences. Zero never primes. */
+	/* Revoke without an image or a retained software fence. */
 	ret = cmdq_pkt_read(pkt, NULL,
 		mtk_get_gce_backup_slot_pa(mtk_crtc, DISP_SLOT_ESD_EPOCH),
 		CMDQ_THR_SPR_IDX3);
@@ -8419,12 +8427,37 @@ static int mtk_crtc_first_frame_begin(struct cmdq_pkt *pkt,
 	ret = cmdq_pkt_assign_command(pkt, CMDQ_THR_SPR_IDX1, 0);
 	if (ret)
 		return ret;
-	zero_assignment = pkt->cmd_buf_size - CMDQ_INST_SIZE;
+	assignment = pkt->cmd_buf_size - CMDQ_INST_SIZE;
+	ret = cmdq_pkt_cond_jump_abs(pkt, CMDQ_THR_SPR_IDX1,
+				     &epoch, &zero, CMDQ_NOT_EQUAL);
+	if (ret)
+		return ret;
+	ret = cmdq_pkt_set_event(pkt, mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
+	if (ret)
+		return ret;
+	ret = cmdq_pkt_set_event(pkt, mtk_crtc->gce_obj.event[EVENT_STREAM_EOF]);
+	if (ret)
+		return ret;
+	loop = cmdq_pkt_get_pa_by_offset(pkt, 0);
+	if (!loop)
+		return -EINVAL;
+	ret = cmdq_pkt_assign_command(pkt, CMDQ_THR_SPR_IDX1,
+				      CMDQ_REG_SHIFT_ADDR(loop));
+	if (ret)
+		return ret;
 	ret = cmdq_pkt_cond_jump_abs(pkt, CMDQ_THR_SPR_IDX1,
 				     &epoch, &zero, CMDQ_EQUAL);
 	if (ret)
 		return ret;
-	/* cmdq_pkt_read uses SPR0 for its address; preserve epoch in SPR3. */
+	ret = cmdq_pkt_assign_command(pkt, CMDQ_THR_SPR_IDX1, 0);
+	if (ret)
+		return ret;
+	normal_label = pkt->cmd_buf_size - CMDQ_INST_SIZE;
+	ret = mtk_crtc_first_frame_patch(pkt, assignment, normal_label);
+	if (ret)
+		return ret;
+
+	/* Prime only an enable generation not completed by hardware CMD_EOF. */
 	ret = cmdq_pkt_read(pkt, NULL,
 		mtk_get_gce_backup_slot_pa(mtk_crtc, DISP_SLOT_ESD_FRAME_EPOCH),
 		CMDQ_THR_SPR_IDX2);
@@ -8434,29 +8467,23 @@ static int mtk_crtc_first_frame_begin(struct cmdq_pkt *pkt,
 	if (ret)
 		return ret;
 	*skip_assignment = pkt->cmd_buf_size - CMDQ_INST_SIZE;
-	ret = cmdq_pkt_cond_jump_abs(pkt, CMDQ_THR_SPR_IDX1,
-				     &epoch, &frame, CMDQ_NOT_EQUAL);
-	if (ret)
-		return ret;
-	ret = cmdq_pkt_assign_command(pkt, CMDQ_THR_SPR_IDX1, 0);
-	if (ret)
-		return ret;
-	normal_label = pkt->cmd_buf_size - CMDQ_INST_SIZE;
-	return mtk_crtc_first_frame_patch(pkt, zero_assignment, normal_label);
+	return cmdq_pkt_cond_jump_abs(pkt, CMDQ_THR_SPR_IDX1,
+				      &epoch, &frame, CMDQ_NOT_EQUAL);
 }
 
-static int mtk_crtc_first_frame_end(struct cmdq_pkt *pkt, u32 skip_assignment)
+static int mtk_crtc_cmd_te_end(struct cmdq_pkt *pkt, u32 skip_assignment)
 {
 	u32 trigger_label;
 	int ret;
 
-	/* A real instruction label stays valid even if a later append relocates it. */
+	/* Regular images keep the real TE WFE before the original trigger. */
 	ret = cmdq_pkt_assign_command(pkt, CMDQ_THR_SPR_IDX1, 0);
 	if (ret)
 		return ret;
 	trigger_label = pkt->cmd_buf_size - CMDQ_INST_SIZE;
 	return mtk_crtc_first_frame_patch(pkt, skip_assignment, trigger_label);
 }
+
 #endif
 
 void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
@@ -8481,8 +8508,8 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 	struct mtk_ddp_comp *output_comp;
 	int en = 1;
 	bool panel_connected = mtk_drm_lcm_is_connect(mtk_crtc);
-	bool first_frame = false;
-	u32 first_frame_jump = 0;
+	bool corot_cmd_te = false;
+	u32 corot_te_skip_assignment = 0;
 
 	const u16 reg_jump = CMDQ_THR_SPR_IDX1;
 	const u16 var1 = CMDQ_CPR_DDR_USR_CNT;
@@ -8540,20 +8567,22 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 		mtk_crtc->pre_te_cfg.merge_trigger_en = false;
 
 	output_comp = mtk_ddp_comp_request_output(mtk_crtc);
-	first_frame = of_machine_is_compatible("xiaomi,corot") && crtc_id == 0 &&
+	corot_cmd_te = of_machine_is_compatible("xiaomi,corot") && crtc_id == 0 &&
 		mtk_crtc->esd_gate.enabled && mtk_crtc->gce_obj.buf.va_base &&
 		output_comp && mtk_ddp_comp_get_type(output_comp->id) == MTK_DSI &&
 		panel_connected && mtk_crtc_is_frame_trigger_mode(crtc) &&
 		!mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_DUAL_TE) &&
+		!(params_lcm && params_lcm->msync2_enable &&
+		  mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_MSYNC2_0)) &&
 		!mtk_crtc->pre_te_cfg.vidle_apsrc_off_en &&
 		!mtk_crtc->pre_te_cfg.vidle_dsi_pll_off_en &&
 		!mtk_crtc->pre_te_cfg.prefetch_te_en &&
 		!mtk_crtc->pre_te_cfg.merge_trigger_en;
-	if (first_frame) {
+	if (corot_cmd_te) {
 		ret = mtk_crtc_first_frame_wait(cmdq_handle, mtk_crtc);
 		if (ret)
 			goto first_frame_error;
-		DDPMSG("COROT-SCANOUT: crtc0 real first frame queued with hardware TE sync\n");
+		DDPMSG("COROT-SCANOUT: crtc0 primes a new image generation before normal hardware TE waits\n");
 	}
 
 	if (mtk_crtc_is_frame_trigger_mode(crtc)) {
@@ -8642,28 +8671,33 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 					mtk_crtc->pre_te_cfg.prefetch_te_en == false &&
 					mtk_crtc->pre_te_cfg.merge_trigger_en == false
 					) {
-					if (first_frame) {
-						ret = mtk_crtc_first_frame_begin(cmdq_handle,
-							mtk_crtc, &first_frame_jump);
+					if (corot_cmd_te) {
+						ret = mtk_crtc_cmd_te_begin(cmdq_handle, mtk_crtc,
+								&corot_te_skip_assignment);
 						if (ret)
 							goto first_frame_error;
-					}
-					cmdq_pkt_clear_event(cmdq_handle,
-						mtk_crtc->gce_obj.event[EVENT_TE]);
-
-					if (mtk_drm_helper_get_opt(priv->helper_opt,
-							MTK_DRM_OPT_MSYNC2_0)
-							&& params_lcm && params_lcm->msync2_enable)
-						cmdq_pkt_request_te(cmdq_handle, mtk_crtc);
-
-					if (panel_connected)
-						cmdq_pkt_wfe(cmdq_handle,
+						ret = cmdq_pkt_clear_event(cmdq_handle,
 							mtk_crtc->gce_obj.event[EVENT_TE]);
-					if (first_frame) {
-						ret = mtk_crtc_first_frame_end(cmdq_handle,
-							first_frame_jump);
 						if (ret)
 							goto first_frame_error;
+						ret = cmdq_pkt_wfe(cmdq_handle,
+							mtk_crtc->gce_obj.event[EVENT_TE]);
+						if (ret)
+							goto first_frame_error;
+						ret = mtk_crtc_cmd_te_end(cmdq_handle,
+								corot_te_skip_assignment);
+						if (ret)
+							goto first_frame_error;
+					} else {
+						cmdq_pkt_clear_event(cmdq_handle,
+							mtk_crtc->gce_obj.event[EVENT_TE]);
+						if (mtk_drm_helper_get_opt(priv->helper_opt,
+							MTK_DRM_OPT_MSYNC2_0) && params_lcm &&
+						    params_lcm->msync2_enable)
+							cmdq_pkt_request_te(cmdq_handle, mtk_crtc);
+						if (panel_connected)
+							cmdq_pkt_wfe(cmdq_handle,
+								mtk_crtc->gce_obj.event[EVENT_TE]);
 					}
 				}
 			}
@@ -8682,8 +8716,10 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 		if (mtk_crtc->pre_te_cfg.prefetch_te_en == false) {
 			if (priv->data->mmsys_id == MMSYS_MT6985)
 				mtk_oddmr_ddren(cmdq_handle, crtc, 1);
-			mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle,
-						MTK_TRIG_FLAG_PRE_TRIGGER);
+			ret = mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle,
+						    MTK_TRIG_FLAG_PRE_TRIGGER);
+			if (ret)
+				goto first_frame_error;
 
 			if (mtk_crtc->pre_te_cfg.merge_trigger_en == true)
 				cmdq_pkt_clear_event(cmdq_handle,
@@ -8698,9 +8734,10 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 				mtk_get_gce_backup_slot_pa(mtk_crtc, DISP_SLOT_ESD_EPOCH),
 				mtk_get_gce_backup_slot_pa(mtk_crtc, DISP_SLOT_ESD_TRIG_EPOCH),
 				CMDQ_THR_SPR_IDX3);
-		mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle,
-					  MTK_TRIG_FLAG_TRIGGER);
-
+		ret = mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle,
+					    MTK_TRIG_FLAG_TRIGGER);
+		if (ret)
+			goto first_frame_error;
 		cmdq_pkt_wfe(cmdq_handle,
 				mtk_crtc->gce_obj.event[EVENT_CMD_EOF]);
 		if (mtk_crtc->esd_gate.enabled)
@@ -8708,7 +8745,10 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 				mtk_get_gce_backup_slot_pa(mtk_crtc, DISP_SLOT_ESD_TRIG_EPOCH),
 				mtk_get_gce_backup_slot_pa(mtk_crtc, DISP_SLOT_ESD_FRAME_EPOCH),
 				CMDQ_THR_SPR_IDX3);
-		mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle, MTK_TRIG_FLAG_EOF);
+		ret = mtk_crtc_comp_trigger(mtk_crtc, cmdq_handle,
+					    MTK_TRIG_FLAG_EOF);
+		if (ret)
+			goto first_frame_error;
 
 #ifdef IF_ZERO /* not ready for dummy register method */
 		if (mtk_drm_helper_get_opt(priv->helper_opt,
@@ -8883,12 +8923,13 @@ void mtk_crtc_start_trig_loop(struct drm_crtc *crtc)
 			}
 		}
 	}
-	cmdq_pkt_finalize_loop(cmdq_handle);
+	ret = cmdq_pkt_finalize_loop(cmdq_handle);
+	if (ret)
+		goto first_frame_error;
 	ret = cmdq_pkt_flush_async(cmdq_handle, trig_done_cb, crtc);
-	if (ret) {
-		mtk_crtc_esd_check_reset(crtc);
-		DDPPR_ERR("%s: trigger loop submission failed: %d\n", __func__, ret);
-	} else if (mtk_crtc->esd_gate.enabled && output_comp &&
+	if (ret)
+		goto first_frame_error;
+	if (mtk_crtc->esd_gate.enabled && output_comp &&
 		   mtk_ddp_comp_get_type(output_comp->id) == MTK_DSI) {
 		struct mtk_dsi *dsi = container_of(output_comp, struct mtk_dsi, ddp_comp);
 
@@ -8908,7 +8949,7 @@ first_frame_error:
 	mtk_crtc_esd_check_reset(crtc);
 	cmdq_pkt_destroy(cmdq_handle);
 	mtk_crtc->trig_loop_cmdq_handle = NULL;
-	DDPPR_ERR("%s: first-frame packet construction failed: %d\n", __func__, ret);
+	DDPPR_ERR("%s: trigger packet construction/submission failed: %d\n", __func__, ret);
 #endif
 }
 

@@ -72,6 +72,7 @@ static char oled_lhbm_cmdline[80] = {0};
 
 static bool lhbm_w900_update_flag = true;
 static bool lhbm_w110_update_flag = true;
+static bool corot_cold_te_cycle_done;
 static bool lhbm_g500_update_flag = true;
 static bool lhbm_w900_readbackdone;
 static bool lhbm_w110_readbackdone;
@@ -596,6 +597,16 @@ static void lcm_panel_init(struct lcm *ctx)
 
 	push_table(ctx, sleep_out_setting,
 		sizeof(sleep_out_setting) / sizeof(struct LCM_setting_table));
+	/*
+	 * A cold-boot init leaves the panel TE engine stopped even though
+	 * 0x35 was accepted. Re-run display-on/TE once, without sleep-in,
+	 * so the panel is never left in the black sleep state.
+	 */
+	if (!corot_cold_te_cycle_done) {
+		corot_cold_te_cycle_done = true;
+		push_table(ctx, cold_te_on_setting,
+			sizeof(cold_te_on_setting) / sizeof(struct LCM_setting_table));
+	}
 	if (panel_build_id == PANEL_APL2600 || panel_build_id == PANEL_APL2600_MP) {
 		if (ctx->gray_level == TEMP_INDEX1_35) {
 			gray_3d_lut_on[3].para_list[0] = 0x02;

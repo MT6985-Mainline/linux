@@ -727,7 +727,7 @@ struct mtk_ddp_comp_funcs {
 		       struct mtk_ddp_config *cfg, struct cmdq_pkt *handle);
 	void (*bypass)(struct mtk_ddp_comp *comp, int bypass,
 		struct cmdq_pkt *handle);
-	void (*config_trigger)(struct mtk_ddp_comp *comp,
+	int (*config_trigger)(struct mtk_ddp_comp *comp,
 			       struct cmdq_pkt *handle,
 			       enum mtk_ddp_comp_trigger_flag trig_flag);
 	void (*addon_config)(struct mtk_ddp_comp *comp,
@@ -905,13 +905,15 @@ static inline void mtk_ddp_comp_first_cfg(struct mtk_ddp_comp *comp,
 		comp->funcs->first_cfg(comp, cfg, handle);
 }
 
-static inline void
+static inline int
 mtk_ddp_comp_config_trigger(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 			    enum mtk_ddp_comp_trigger_flag flag)
 {
 	if (comp && comp->funcs && comp->funcs->config_trigger &&
-			!comp->blank_mode)
-		comp->funcs->config_trigger(comp, handle, flag);
+	    !comp->blank_mode)
+		return comp->funcs->config_trigger(comp, handle, flag);
+
+	return 0;
 }
 
 static inline void

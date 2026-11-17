@@ -8,6 +8,7 @@
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_fourcc.h>
 #include <linux/mailbox_controller.h>
+#include <linux/of.h>
 
 #include "mtk_drm_crtc.h"
 #include "mtk_drm_ddp_comp.h"
@@ -464,6 +465,7 @@ void mtk_plane_get_comp_state(struct drm_plane *plane,
 static void mtk_plane_atomic_update(struct drm_plane *plane,
 				    struct drm_atomic_commit *state)
 {
+	static atomic_t corot_fb_traces = ATOMIC_INIT(0);
 	struct mtk_plane_state *mtk_plane_state = to_mtk_plane_state(plane->state);
 	struct drm_crtc *crtc = plane->state->crtc;
 	struct mtk_drm_private *priv;
@@ -558,6 +560,16 @@ static void mtk_plane_atomic_update(struct drm_plane *plane,
 
 	wmb(); /* Make sure the above parameters are set before update */
 	mtk_plane_state->pending.dirty = true;
+	if (!crtc_index && !plane_index &&
+	    of_machine_is_compatible("xiaomi,corot") &&
+	    atomic_inc_return(&corot_fb_traces) <= 16)
+		DDPMSG("COROT-FB: id=%u fb=%ux%u fmt=%p4cc pitch=%u bytes=%zu dma=%#llx src=%u,%u %dx%d dst=%d,%d %dx%d enabled=%u queued\n",
+		       fb->base.id, fb->width, fb->height, &fb->format->format,
+		       fb->pitches[0], mtk_fb_get_size(fb),
+		       (unsigned long long)mtk_fb_get_dma(fb),
+		       mtk_plane_state->pending.src_x, mtk_plane_state->pending.src_y,
+		       src_w, src_h, dst_x, dst_y, dst_w, dst_h,
+		       mtk_plane_state->pending.enable);
 
 	DDPINFO("%s:%d en%d,pitch%d,fmt:%p4cc\n",
 		__func__, __LINE__, (unsigned int)mtk_plane_state->pending.enable,

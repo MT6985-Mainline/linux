@@ -2644,7 +2644,8 @@ s32 cmdq_pkt_flush_async(struct cmdq_pkt *pkt,
 	mbox_client_txdone(client->chan, 0);
 	mutex_unlock(&client->chan_mutex);
 
-	return err;
+	/* Mailbox queue tokens are successful submissions, not CMDQ errors. */
+	return err < 0 ? err : 0;
 }
 EXPORT_SYMBOL(cmdq_pkt_flush_async);
 
